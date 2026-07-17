@@ -14,7 +14,7 @@ function numberEnv(name, fallback) {
 }
 
 const solPriceUsdForConfig = numberEnv('SOL_PRICE_USD', 72);
-const activityFlow1mMinVolumeUsdDefault = numberEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 10000);
+const activityFlow1mMinVolumeUsdDefault = numberEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
 const activityFlow1mMinVolumeSolDefault = activityFlow1mMinVolumeUsdDefault / Math.max(solPriceUsdForConfig, 0.001);
 
 const config = {
@@ -122,9 +122,9 @@ const config = {
     //   clean:     30min (1800000ms) — 短线反弹策略, 超时强制退出
     maxHoldMs: parseInt(process.env.MAX_HOLD_MS || '0', 10),
     lowPeakTimeoutMs: parseInt(process.env.LOW_PEAK_TIMEOUT_MS || '0', 10),
-    // FLOW_REVERSAL_EXIT: 持仓后如果短窗口买盘反转为卖盘，则主动退出。
-    flowReversalExitEnabled: (process.env.FLOW_REVERSAL_EXIT_ENABLED ?? 'false').toLowerCase() === 'true',
-    flowReversalExitMode: String(process.env.FLOW_REVERSAL_EXIT_MODE || 'VOLUME_RATIO_1M').toUpperCase(),
+    // Two complete falling 15-second candles plus net flow turning positive to negative.
+    flowReversalExitEnabled: true,
+    flowReversalExitMode: 'FLOW_TURN_15S',
     flowReversalExitWindowMs: parseInt(process.env.FLOW_REVERSAL_EXIT_WINDOW_MS || '60000', 10),
     flowReversalExitSellBuyRatio1m: parseFloat(process.env.FLOW_REVERSAL_EXIT_SELL_BUY_RATIO_1M || '1.35'),
     flowReversalExitMinVolume1mSol: parseFloat(process.env.FLOW_REVERSAL_EXIT_MIN_VOLUME_1M_SOL || '5'),
@@ -208,7 +208,7 @@ const config = {
 
   // ============ Activity-flow entry ============
   activityFlow: {
-    // Default entry: 1-minute volume + buy/sell ratio. Legacy multi-window fields remain available.
+    // Default entry: active 1-minute volume plus a 15-second flow-acceleration reversal.
     enabled:
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_ENABLED ?? process.env.ORDER_FLOW_ENABLED ?? 'true').toLowerCase() === 'true',
@@ -216,8 +216,8 @@ const config = {
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL ?? process.env.ORDER_FLOW_REPLACE_DUMP_SIGNAL ?? 'true')
         .toLowerCase() === 'true',
-    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'VOLUME_RATIO_1M').toUpperCase(),
-    minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '10000'),
+    entryMode: 'FLOW_ACCEL_15S',
+    minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
     ),

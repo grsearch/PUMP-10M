@@ -39,18 +39,12 @@ async function main() {
   console.log(
     `Entry: ACTIVITY_FLOW ` +
       `(${config.activityFlow.entryMode}: 1m volume>=${config.activityFlow.minVolume1mSol.toFixed(2)}SOL ` +
-      `(~$${Math.round(config.activityFlow.minVolume1mUsd)}), buy/sell>=${config.activityFlow.minRatio1m}, ` +
-      `trades>=${config.activityFlow.minTrades1m}, ` +
-      `RSI disabled; ` +
-      `5s buyers>=${config.activityFlow.confirmMinUniqueBuyers5s}, ` +
-      `topBuyer<=${Math.round(config.activityFlow.confirmMaxBuyerShare5s * 100)}%, ` +
-      `rise<=${config.activityFlow.confirmMaxPriceRise5sPct}%)`,
+      `(~$${Math.round(config.activityFlow.minVolume1mUsd)}), trades>=${config.activityFlow.minTrades1m}, ` +
+      `3 increasing closed 15s net-flow values, flow acceleration - to +, ratio filters disabled)`,
   );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
-      `(1m sell/buy>=${config.strategy.flowReversalExitSellBuyRatio1m}, ` +
-      `volume>=${config.strategy.flowReversalExitMinVolume1mSol}SOL, ` +
-      `hold>=${config.strategy.flowReversalExitMinHoldMs}ms)`
+      `(2 closed 15s net-flow values, + to -)`
     : 'Flow exit: disabled');
   console.log(`Legacy dumpSignal: ${config.activityFlow.replaceDumpSignal ? 'suppressed' : 'allowed fallback'}`);
   console.log(`Rebuy cooldown: ${config.strategy.rebuyCooldownMs > 0 ? config.strategy.rebuyCooldownMs / 60_000 + 'min after close' : 'disabled'}`);
@@ -210,13 +204,9 @@ async function main() {
     `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
       `mode=${activityFlowTracker.entryMode} ` +
       `1m>=${activityFlowTracker.minVolume1mSol.toFixed(2)}SOL(~$${Math.round(activityFlowTracker.minVolume1mUsd)}) ` +
-      `buy/sell>=${activityFlowTracker.minRatio1m} ` +
       `trades>=${activityFlowTracker.minTrades1m} ` +
-      `5s buys>=${activityFlowTracker.confirmMinBuyTrades5s} ` +
-      `buyers>=${activityFlowTracker.confirmMinUniqueBuyers5s} ` +
-      `topBuyer<=${Math.round(activityFlowTracker.confirmMaxBuyerShare5s * 100)}% ` +
-      `rise<=${activityFlowTracker.confirmMaxPriceRise5sPct}% ` +
-      `singleImpact<=${activityFlowTracker.confirmMaxSingleBuyImpactPct}% ` +
+      `entry=3x15s-net-flow-up+accel-cross ` +
+      `ratioFilters=disabled ` +
       `pool>=${activityFlowTracker.minPoolQuoteSol}SOL ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );

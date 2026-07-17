@@ -651,14 +651,11 @@ class SignalEngine extends EventEmitter {
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
     const activityReason = signal._activityFlow && flow
-      ? `activity_flow_1m: ${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(2)}SOL ` +
-        `buy=${flow.s60.buySol.toFixed(2)} sell=${flow.s60.sellSol.toFixed(2)} ` +
-        `r=${flow.s60.buySellRatio.toFixed(2)} ` +
-        `rsi1m_closed=${Number.isFinite(signal._rsi1mClosed) ? signal._rsi1mClosed.toFixed(1) : 'n/a'} ` +
-        `rsi1m_live=${Number.isFinite(signal._rsi1mLive) ? signal._rsi1mLive.toFixed(1) : 'n/a'} ` +
-        `closed_bars=${signal._rsi1mClosedBars || 0} ` +
-        `close=${Number.isFinite(signal._rsi1mLiveClose) ? signal._rsi1mLiveClose : 'n/a'} ` +
-        `prev_close=${Number.isFinite(signal._rsi1mLastClosedClose) ? signal._rsi1mLastClosedClose : 'n/a'}`
+      ? `activity_flow_15s: 1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(2)}SOL ` +
+        `net=${flow.entry15s.netFlows.map((value) => value.toFixed(2)).join('/')}SOL ` +
+        `accel=${flow.entry15s.previousAcceleration.toFixed(2)}->` +
+        `${flow.entry15s.currentAcceleration.toFixed(2)}->` +
+        `${flow.entry15s.latestAcceleration.toFixed(2)}`
       : null;
 
     // v3.10: 先 emit buyOrder（让 Executor 立即开始工作），再异步写 DB

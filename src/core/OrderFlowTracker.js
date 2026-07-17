@@ -2,6 +2,7 @@
 
 const EventEmitter = require('events');
 const { config } = require('../config');
+const { evaluateFlowAccelerationEntry } = require('./FlowCandleStrategy');
 
 function boolEnv(name, fallback) {
   const raw = process.env[name];
@@ -50,17 +51,15 @@ class OrderFlowTracker extends EventEmitter {
 
     this.entryMode =
       String(
-        (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'VOLUME_RATIO_1M') ||
-          'VOLUME_RATIO_1M',
+        (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'FLOW_ACCEL_15S') ||
+          'FLOW_ACCEL_15S',
       ).toUpperCase();
     this.minVolume1mUsd =
-      opts.minVolume1mUsd ?? flowConfig.minVolume1mUsd ?? numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 10000);
+      opts.minVolume1mUsd ?? flowConfig.minVolume1mUsd ?? numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
     this.minVolume1mSol =
       opts.minVolume1mSol ??
       flowConfig.minVolume1mSol ??
       numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_SOL', this.minVolume1mUsd / Math.max(numEnv('SOL_PRICE_USD', 72), 0.001));
-    this.minRatio1m =
-      opts.minRatio1m ?? flowConfig.minRatio1m ?? numEnv('ACTIVITY_FLOW_1M_MIN_BUY_SELL_RATIO', 1.35);
     this.minTrades1m =
       opts.minTrades1m ?? flowConfig.minTrades1m ?? numEnv('ACTIVITY_FLOW_1M_MIN_TRADES', 25);
     this.confirmMinBuyTrades5s =
@@ -71,10 +70,6 @@ class OrderFlowTracker extends EventEmitter {
       opts.confirmMinUniqueBuyers5s ??
       flowConfig.confirmMinUniqueBuyers5s ??
       numEnv('ACTIVITY_FLOW_CONFIRM_MIN_UNIQUE_BUYERS_5S', 3);
-    this.confirmMinRatio5s =
-      opts.confirmMinRatio5s ??
-      flowConfig.confirmMinRatio5s ??
-      numEnv('ACTIVITY_FLOW_CONFIRM_MIN_BUY_SELL_RATIO_5S', 1.10);
     this.confirmMaxBuyerShare5s =
       opts.confirmMaxBuyerShare5s ??
       flowConfig.confirmMaxBuyerShare5s ??
@@ -106,15 +101,10 @@ class OrderFlowTracker extends EventEmitter {
       opts.minTrades30s ?? flowConfig.minTrades30s ?? numEnv('ACTIVITY_FLOW_MIN_TRADES_30S', 12);
     this.minVolume30sSol =
       opts.minVolume30sSol ?? flowConfig.minVolume30sSol ?? numEnv('ACTIVITY_FLOW_MIN_VOLUME_30S_SOL', 6);
-    this.minRatio30s =
-      opts.minRatio30s ?? flowConfig.minRatio30s ?? numEnv('ACTIVITY_FLOW_MIN_BUY_SELL_RATIO_30S', 1.05);
-
     this.minTrades15s =
       opts.minTrades15s ?? flowConfig.minTrades15s ?? numEnv('ACTIVITY_FLOW_MIN_TRADES_15S', 8);
     this.minVolume15sSol =
       opts.minVolume15sSol ?? flowConfig.minVolume15sSol ?? numEnv('ACTIVITY_FLOW_MIN_VOLUME_15S_SOL', 4);
-    this.minRatio15s =
-      opts.minRatio15s ?? flowConfig.minRatio15s ?? numEnv('ACTIVITY_FLOW_MIN_BUY_SELL_RATIO_15S', 1.45);
     this.minImbalance15s =
       opts.minImbalance15s ?? flowConfig.minImbalance15s ?? numEnv('ACTIVITY_FLOW_MIN_IMBALANCE_15S', 0.20);
     this.minUniqueBuyers15s =
@@ -137,8 +127,6 @@ class OrderFlowTracker extends EventEmitter {
     this.minTrades5s = opts.minTrades5s ?? flowConfig.minTrades5s ?? numEnv('ACTIVITY_FLOW_MIN_TRADES_5S', 5);
     this.minVolume5sSol =
       opts.minVolume5sSol ?? flowConfig.minVolume5sSol ?? numEnv('ACTIVITY_FLOW_MIN_VOLUME_5S_SOL', 2.5);
-    this.minRatio5s =
-      opts.minRatio5s ?? flowConfig.minRatio5s ?? numEnv('ACTIVITY_FLOW_MIN_BUY_SELL_RATIO_5S', 1.40);
     this.minImbalance5s =
       opts.minImbalance5s ?? flowConfig.minImbalance5s ?? numEnv('ACTIVITY_FLOW_MIN_IMBALANCE_5S', 0.25);
     this.minUniqueBuyers5s =
@@ -175,7 +163,7 @@ class OrderFlowTracker extends EventEmitter {
       opts.maxEventsPerMint ?? flowConfig.maxEventsPerMint ?? numEnv('ACTIVITY_FLOW_MAX_EVENTS_PER_MINT', 600);
     this.debug = opts.debug ?? flowConfig.debug ?? boolEnv('ACTIVITY_FLOW_DEBUG', false);
 
-    this.maxWindowMs = Math.max(this.window5Ms, this.window15Ms, this.window30Ms, this.window60Ms);
+    this.maxWindowMs = Math.max(90_000, this.window5Ms, this.window15Ms, this.window30Ms, this.window60Ms);
     this.states = new Map();
     this.cooldowns = new Map();
     this._lastDebugLog = new Map();
@@ -222,13 +210,14 @@ class OrderFlowTracker extends EventEmitter {
     };
 
     const state = this._stateOf(ev.mint);
+    if (state.firstSeenTs == null) state.firstSeenTs = ev.ts;
     state.events.push(ev);
     state.symbol = ev.symbol || state.symbol;
     state.poolAddress = ev.poolAddress || state.poolAddress;
     state.lastPoolQuoteAfter = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
     this._prune(state, ev.ts);
 
-    if (ev.side === 'BUY') {
+    if (this.entryMode === 'FLOW_ACCEL_15S' || ev.side === 'BUY') {
       this._trySignal(state, ev);
     }
   }
@@ -248,6 +237,8 @@ class OrderFlowTracker extends EventEmitter {
         poolAddress: null,
         lastPoolQuoteAfter: null,
         lastDumpSignal: null,
+        lastEntrySignalBucket: null,
+        firstSeenTs: null,
       };
       this.states.set(mint, state);
     }
@@ -327,12 +318,22 @@ class OrderFlowTracker extends EventEmitter {
     const cooldownUntil = this.cooldowns.get(ev.mint) || 0;
     if (cooldownUntil > wallNow) return;
 
+    const entryPattern = evaluateFlowAccelerationEntry(state.events, ev.ts, {
+      sinceTs: state.firstSeenTs,
+    });
+    if (
+      entryPattern.triggerBucketTs != null &&
+      entryPattern.triggerBucketTs === state.lastEntrySignalBucket
+    ) {
+      return;
+    }
+
     const s5 = this._stats(state, ev.ts, this.window5Ms);
     const s15 = this._stats(state, ev.ts, this.window15Ms);
     const s30 = this._stats(state, ev.ts, this.window30Ms);
     const s60 = this._stats(state, ev.ts, this.window60Ms);
     const poolQuoteSol = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
-    const reject = this._firstReject(s5, s15, s30, s60, poolQuoteSol);
+    const reject = this._firstReject(s5, s15, s30, s60, poolQuoteSol, entryPattern);
     if (reject) {
       this._debugReject(ev.mint, ev.ts, reject, s5, s15, s30, s60);
       return;
@@ -343,8 +344,11 @@ class OrderFlowTracker extends EventEmitter {
       s15: this._compactStats(s15),
       s30: this._compactStats(s30),
       s60: this._compactStats(s60),
+      entry15s: this._compactEntryPattern(entryPattern),
     };
-    const entryStats = this.entryMode === 'VOLUME_RATIO_1M' ? s60 : s15;
+    const entryStats = this.entryMode === 'FLOW_ACCEL_15S' || this.entryMode === 'VOLUME_RATIO_1M'
+      ? s60
+      : s15;
 
     const signal = {
       mint: ev.mint,
@@ -367,27 +371,37 @@ class OrderFlowTracker extends EventEmitter {
       _totalSellSol10s: round(entryStats.sellSol, 4),
       _sellers: [...new Set(entryStats.events.filter((x) => x.side === 'SELL').map((x) => x.signer).filter(Boolean))],
       _flow: flow,
+      _flowPattern: flow.entry15s,
     };
 
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} ` +
         `mode=${this.entryMode} ` +
-        `5s=${flow.s5.tradeCount}tx/${flow.s5.volumeSol.toFixed(1)}SOL ` +
-        `r=${flow.s5.buySellRatio.toFixed(2)} buyers=${flow.s5.uniqueBuyers} ` +
-        `top=${(flow.s5.largestBuyerShare * 100).toFixed(0)}% ` +
-        `jump=${flow.s5.maxSingleBuyImpactPct.toFixed(1)}% chg=${flow.s5.priceChangePct.toFixed(1)}% ` +
-        `| 15s=${flow.s15.tradeCount}tx/${flow.s15.volumeSol.toFixed(1)}SOL ` +
-        `r=${flow.s15.buySellRatio.toFixed(2)} imb=${flow.s15.imbalance.toFixed(2)} chg=${flow.s15.priceChangePct.toFixed(1)}% ` +
-        `| 60s=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(1)}SOL traders=${flow.s60.uniqueTraders}`,
+        `1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(1)}SOL ` +
+        `15sNet=${flow.entry15s.netFlows.map((value) => value.toFixed(2)).join('/')}SOL ` +
+        `accel=${flow.entry15s.previousAcceleration.toFixed(2)}->` +
+        `${flow.entry15s.currentAcceleration.toFixed(2)}->` +
+        `${flow.entry15s.latestAcceleration.toFixed(2)}`,
     );
 
+    state.lastEntrySignalBucket = entryPattern.triggerBucketTs;
     this.cooldowns.set(ev.mint, wallNow + this.cooldownMs);
     this.emit('flowReversalSignal', signal);
   }
 
-  _firstReject(s5, s15, s30, s60, poolQuoteSol) {
+  _firstReject(s5, s15, s30, s60, poolQuoteSol, entryPattern) {
     if (this.minPoolQuoteSol > 0 && (!poolQuoteSol || poolQuoteSol < this.minPoolQuoteSol)) {
       return `pool ${poolQuoteSol ? poolQuoteSol.toFixed(1) : 'unknown'}SOL<${this.minPoolQuoteSol}`;
+    }
+    if (this.entryMode === 'FLOW_ACCEL_15S') {
+      if (this.minTrades1m > 0 && s60.tradeCount < this.minTrades1m) {
+        return `1m trades ${s60.tradeCount}<${this.minTrades1m}`;
+      }
+      if (s60.volumeSol < this.minVolume1mSol) {
+        return `1m volume ${s60.volumeSol.toFixed(2)}<${this.minVolume1mSol.toFixed(2)}SOL`;
+      }
+      if (!entryPattern.matched) return entryPattern.reason;
+      return null;
     }
     if (this.entryMode === 'VOLUME_RATIO_1M') {
       if (this.minTrades1m > 0 && s60.tradeCount < this.minTrades1m) {
@@ -396,17 +410,11 @@ class OrderFlowTracker extends EventEmitter {
       if (s60.volumeSol < this.minVolume1mSol) {
         return `1m volume ${s60.volumeSol.toFixed(2)}<${this.minVolume1mSol.toFixed(2)}SOL`;
       }
-      if (s60.buySellRatio < this.minRatio1m) {
-        return `1m buy/sell ${s60.buySellRatio.toFixed(2)}<${this.minRatio1m}`;
-      }
       if (s5.buyCount < this.confirmMinBuyTrades5s) {
         return `5s buy trades ${s5.buyCount}<${this.confirmMinBuyTrades5s}`;
       }
       if (s5.uniqueBuyers < this.confirmMinUniqueBuyers5s) {
         return `5s buyers ${s5.uniqueBuyers}<${this.confirmMinUniqueBuyers5s}`;
-      }
-      if (s5.buySellRatio < this.confirmMinRatio5s) {
-        return `5s buy/sell ${s5.buySellRatio.toFixed(2)}<${this.confirmMinRatio5s}`;
       }
       if (s5.largestBuyerShare > this.confirmMaxBuyerShare5s) {
         return `5s top buyer ${(s5.largestBuyerShare * 100).toFixed(0)}%>${(this.confirmMaxBuyerShare5s * 100).toFixed(0)}%`;
@@ -428,9 +436,6 @@ class OrderFlowTracker extends EventEmitter {
     }
     if (s30.tradeCount < this.minTrades30s) return `30s trades ${s30.tradeCount}<${this.minTrades30s}`;
     if (s30.volumeSol < this.minVolume30sSol) return `30s volume ${s30.volumeSol.toFixed(2)}<${this.minVolume30sSol}`;
-    if (s30.buySellRatio < this.minRatio30s) {
-      return `30s buy/sell ${s30.buySellRatio.toFixed(2)}<${this.minRatio30s}`;
-    }
     if (s30.priceChangePct < this.minPriceChange30sPct) {
       return `30s price ${s30.priceChangePct.toFixed(1)}%<${this.minPriceChange30sPct}%`;
     }
@@ -440,9 +445,6 @@ class OrderFlowTracker extends EventEmitter {
 
     if (s15.tradeCount < this.minTrades15s) return `15s trades ${s15.tradeCount}<${this.minTrades15s}`;
     if (s15.volumeSol < this.minVolume15sSol) return `15s volume ${s15.volumeSol.toFixed(2)}<${this.minVolume15sSol}`;
-    if (s15.buySellRatio < this.minRatio15s) {
-      return `15s buy/sell ${s15.buySellRatio.toFixed(2)}<${this.minRatio15s}`;
-    }
     if (s15.imbalance < this.minImbalance15s) {
       return `15s imbalance ${s15.imbalance.toFixed(2)}<${this.minImbalance15s}`;
     }
@@ -455,7 +457,6 @@ class OrderFlowTracker extends EventEmitter {
 
     if (s5.tradeCount < this.minTrades5s) return `5s trades ${s5.tradeCount}<${this.minTrades5s}`;
     if (s5.volumeSol < this.minVolume5sSol) return `5s volume ${s5.volumeSol.toFixed(2)}<${this.minVolume5sSol}`;
-    if (s5.buySellRatio < this.minRatio5s) return `5s buy/sell ${s5.buySellRatio.toFixed(2)}<${this.minRatio5s}`;
     if (s5.imbalance < this.minImbalance5s) return `5s imbalance ${s5.imbalance.toFixed(2)}<${this.minImbalance5s}`;
     if (s5.uniqueBuyers < this.minUniqueBuyers5s) return `5s buyers ${s5.uniqueBuyers}<${this.minUniqueBuyers5s}`;
     if (s5.lastSide !== 'BUY') return 'last side is not BUY';
@@ -493,6 +494,16 @@ class OrderFlowTracker extends EventEmitter {
       largestBuyerShare: round(stats.largestBuyerShare, 3),
       maxSingleBuyImpactPct: round(stats.maxSingleBuyImpactPct, 3),
       priceChangePct: round(stats.priceChangePct, 3),
+    };
+  }
+
+  _compactEntryPattern(pattern) {
+    return {
+      triggerBucketTs: pattern.triggerBucketTs,
+      previousAcceleration: round(pattern.previousAcceleration, 4),
+      currentAcceleration: round(pattern.currentAcceleration, 4),
+      latestAcceleration: round(pattern.latestAcceleration, 4),
+      netFlows: pattern.candles.map((candle) => round(candle.netFlow, 4)),
     };
   }
 

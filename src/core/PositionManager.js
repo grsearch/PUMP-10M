@@ -29,24 +29,12 @@ const EventEmitter = require('events');
 const crypto = require('crypto');
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
+const { evaluateFlowTurnExit } = require('./FlowCandleStrategy');
 
 const monitor = getMonitor();
 monitor.registerModule('PositionManager', { staleMs: 10_000, label: 'Position Manager' });
 
 const SELL_RETRY_DELAYS_MS = [500, 1500, 3000, 5000, 10_000, 20_000]; // 之后保持 30s
-
-function sumSolVolume(items) {
-  return items.reduce((sum, x) => sum + (Number.isFinite(x.solVolume) ? x.solVolume : 0), 0);
-}
-
-function uniqueCount(items, field) {
-  const set = new Set();
-  for (const item of items) {
-    const v = item[field];
-    if (v) set.add(v);
-  }
-  return set.size;
-}
 
 class PositionManager extends EventEmitter {
   constructor({ tradeLogger, executor, priceTracker, tokenRegistry, tickStream, postExitTracker }) {
@@ -153,6 +141,7 @@ class PositionManager extends EventEmitter {
       solVolume,
       signer: swap.signer || null,
       ts: Number.isFinite(swap.ts) ? swap.ts : Date.now(),
+      slot: swap.slot || 0,
       signature: swap.signature || null,
     };
 
@@ -176,45 +165,11 @@ class PositionManager extends EventEmitter {
     const events = this._flowExitEvents.get(mint);
     if (!events) return;
 
-    const s = config.strategy;
-    const maxWindowMs = Math.max(
-      s.flowReversalExitWindowMs || 60_000,
-      s.flowReversalExitWindow5Ms || 5_000,
-      s.flowReversalExitWindow15Ms || 15_000,
-    ) + 1_000;
+    const maxWindowMs = 60_000 + 1_000;
     const cutoff = now - maxWindowMs;
     const kept = events.filter((ev) => ev.ts >= cutoff);
     if (kept.length > 0) this._flowExitEvents.set(mint, kept);
     else this._flowExitEvents.delete(mint);
-  }
-
-  _flowExitStats(mint, now, windowMs) {
-    const events = (this._flowExitEvents.get(mint) || [])
-      .filter((ev) => ev.ts >= now - windowMs && ev.ts <= now)
-      .sort((a, b) => a.ts - b.ts);
-    const buys = events.filter((ev) => ev.side === 'BUY');
-    const sells = events.filter((ev) => ev.side === 'SELL');
-    const buySol = sumSolVolume(buys);
-    const sellSol = sumSolVolume(sells);
-    const volumeSol = buySol + sellSol;
-    const first = events[0] || null;
-    const last = events[events.length - 1] || null;
-
-    return {
-      tradeCount: events.length,
-      buyCount: buys.length,
-      sellCount: sells.length,
-      buySol,
-      sellSol,
-      volumeSol,
-      sellBuyRatio: sellSol / Math.max(buySol, 0.001),
-      imbalance: (sellSol - buySol) / Math.max(volumeSol, 0.001),
-      uniqueSellers: uniqueCount(sells, 'signer'),
-      uniqueBuyers: uniqueCount(buys, 'signer'),
-      firstPrice: first ? first.price : 0,
-      lastPrice: last ? last.price : 0,
-      lastSide: last ? last.side : null,
-    };
   }
 
   _maybeFlowReversalExit(pos, price, now) {
@@ -225,55 +180,16 @@ class PositionManager extends EventEmitter {
     if (!Number.isFinite(price) || price <= 0 || !pos.entryPrice || pos.entryPrice <= 0) return;
 
     const holdStart = pos.reconciledAt || pos.openedAt || now;
-    if (now - holdStart < s.flowReversalExitMinHoldMs) return;
+    const events = this._flowExitEvents.get(pos.mint) || [];
+    const observedSince = events.length > 0 ? Math.max(holdStart, events[0].ts) : holdStart;
+    const pattern = evaluateFlowTurnExit(events, now, { sinceTs: observedSince });
+    if (!pattern.matched) return;
 
-    if (s.flowReversalExitMode === 'VOLUME_RATIO_1M') {
-      const windowMs = s.flowReversalExitWindowMs || 60_000;
-      const st1m = this._flowExitStats(pos.mint, now, windowMs);
-      if (st1m.volumeSol < s.flowReversalExitMinVolume1mSol) return;
-      if (st1m.sellSol <= st1m.buySol) return;
-      if (st1m.sellBuyRatio < s.flowReversalExitSellBuyRatio1m) return;
-      if (st1m.lastSide !== 'SELL') return;
-
-      const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-      console.log(
-        `[PositionManager] FLOW_REVERSAL_EXIT ${pos.symbol || pos.mint.slice(0, 6)} ` +
-          `mode=VOLUME_RATIO_1M pnl=${pnlPct.toFixed(2)}% ` +
-          `1m sell/buy=${st1m.sellSol.toFixed(2)}/${st1m.buySol.toFixed(2)}SOL ` +
-          `r=${st1m.sellBuyRatio.toFixed(2)} volume=${st1m.volumeSol.toFixed(2)}SOL`,
-      );
-      monitor.inc('PositionManager.flowReversalExit', 1, 'PositionManager');
-      this._exitForCondition(pos, price, 'FLOW_REVERSAL_EXIT');
-      return;
-    }
-
-    const st5 = this._flowExitStats(pos.mint, now, s.flowReversalExitWindow5Ms);
-    if (st5.tradeCount < s.flowReversalExitMinTrades5s) return;
-    if (st5.volumeSol < s.flowReversalExitMinVolume5sSol) return;
-    if (st5.sellBuyRatio < s.flowReversalExitSellBuyRatio5s) return;
-    if (st5.imbalance < s.flowReversalExitImbalance5s) return;
-    if (st5.lastSide !== 'SELL') return;
-
-    const st15 = this._flowExitStats(pos.mint, now, s.flowReversalExitWindow15Ms);
-    if (st15.tradeCount < s.flowReversalExitMinTrades15s) return;
-    if (st15.volumeSol < s.flowReversalExitMinVolume15sSol) return;
-    if (st15.sellBuyRatio < s.flowReversalExitSellBuyRatio15s) return;
-    if (st15.imbalance < s.flowReversalExitImbalance15s) return;
-
-    const hwm = Math.max(pos.highWaterMark || 0, pos.entryPrice);
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-    const peakPnlPct = ((hwm - pos.entryPrice) / pos.entryPrice) * 100;
-    const drawdownPct = hwm > 0 ? ((hwm - price) / hwm) * 100 : 0;
-    const peakDropPct = peakPnlPct - pnlPct;
-
-    if (peakPnlPct < s.flowReversalExitMinPeakPnlPct) return;
-    if (drawdownPct < s.flowReversalExitMinDrawdownPct && peakDropPct < s.flowReversalExitMinPeakDropPct) return;
-
     console.log(
       `[PositionManager] FLOW_REVERSAL_EXIT ${pos.symbol || pos.mint.slice(0, 6)} ` +
-        `pnl=${pnlPct.toFixed(2)}% peak=${peakPnlPct.toFixed(2)}% dd=${drawdownPct.toFixed(2)}% ` +
-        `5s=${st5.sellSol.toFixed(2)}/${st5.buySol.toFixed(2)}SOL r=${st5.sellBuyRatio.toFixed(2)} ` +
-        `15s=${st15.sellSol.toFixed(2)}/${st15.buySol.toFixed(2)}SOL r=${st15.sellBuyRatio.toFixed(2)}`,
+        `mode=FLOW_TURN_15S pnl=${pnlPct.toFixed(2)}% ` +
+        `netFlow=${pattern.previousNetFlow.toFixed(2)}->${pattern.currentNetFlow.toFixed(2)}SOL`,
     );
     monitor.inc('PositionManager.flowReversalExit', 1, 'PositionManager');
     this._exitForCondition(pos, price, 'FLOW_REVERSAL_EXIT');
