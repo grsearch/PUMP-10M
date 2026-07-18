@@ -179,6 +179,8 @@ class FeatureRecorder {
       signature: swap.signature || null,
       poolAddress: swap.poolAddress || state.poolAddress || null,
       poolQuoteAfter: positive(swap.poolQuoteAfter, null),
+      dataQualityVersion: Math.max(1, Math.floor(finite(swap.dataQualityVersion, 1))),
+      priceSanitized: Boolean(swap.priceSanitized),
     };
     if (ev.priceChangePct == null && ev.price && ev.priceBefore) {
       ev.priceChangePct = ((ev.price - ev.priceBefore) / ev.priceBefore) * 100;
@@ -192,6 +194,7 @@ class FeatureRecorder {
     state.poolAddress = ev.poolAddress || state.poolAddress;
     state.lastPoolQuoteAfter = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
     state.lastSeenAt = Math.max(state.lastSeenAt || 0, ev.ts);
+    state.lastDataQualityVersion = Math.max(state.lastDataQualityVersion || 1, ev.dataQualityVersion);
     if (ev.price) state.lastPrice = ev.price;
 
     if (ev.signer) {
@@ -282,6 +285,7 @@ class FeatureRecorder {
         poolAddress: null,
         lastPoolQuoteAfter: null,
         lastPrice: null,
+        lastDataQualityVersion: 1,
         lastSeenAt: 0,
         buyStreak: 0,
         sellStreak: 0,
@@ -389,6 +393,7 @@ class FeatureRecorder {
       holders: this._extractHolders(token),
       pool_address: state.poolAddress || token?.pool_address || null,
       pool_quote_after: finite(state.lastPoolQuoteAfter, null),
+      data_quality_version: state.lastDataQualityVersion || 1,
       buy_streak: state.buyStreak,
       sell_streak: state.sellStreak,
       lp_change_60s_pct: this._marketDeltaPct(state, now, 'liquidity', liquidity),
@@ -464,6 +469,7 @@ class FeatureRecorder {
       unique_sell_wallets: uniqueSet(sells, (ev) => ev.signer).size,
       fdv: finite(token?.fdv, null),
       liquidity: finite(token?.liquidity, null),
+      data_quality_version: Math.min(...events.map((ev) => ev.dataQualityVersion || 1)),
       updated_at: now,
     };
   }

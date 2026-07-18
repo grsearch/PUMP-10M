@@ -200,6 +200,12 @@ async function main() {
   const activityFlowTracker = new ActivityFlowTracker({ tokenRegistry });
   const featureRecorder = new FeatureRecorder({ tradeLogger, tokenRegistry });
   featureRecorder.start();
+  const swapSanitizer = dumpDetector.swapEventSanitizer;
+  console.log(
+    `[main] SwapSanitizer ${swapSanitizer.enabled ? 'enabled' : 'disabled'}: ` +
+      `quality=v${swapSanitizer.enabled ? 2 : 1} ` +
+      `jump<=${swapSanitizer.maxJumpRatio}x market<=${swapSanitizer.marketMaxRatio}x`,
+  );
   console.log(
     `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
       `mode=${activityFlowTracker.entryMode} ` +

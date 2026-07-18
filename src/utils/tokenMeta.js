@@ -3,6 +3,8 @@
 const axios = require('axios');
 const { config } = require('../config');
 
+const WRAPPED_SOL_MINT = 'So11111111111111111111111111111111111111112';
+
 /**
  * 通过 Helius DAS API 获取代币基本信息（symbol, decimals, name）。
  */
@@ -51,6 +53,7 @@ async function fetchTokenMarketFromBirdeye(mint) {
     marketCap: d.mc ?? null,
     liquidity: d.liquidity ?? null,
     price: d.price ?? null,
+    holders: d.holder ?? d.holderCount ?? d.holders ?? null,
     priceChange24h: d.priceChange24hPercent ?? null,
     volume24h: d.v24hUSD ?? null,
     marketSource: 'birdeye',
@@ -92,6 +95,9 @@ function normalizeDexScreenerPair(pair, mint = pair?.baseToken?.address) {
   const marketCap = isBaseToken ? finitePositive(pair.marketCap) : null;
   const liquidity = finitePositive(pair.liquidity?.usd);
   const price = isBaseToken ? finitePositive(pair.priceUsd) : null;
+  const priceSol = isBaseToken && pair.quoteToken?.address === WRAPPED_SOL_MINT
+    ? finitePositive(pair.priceNative)
+    : null;
   const effectiveFdv = fdv || marketCap;
   const pairCreatedAt = Number.isFinite(Number(pair.pairCreatedAt))
     ? Number(pair.pairCreatedAt)
@@ -105,6 +111,7 @@ function normalizeDexScreenerPair(pair, mint = pair?.baseToken?.address) {
     marketCap,
     liquidity,
     price,
+    priceSol,
     priceChange24h: Number.isFinite(Number(pair.priceChange?.h24))
       ? Number(pair.priceChange.h24)
       : null,

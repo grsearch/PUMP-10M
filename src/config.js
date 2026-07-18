@@ -279,6 +279,18 @@ const config = {
     // 可疑样本必须在多少毫秒内连续出现并方向一致才接受
     confirmWindowMs: parseInt(process.env.PRICE_CONFIRM_WINDOW_MS || '3000', 10),
     confirmMinSamples: parseInt(process.env.PRICE_CONFIRM_MIN_SAMPLES || '2', 10),
+    swapSanitizer: {
+      enabled: (process.env.SWAP_SANITIZER_ENABLED ?? 'true').toLowerCase() === 'true',
+      solPriceUsd: parseFloat(process.env.SOL_PRICE_USD || '72'),
+      maxJumpRatio: parseFloat(process.env.SWAP_SANITIZER_MAX_JUMP_RATIO || '2'),
+      marketMaxRatio: parseFloat(process.env.SWAP_SANITIZER_MARKET_MAX_RATIO || '5'),
+      marketMaxAgeMs: parseInt(process.env.SWAP_SANITIZER_MARKET_MAX_AGE_MS || '300000', 10),
+      confirmWindowMs: parseInt(process.env.SWAP_SANITIZER_CONFIRM_WINDOW_MS || '5000', 10),
+      confirmMinSamples: parseInt(process.env.SWAP_SANITIZER_CONFIRM_MIN_SAMPLES || '3', 10),
+      confirmMinSpanMs: parseInt(process.env.SWAP_SANITIZER_CONFIRM_MIN_SPAN_MS || '100', 10),
+      confirmClusterRatio: parseFloat(process.env.SWAP_SANITIZER_CONFIRM_CLUSTER_RATIO || '1.25'),
+      debug: (process.env.SWAP_SANITIZER_DEBUG ?? 'false').toLowerCase() === 'true',
+    },
   },
 
   // ============ Helius ============

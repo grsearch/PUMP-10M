@@ -17,6 +17,7 @@ const DEFAULT_COLUMNS = [
   'liquidity',
   'age_min',
   'holders',
+  'data_quality_version',
   'buy_volume_5s',
   'sell_volume_5s',
   'buy_sell_ratio_5s',
@@ -72,6 +73,7 @@ function parseArgs(argv) {
     limit: 0,
     allColumns: false,
     includeUnlabeled: false,
+    minQualityVersion: 2,
   };
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -80,6 +82,12 @@ function parseArgs(argv) {
     else if (arg === '--limit') args.limit = Number(argv[++i] || 0);
     else if (arg === '--all') args.allColumns = true;
     else if (arg === '--include-unlabeled') args.includeUnlabeled = true;
+    else if (arg === '--min-quality-version') {
+      args.minQualityVersion = Number(argv[++i]);
+      if (!Number.isFinite(args.minQualityVersion) || args.minQualityVersion < 0) {
+        throw new Error('--min-quality-version must be a number greater than or equal to 0');
+      }
+    }
     else if (arg === '--help' || arg === '-h') {
       printHelp();
       process.exit(0);
@@ -97,6 +105,7 @@ Options:
   --limit N              Maximum rows to export. 0 means no limit.
   --all                  Export every token_snapshots column.
   --include-unlabeled    Include rows whose future labels are still null.
+  --min-quality-version  Minimum data quality version. Defaults to 2; use 0 for legacy rows.
 `);
 }
 
@@ -129,10 +138,28 @@ function main() {
   const available = new Set(db.pragma('table_info(token_snapshots)').map((row) => row.name));
   const selected = columns.filter((name) => available.has(name));
   if (!selected.includes('ts')) selected.unshift('ts');
+  if (args.allColumns) {
+    const expected = [...available].filter((name) => name !== 'id').length;
+    if (selected.length !== expected) {
+      throw new Error(`--all requested ${expected} database columns but selected ${selected.length}`);
+    }
+  }
 
   const where = [];
   const params = {};
   if (!args.includeUnlabeled) where.push('future_max_60s_pct IS NOT NULL');
+  if (
+    Number.isFinite(args.minQualityVersion) &&
+    args.minQualityVersion > 0
+  ) {
+    if (!available.has('data_quality_version')) {
+      throw new Error(
+        'data_quality_version is missing. Restart the updated bot first, or explicitly use --min-quality-version 0 for legacy data.',
+      );
+    }
+    params.minQualityVersion = Math.floor(args.minQualityVersion);
+    where.push('COALESCE(data_quality_version, 0) >= @minQualityVersion');
+  }
   if (Number.isFinite(args.hours) && args.hours > 0) {
     params.since = Date.now() - args.hours * 60 * 60 * 1000;
     where.push('ts >= @since');
@@ -161,7 +188,7 @@ function main() {
     rows++;
   }
   stream.end();
-  console.log(`Exported ${rows} rows to ${outPath}`);
+  console.log(`Exported ${rows} rows / ${selected.length + 1} CSV columns to ${outPath}`);
 }
 
 main();

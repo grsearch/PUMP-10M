@@ -83,6 +83,8 @@ TokenWatchdog 默认每 1 分钟巡检一次 FDV 和 LP：
 - `token_events`：首次突破 1 分钟高点、资金流转正、Buy Burst、TPS 翻倍、Smart Wallet 买入、LP 变化和 FDV 档位突破等事件。
 - `bot_latency_events`：买入链路的 detect / decision / send / confirm 延迟拆分。
 
+成交事件默认经过 `SwapSanitizer`：零成交量事件会被拒绝；CPI/余额回退产生的归一化价格、瞬时百倍跳价会使用最近可信池价或新鲜市场价校正。真实成交量仍会保留；暂时无法确定价格时只记录成交量，不生成价格 Tick。新数据写入 `data_quality_version=2`，原有历史行保持版本 1，便于明确区分修复前后的数据。
+
 默认只给最近有成交的代币持续快照，避免全监控列表每秒刷库影响交易延迟。若要强制整个监控列表每秒记录，设置 `STRATEGY_LAB_SNAPSHOT_ALL_ACTIVE=true`。
 
 导出策略数据集：
@@ -92,7 +94,7 @@ npm run export:strategy -- --hours 168
 npm run export:strategy -- --hours 0 --all
 ```
 
-默认只导出已经拥有 `future_max_60s_pct` 标签的样本；需要导出未打标签快照时可加 `--include-unlabeled`。
+默认只导出 `data_quality_version>=2` 且已经拥有 `future_max_60s_pct` 标签的干净样本；需要导出未打标签快照时可加 `--include-unlabeled`。`--all` 会校验导出字段数确实等于数据库全部特征字段。只有明确研究旧数据时才使用 `--min-quality-version 0`。
 
 ## 15 秒策略回测
 

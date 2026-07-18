@@ -77,6 +77,12 @@ class TradeLogger {
         exit_sol REAL,
         pnl_sol REAL,
         pnl_pct REAL,
+        peak_pnl_pct REAL,
+        peak_price REAL,
+        peak_ts INTEGER,
+        time_to_peak_ms INTEGER,
+        price_tick_count INTEGER,
+        pre_vol_5m_pct REAL,
         token_amount REAL,
         dry_run INTEGER NOT NULL DEFAULT 0,
         buy_signature TEXT,
@@ -139,7 +145,14 @@ class TradeLogger {
         slot INTEGER,
         signature TEXT,
         pool_address TEXT,
-        pool_quote_after REAL
+        pool_quote_after REAL,
+        source TEXT,
+        price_reliable INTEGER,
+        price_sanitized INTEGER,
+        raw_price REAL,
+        raw_price_before REAL,
+        sanitizer_reason TEXT,
+        data_quality_version INTEGER DEFAULT 1
       );
       CREATE INDEX IF NOT EXISTS idx_swap_events_ts ON swap_events(ts);
       CREATE INDEX IF NOT EXISTS idx_swap_events_mint_ts ON swap_events(mint, ts);
@@ -192,6 +205,24 @@ class TradeLogger {
       this.db.exec('ALTER TABLE positions ADD COLUMN is_addon INTEGER DEFAULT 0');
     } catch (_) { /* column already exists */ }
 
+    this._ensureColumns('positions', [
+      ['peak_pnl_pct', 'REAL'],
+      ['peak_price', 'REAL'],
+      ['peak_ts', 'INTEGER'],
+      ['time_to_peak_ms', 'INTEGER'],
+      ['price_tick_count', 'INTEGER'],
+      ['pre_vol_5m_pct', 'REAL'],
+    ]);
+    this._ensureColumns('swap_events', [
+      ['source', 'TEXT'],
+      ['price_reliable', 'INTEGER'],
+      ['price_sanitized', 'INTEGER'],
+      ['raw_price', 'REAL'],
+      ['raw_price_before', 'REAL'],
+      ['sanitizer_reason', 'TEXT'],
+      ['data_quality_version', 'INTEGER DEFAULT 1'],
+    ]);
+
     this._initStrategyLabSchema();
   }
 
@@ -218,6 +249,7 @@ class TradeLogger {
       ['holders', 'INTEGER'],
       ['pool_address', 'TEXT'],
       ['pool_quote_after', 'REAL'],
+      ['data_quality_version', 'INTEGER'],
     ];
 
     const windowMetrics = [
@@ -322,6 +354,7 @@ ${snapshotColumnsSql},
         unique_sell_wallets INTEGER,
         fdv REAL,
         liquidity REAL,
+        data_quality_version INTEGER,
         updated_at INTEGER,
         PRIMARY KEY(timeframe, mint, bucket_ts)
       );
@@ -385,6 +418,7 @@ ${snapshotColumnsSql},
       ['unique_sell_wallets', 'INTEGER'],
       ['fdv', 'REAL'],
       ['liquidity', 'REAL'],
+      ['data_quality_version', 'INTEGER'],
       ['updated_at', 'INTEGER'],
     ]);
     this._ensureColumns('token_events', [
@@ -461,10 +495,12 @@ ${snapshotColumnsSql},
       insertSwapEvent: this.db.prepare(`
         INSERT OR IGNORE INTO swap_events
           (ts, mint, symbol, signer, side, sol_volume, price, price_before, price_change_pct,
-           slot, signature, pool_address, pool_quote_after)
+           slot, signature, pool_address, pool_quote_after, source, price_reliable,
+           price_sanitized, raw_price, raw_price_before, sanitizer_reason, data_quality_version)
         VALUES
           (@ts, @mint, @symbol, @signer, @side, @solVolume, @price, @priceBefore, @priceChangePct,
-           @slot, @signature, @poolAddress, @poolQuoteAfter)
+           @slot, @signature, @poolAddress, @poolQuoteAfter, @source, @priceReliable,
+           @priceSanitized, @rawPrice, @rawPriceBefore, @sanitizerReason, @dataQualityVersion)
       `),
 
       swapEventsInRange: this.db.prepare(`
@@ -650,11 +686,11 @@ ${snapshotColumnsSql},
       INSERT INTO token_candles
         (timeframe, bucket_ts, mint, symbol, open, high, low, close,
          volume_sol, buy_volume_sol, sell_volume_sol, buy_count, sell_count, tx_count,
-         unique_buy_wallets, unique_sell_wallets, fdv, liquidity, updated_at)
+         unique_buy_wallets, unique_sell_wallets, fdv, liquidity, data_quality_version, updated_at)
       VALUES
         (@timeframe, @bucket_ts, @mint, @symbol, @open, @high, @low, @close,
          @volume_sol, @buy_volume_sol, @sell_volume_sol, @buy_count, @sell_count, @tx_count,
-         @unique_buy_wallets, @unique_sell_wallets, @fdv, @liquidity, @updated_at)
+         @unique_buy_wallets, @unique_sell_wallets, @fdv, @liquidity, @data_quality_version, @updated_at)
       ON CONFLICT(timeframe, mint, bucket_ts) DO UPDATE SET
         symbol = excluded.symbol,
         open = excluded.open,
@@ -671,6 +707,7 @@ ${snapshotColumnsSql},
         unique_sell_wallets = excluded.unique_sell_wallets,
         fdv = excluded.fdv,
         liquidity = excluded.liquidity,
+        data_quality_version = excluded.data_quality_version,
         updated_at = excluded.updated_at
     `);
 
@@ -694,6 +731,7 @@ ${snapshotColumnsSql},
       SELECT id, mint, ts, price
       FROM token_snapshots
       WHERE price > 0
+        AND COALESCE(data_quality_version, 1) >= 2
         AND ts <= ?
         AND label_updated_at IS NULL
       ORDER BY ts ASC
@@ -707,6 +745,7 @@ ${snapshotColumnsSql},
         AND ts > ?
         AND ts <= ?
         AND price > 0
+        AND COALESCE(data_quality_version, 1) >= 2
       ORDER BY ts ASC, id ASC
     `);
 
@@ -783,6 +822,7 @@ ${snapshotColumnsSql},
     if (side !== 'BUY' && side !== 'SELL') return;
 
     const num = (value) => {
+      if (value == null || value === '') return null;
       const n = Number(value);
       return Number.isFinite(n) ? n : null;
     };
@@ -802,6 +842,13 @@ ${snapshotColumnsSql},
         signature: swap.signature || null,
         poolAddress: swap.poolAddress || null,
         poolQuoteAfter: num(swap.poolQuoteAfter),
+        source: swap.source || null,
+        priceReliable: swap.priceReliable ? 1 : 0,
+        priceSanitized: swap.priceSanitized ? 1 : 0,
+        rawPrice: num(swap.rawPrice),
+        rawPriceBefore: num(swap.rawPriceBefore),
+        sanitizerReason: swap.sanitizerReason || null,
+        dataQualityVersion: num(swap.dataQualityVersion) || 1,
       });
     } catch (_) { /* best effort; strategy must never block on analytics writes */ }
   }
@@ -849,6 +896,7 @@ ${snapshotColumnsSql},
       unique_sell_wallets: this._cleanDbValue(candle.unique_sell_wallets),
       fdv: this._cleanDbValue(candle.fdv),
       liquidity: this._cleanDbValue(candle.liquidity),
+      data_quality_version: this._cleanDbValue(candle.data_quality_version),
       updated_at: candle.updated_at || Date.now(),
     };
     try {

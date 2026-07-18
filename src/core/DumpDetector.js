@@ -31,6 +31,7 @@ const bs58Lib = require('bs58');
 const bs58 = bs58Lib.default || bs58Lib;
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
+const SwapEventSanitizer = require('./SwapEventSanitizer');
 
 const monitor = getMonitor();
 monitor.registerModule('DumpDetector', { staleMs: 120_000, label: 'Dump Detector' });
@@ -68,6 +69,7 @@ class DumpDetector extends EventEmitter {
     super();
     this.tokenRegistry = tokenRegistry;
     this.poolStateCache = null;
+    this.swapEventSanitizer = new SwapEventSanitizer({ tokenRegistry });
 
     // v3.17.13: 短窗口累计砸盘追踪
     //   记录每个 mint 最近 N 秒内的所有卖出,用于检测 rug
@@ -101,6 +103,7 @@ class DumpDetector extends EventEmitter {
     }
     this._recentSells.clear();
     this._processedSigs.clear();
+    this.swapEventSanitizer.clear();
   }
 
   setPoolStateCache(cache) {
@@ -171,28 +174,12 @@ class DumpDetector extends EventEmitter {
         return;
       }
 
-      // emit priceTick (DumpDetector 只 emit "可信"价格--pool 已知的)
-      // v3.17.17: 带 side + quoteAmount + poolQuoteAfter 让 RSI 能做 volume-weighted
-      monitor.inc('DumpDetector.priceTicks', 1, 'DumpDetector');
-      this.emit('priceTick', {
-        mint: parsed.baseMint,
-        price: parsed.priceAfter,
-        ts: parsed.ts,
-        poolAddress: parsed.poolAddress,
-        side: parsed.side,                 // 'BUY' | 'SELL'
-        solVolume: parsed.quoteAmount,     // 这笔交易的 SOL 体积
-        poolQuoteAfter: parsed.poolQuoteAfter, // 池子当前 SOL
-      });
-
-      // v3.17.20: emit swapParsed -- 给 CompetitorTracker 用。
-      //   每一笔被监控代币上的 swap(无论 BUY/SELL)都带上 signer(钱包)、side、SOL 体积、价格。
-      //   CompetitorTracker 只关心被追踪钱包的交易,其余直接忽略,零额外开销。
-      this.emit('swapParsed', {
+      const sanitized = this.swapEventSanitizer.sanitize({
         mint: parsed.baseMint,
         symbol: parsed.symbol,
-        signer: parsed.signer,             // 交易钱包(竞争对手地址比对用)
-        side: parsed.side,                 // 'BUY' | 'SELL'
-        solVolume: parsed.quoteAmount,     // 这笔 swap 的 SOL 体积
+        signer: parsed.signer,
+        side: parsed.side,
+        solVolume: parsed.quoteAmount,
         price: parsed.priceAfter,
         priceBefore: parsed.priceBefore,
         priceChangePct: parsed.priceChangePct,
@@ -201,7 +188,41 @@ class DumpDetector extends EventEmitter {
         signature: parsed.signature,
         poolAddress: parsed.poolAddress,
         poolQuoteAfter: parsed.poolQuoteAfter,
+        source: parsed.source,
+        priceReliable: parsed.priceReliable,
       });
+      if (sanitized.event) {
+        const swap = sanitized.event;
+        const hasTrustedPrice = Number.isFinite(swap.price) && swap.price > 0;
+        parsed._analyticsPriceBefore = hasTrustedPrice ? swap.priceBefore : 0;
+        parsed._analyticsPriceAfter = hasTrustedPrice ? swap.price : 0;
+        parsed._analyticsPriceChangePct = hasTrustedPrice ? swap.priceChangePct : 0;
+        monitor.inc(
+          sanitized.status === 'accepted'
+            ? 'DumpDetector.swapSanitizerAccepted'
+            : `DumpDetector.swapSanitizer.${sanitized.status}`,
+          1,
+          'DumpDetector',
+        );
+        if (hasTrustedPrice) {
+          monitor.inc('DumpDetector.priceTicks', 1, 'DumpDetector');
+          this.emit('priceTick', {
+            mint: swap.mint,
+            price: swap.price,
+            ts: swap.ts,
+            poolAddress: swap.poolAddress,
+            side: swap.side,
+            solVolume: swap.solVolume,
+            poolQuoteAfter: swap.poolQuoteAfter,
+            priceSanitized: swap.priceSanitized,
+            dataQualityVersion: swap.dataQualityVersion,
+          });
+        }
+        this.emit('swapParsed', swap);
+      } else {
+        monitor.inc('DumpDetector.swapSanitizerRejected', 1, 'DumpDetector');
+        return;
+      }
 
       // 仅卖单进入下游判定
       if (parsed.side !== 'SELL') return;
@@ -246,7 +267,7 @@ class DumpDetector extends EventEmitter {
       }
 
       const sellSol = parsed.quoteAmount; // 用户得到的 quote (SOL)
-      const priceImpactPct = -parsed.priceChangePct; // 转为正数表示跌幅
+      const priceImpactPct = -(parsed._analyticsPriceChangePct ?? parsed.priceChangePct); // 转为正数表示跌幅
       const poolQuoteAfter = parsed.poolQuoteAfter; // 池子 SOL 余额
 
       // v3.10: 三条过滤
@@ -303,8 +324,8 @@ class DumpDetector extends EventEmitter {
         signature: parsed.signature,
         ts: parsed.ts,
         poolAddress: parsed.poolAddress,
-        priceAfter: parsed.priceAfter,
-        priceBefore: parsed.priceBefore,
+        priceAfter: parsed._analyticsPriceAfter ?? parsed.priceAfter,
+        priceBefore: parsed._analyticsPriceBefore ?? parsed.priceBefore,
       });
 
       // v3.17.15: 跨 slot RUG 检测已移除 - RUG 必须同 slot(相同 GAS)才算
@@ -316,8 +337,8 @@ class DumpDetector extends EventEmitter {
       }
       this._recentSells.get(recentMint).push({
         sellSol,
-        priceBefore: parsed.priceBefore,
-        priceAfter: parsed.priceAfter,
+        priceBefore: parsed._analyticsPriceBefore ?? parsed.priceBefore,
+        priceAfter: parsed._analyticsPriceAfter ?? parsed.priceAfter,
         ts: parsed.ts,
         slot: parsed.slot || null, // v3.17.20: 供 CompetitorTracker 算 dump→buy slot lag
       });
@@ -400,8 +421,8 @@ class DumpDetector extends EventEmitter {
       poolAddress: parsed.poolAddress,
       poolBaseVault: parsed.poolBaseVault,
       poolQuoteVault: parsed.poolQuoteVault,
-      priceAfter: parsed.priceAfter,
-      priceBefore: parsed.priceBefore,
+      priceAfter: parsed._analyticsPriceAfter ?? parsed.priceAfter,
+      priceBefore: parsed._analyticsPriceBefore ?? parsed.priceBefore,
       baseDecimals: parsed.baseDecimals,
       quoteDecimals: parsed.quoteDecimals,
       _sellCount10s: recentStats ? recentStats.sellCount : 1,
@@ -421,7 +442,7 @@ class DumpDetector extends EventEmitter {
     bucket.sells.push({
       mint: parsed.baseMint,
       sellSol: parsed.quoteAmount,
-      priceImpactPct: -parsed.priceChangePct,
+      priceImpactPct: -(parsed._analyticsPriceChangePct ?? parsed.priceChangePct),
       poolQuoteAfter: parsed.poolQuoteAfter,
       seller: parsed.signer,
       signature: parsed.signature,
@@ -429,8 +450,8 @@ class DumpDetector extends EventEmitter {
       slot: parsed.slot,
       symbol: parsed.symbol,
       poolAddress: parsed.poolAddress,
-      priceBefore: parsed.priceBefore,
-      priceAfter: parsed.priceAfter,
+      priceBefore: parsed._analyticsPriceBefore ?? parsed.priceBefore,
+      priceAfter: parsed._analyticsPriceAfter ?? parsed.priceAfter,
       poolBaseVault: parsed.poolBaseVault,
       poolQuoteVault: parsed.poolQuoteVault,
       baseDecimals: parsed.baseDecimals,
@@ -785,6 +806,7 @@ class DumpDetector extends EventEmitter {
       poolBaseAfter: baseAfter,
       _poolBaseDelta: poolBaseDelta,
       source: 'direct',
+      priceReliable: true,
     };
   }
 
@@ -851,6 +873,7 @@ class DumpDetector extends EventEmitter {
     let priceAfter = 0;
     let priceChangePct = 0;
     let poolQuoteAfter = 0;
+    let priceReliable = false;
 
     if (poolState && poolState.poolQuoteAmount && poolState.poolBaseAmount) {
       // 有实时池子状态,用 AMM 常数乘积精确计算
@@ -863,6 +886,7 @@ class DumpDetector extends EventEmitter {
         : Number(poolState.poolBaseAmount) / Math.pow(10, baseDecimals);
 
       if (qBefore > 0 && bBefore > 0) {
+        priceReliable = true;
         priceBefore = qBefore / bBefore;
         const qAfter = (qBefore * bBefore) / baseAfter;
         quoteAmount = Math.abs(qBefore - qAfter);
@@ -894,9 +918,9 @@ class DumpDetector extends EventEmitter {
       //
       // 更好的方法:用 base 余额比例直接算 priceChangePct 和近似 quoteAmount
       const baseRatio = baseBefore / baseAfter; // >1 for SELL (base increased)
-      priceChangePct = (1 - baseRatio * baseRatio) * 100; // = (1 - (baseBefore/baseAfter)2) × 100
       priceBefore = 1; // 归一化
-      priceAfter = baseRatio * baseRatio; // price_after/price_before = (base_before/base_after)2
+      priceAfter = baseRatio * baseRatio; // price_after/price_before = (base_before/base_after)^2
+      priceChangePct = (priceAfter - priceBefore) * 100;
       // quoteAmount 近似:|baseDelta| / baseBefore × 池子 quote 规模
       //   不知道池子规模,用 baseDelta 比例近似(偏保守)
       //   实际 quoteAmount ≈ |poolBaseDelta| × priceBefore = |poolBaseDelta| (归一化)
@@ -946,6 +970,7 @@ class DumpDetector extends EventEmitter {
       poolBaseAfter: baseAfter,
       _poolBaseDelta: poolBaseDelta,
       source: 'cpi',
+      priceReliable,
     };
   }
 
@@ -1155,6 +1180,7 @@ class DumpDetector extends EventEmitter {
     let priceAfter = 0;
     let priceChangePct = 0;
     let poolQuoteAfter = 0;
+    let priceReliable = false;
 
     // 先试卖家 SOL native balance 变化(最准)
     const solDelta = this._estimateCpiSolDelta(meta, bestSeller, allKeys);
@@ -1179,6 +1205,7 @@ class DumpDetector extends EventEmitter {
         ? poolState.poolBaseAmount.toNumber() / Math.pow(10, baseDecimals)
         : Number(poolState.poolBaseAmount) / Math.pow(10, baseDecimals);
       if (qBefore > 0 && bBefore > 0) {
+        priceReliable = true;
         priceBefore = qBefore / bBefore;
         const bAfter = bBefore + tokensSold;
         const qAfter = (qBefore * bBefore) / bAfter;
@@ -1243,6 +1270,7 @@ class DumpDetector extends EventEmitter {
       poolQuoteAfter,
       poolBaseAfter: 0,
       source: 'balance_only',
+      priceReliable,
     };
   }
 
