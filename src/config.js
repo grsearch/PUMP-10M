@@ -119,10 +119,10 @@ const config = {
     //   v3.17.19: 30秒 (30000ms) — 反弹窗口通常 5-30 秒
     //   v3.17.20: 设 0 禁用 TIMEOUT 卖出，持仓靠 TP/Trailing/Emergency 退出
     //   v3.17.32: 恢复为 4h 强制退出(数据回测: 4h+ 只有 30% 胜率, 平均亏 -13%)
-    // Strategy V5 hard timeout: close every remaining position after 180 seconds.
+    // Activity strategies hard timeout: close every remaining position after 180 seconds.
     maxHoldMs: parseInt(process.env.MAX_HOLD_MS || '180000', 10),
 
-    // Strategy V5 exits quiet positions before the hard 180s timeout.
+    // Activity strategies exit quiet positions before the hard 180s timeout.
     noBounceExitEnabled: (process.env.NO_BOUNCE_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
     noBounceExitMs: parseInt(process.env.NO_BOUNCE_EXIT_MS || '90000', 10),
     noBounceMaxPeakPnlPct: parseFloat(process.env.NO_BOUNCE_MAX_PEAK_PNL_PCT || '5'),
@@ -217,7 +217,7 @@ const config = {
 
   // ============ Activity-flow entry ============
   activityFlow: {
-    // Strategy V5: arm on broad 1-minute activity, then enter on a confirmed 5-second flow turn.
+    // Strategy V6: arm on broad buyer participation, then confirm short-window breadth/acceleration.
     enabled:
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_ENABLED ?? process.env.ORDER_FLOW_ENABLED ?? 'true').toLowerCase() === 'true',
@@ -225,7 +225,7 @@ const config = {
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL ?? process.env.ORDER_FLOW_REPLACE_DUMP_SIGNAL ?? 'true')
         .toLowerCase() === 'true',
-    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'ACTIVITY_BURST_V5').toUpperCase(),
+    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'BREADTH_BURST_V6').toUpperCase(),
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -253,6 +253,24 @@ const config = {
     triggerMaxPriceChange10sPct: parseFloat(process.env.ACTIVITY_FLOW_TRIGGER_MAX_PRICE_CHANGE_10S_PCT || '6'),
     triggerConfirmMinGapMs: parseInt(process.env.ACTIVITY_FLOW_TRIGGER_CONFIRM_MIN_GAP_MS || '1000', 10),
     triggerConfirmMaxGapMs: parseInt(process.env.ACTIVITY_FLOW_TRIGGER_CONFIRM_MAX_GAP_MS || '3000', 10),
+    breadthMinUniqueBuyers1m: parseInt(process.env.BREADTH_BURST_MIN_UNIQUE_BUYERS_1M || '80', 10),
+    breadthMinNewBuyers1m: parseInt(process.env.BREADTH_BURST_MIN_NEW_BUYERS_1M || '40', 10),
+    breadthMinBuyCount1m: parseInt(process.env.BREADTH_BURST_MIN_BUY_COUNT_1M || '100', 10),
+    breadthMaxLargestBuyShare1m: parseFloat(
+      process.env.BREADTH_BURST_MAX_LARGEST_BUY_SHARE_1M || '0.10',
+    ),
+    breadthMinUniqueBuyers5s: parseInt(process.env.BREADTH_BURST_MIN_UNIQUE_BUYERS_5S || '10', 10),
+    breadthPreviousRatioMax5s: parseFloat(process.env.BREADTH_BURST_PREVIOUS_RATIO_MAX_5S || '0.8'),
+    breadthCurrentRatioMin5s: parseFloat(process.env.BREADTH_BURST_CURRENT_RATIO_MIN_5S || '0.8'),
+    breadthCurrentRatioMax5s: parseFloat(process.env.BREADTH_BURST_CURRENT_RATIO_MAX_5S || '1.0'),
+    breadthMinAccelerationFactor5s: parseFloat(
+      process.env.BREADTH_BURST_MIN_ACCELERATION_FACTOR_5S || '1.5',
+    ),
+    breadthMinPriceChange10sPct: parseFloat(process.env.BREADTH_BURST_MIN_PRICE_CHANGE_10S_PCT || '-5'),
+    breadthMaxPriceChange10sPct: parseFloat(process.env.BREADTH_BURST_MAX_PRICE_CHANGE_10S_PCT || '5'),
+    breadthMinConfirmations: parseInt(process.env.BREADTH_BURST_MIN_CONFIRMATIONS || '3', 10),
+    breadthCooldownMs: parseInt(process.env.BREADTH_BURST_COOLDOWN_MS || '60000', 10),
+    breadthWarmupMs: parseInt(process.env.BREADTH_BURST_WARMUP_MS || '60000', 10),
     rsi1mEnabled: false,
     rsi1mPeriod: parseInt(process.env.ACTIVITY_FLOW_RSI_1M_PERIOD || '7', 10),
     rsi1mMax: parseFloat(process.env.ACTIVITY_FLOW_RSI_1M_MAX || '50'),

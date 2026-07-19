@@ -270,7 +270,7 @@
 <body>
 
 <div class="header">
-  <h1>🎯 Dump Sniper <span class="v">Strategy V5</span></h1>
+  <h1>🎯 Dump Sniper <span class="v">Strategy V6</span></h1>
   <div class="badges">
     <a href="/reports.html" style="color:var(--accent);text-decoration:none;font-size:12px;font-weight:500;margin-right:8px;">📅 报告</a>
     <span id="modeBadge" class="badge dry">DRY_RUN</span>
@@ -388,8 +388,8 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>1m 成交量</th><th>1m 笔数</th><th>1m 钱包</th><th>最大单买</th><th>1m 波动</th><th>5s 净流</th><th>资金加速</th><th>成交加速</th><th>5s 成交量</th><th>5s 笔数</th><th>5s 买家</th><th>5s 振幅</th><th>10s 涨幅</th><th>阶段</th></tr></thead>
-            <tbody id="signalsTbody"><tr><td colspan="17" class="empty">暂无活跃成交</td></tr></tbody>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>1m 成交量</th><th>1m 买入笔数</th><th>1m 买家</th><th>1m 新买家</th><th>最大单买</th><th>5s 买家</th><th>5s 买卖比</th><th>5s 加速</th><th>10s 涨幅</th><th>确认</th><th>阶段</th></tr></thead>
+            <tbody id="signalsTbody"><tr><td colspan="14" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -739,8 +739,8 @@ async function refreshSignals() {
   const meta = $('strategySignalMeta');
   const tbody = $('signalsTbody');
   if (!r.ok) {
-    meta.innerHTML = `<span class="neg">${escapeHtml(r.error || 'V5 实时数据不可用')}</span>`;
-    tbody.innerHTML = '<tr><td colspan="17" class="empty">等待 Strategy V5 数据</td></tr>';
+    meta.innerHTML = `<span class="neg">${escapeHtml(r.error || 'V6 实时数据不可用')}</span>`;
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">等待 Strategy V6 数据</td></tr>';
     return;
   }
 
@@ -758,7 +758,7 @@ async function refreshSignals() {
   ].join('');
 
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="17" class="empty">暂无活跃成交</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="14" class="empty">暂无活跃成交</td></tr>';
     return;
   }
 
@@ -774,18 +774,15 @@ async function refreshSignals() {
         <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
         ${caCell(candidate.mint)}
         <td>${_strategyCondition(`${fmtMoney(minute.volumeUsd)} / ${fmtMoney(thresholds.volume1mUsd)}`, conditions.volume1m)}</td>
-        <td>${_strategyCondition(`${minute.tradeCount || 0} / ${thresholds.trades1m || 0}`, conditions.trades1m)}</td>
-        <td>${_strategyCondition(`${minute.uniqueTraders || 0} / ${thresholds.wallets1m || 0}`, conditions.wallets1m)}</td>
-        <td>${_strategyCondition(`${_strategyNumber((minute.largestBuyShare || 0) * 100, 1)}%`, conditions.largestBuy1m, `上限 ${_strategyNumber((thresholds.largestBuyShare1m || 0) * 100, 0)}%`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(minute.volatilityPct)}%`, conditions.volatility1m, `门槛 ${_strategyNumber(thresholds.volatility1mPct, 1)}%`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(trigger.previousNet5s)}→${_strategyNumber(trigger.currentNet5s)} SOL`, conditions.netTurn5s)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(trigger.flowAcceleration5s)} SOL`, conditions.flowAcceleration5s)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(trigger.txAcceleration5s, 0)}`, conditions.txAcceleration5s, `门槛 ${thresholds.txAcceleration5s || 0}`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(fiveSeconds.volumeSol)} / ${_strategyNumber(thresholds.volume5sSol, 1)} SOL`, conditions.volume5s)}</td>
-        <td>${_strategyCondition(`${fiveSeconds.tradeCount || 0} / ${thresholds.trades5s || 0}`, conditions.trades5s)}</td>
-        <td>${_strategyCondition(`${fiveSeconds.uniqueBuyers || 0} / ${thresholds.buyers5s || 0}`, conditions.buyers5s)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(fiveSeconds.rangePct)}%`, conditions.range5s, `门槛 ${_strategyNumber(thresholds.range5sPct, 1)}%`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(tenSeconds.priceChangePct)}%`, conditions.price10s, `${thresholds.priceChange10sMinPct || 0}%～${thresholds.priceChange10sMaxPct || 0}%`)}</td>
+        <td>${_strategyCondition(`${minute.buyCount || 0} / ${thresholds.buyTrades1m || 0}`, conditions.buyTrades1m)}</td>
+        <td>${_strategyCondition(`${minute.uniqueBuyers || 0} / ${thresholds.buyers1m || 0}`, conditions.buyers1m)}</td>
+        <td>${_strategyCondition(`${minute.newUniqueBuyers || 0} / ${thresholds.newBuyers1m || 0}`, conditions.newBuyers1m)}</td>
+        <td>${_strategyCondition(`${_strategyNumber((minute.largestBuyShare || 0) * 100, 1)}%`, conditions.largestBuy1m, `上限 ${_strategyNumber((thresholds.breadthLargestBuyShare1m || 0) * 100, 0)}%`)}</td>
+        <td>${_strategyCondition(`${fiveSeconds.uniqueBuyers || 0} / ${thresholds.breadthBuyers5s || 0}`, conditions.buyers5s)}</td>
+        <td>${_strategyCondition(`${_strategyNumber(trigger.previousBuySellRatio5s)}→${_strategyNumber(trigger.currentBuySellRatio5s)}`, conditions.ratioTurn5s, `${thresholds.currentRatioMin5s}～${thresholds.currentRatioMax5s}`)}</td>
+        <td>${_strategyCondition(`${_strategyNumber(trigger.txAccelerationFactor5s)}x / ${_strategyNumber(trigger.volumeAccelerationFactor5s)}x`, conditions.acceleration5s, `任一 ≥${thresholds.accelerationFactor5s}x`)}</td>
+        <td>${_strategyCondition(`${_strategyNumber(tenSeconds.priceChangePct)}%`, conditions.price10s, `${thresholds.breadthPriceChange10sMinPct}%～${thresholds.breadthPriceChange10sMaxPct}%`)}</td>
+        <td>${_strategyCondition(`${trigger.supportScore || 0} / 5`, conditions.supportScore, `至少 ${thresholds.minConfirmations || 0}`)}</td>
         <td>${_strategyStage(candidate, r.now || Date.now())}</td>
       </tr>`;
   }).join('');

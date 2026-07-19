@@ -219,10 +219,12 @@ async function main() {
     `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
       `mode=${activityFlowTracker.entryMode} ` +
       `1m>=${activityFlowTracker.minVolume1mSol.toFixed(2)}SOL(~$${Math.round(activityFlowTracker.minVolume1mUsd)}) ` +
-      `trades>=${activityFlowTracker.minTrades1m} ` +
       `arm=${activityFlowTracker.armWindowMs / 1000}s ` +
-      `wallets>=${activityFlowTracker.armMinUniqueTraders1m} ` +
-      `entry=5s-flow-turn+2x-confirm ` +
+      `buyers>=${activityFlowTracker.breadthMinUniqueBuyers1m} ` +
+      `newBuyers>=${activityFlowTracker.breadthMinNewBuyers1m} ` +
+      `entry=breadth-score-${activityFlowTracker.breadthMinConfirmations}/5+2x-confirm ` +
+      `warmup=${activityFlowTracker.breadthWarmupMs / 1000}s ` +
+      `cooldown=${activityFlowTracker.breadthCooldownMs / 1000}s ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(

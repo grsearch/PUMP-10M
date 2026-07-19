@@ -651,7 +651,17 @@ class SignalEngine extends EventEmitter {
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
     let activityReason = null;
-    if (signal._activityFlow && flow?.entryV5) {
+    if (signal._activityFlow && flow?.entryV6) {
+      activityReason =
+        `breadth_burst_v6: 1m=${flow.s60.buyCount}buys/${flow.s60.volumeSol.toFixed(2)}SOL ` +
+        `buyers=${flow.s60.uniqueBuyers} new=${flow.s60.newUniqueBuyers} ` +
+        `topBuy=${(flow.s60.largestBuyShare * 100).toFixed(1)}% ` +
+        `support=${flow.entryV6.supportScore}/5 ` +
+        `ratio5=${flow.entryV6.previousBuySellRatio5s.toFixed(2)}->` +
+        `${flow.entryV6.currentBuySellRatio5s.toFixed(2)} ` +
+        `accel=${flow.entryV6.txAccelerationFactor5s.toFixed(2)}x/` +
+        `${flow.entryV6.volumeAccelerationFactor5s.toFixed(2)}x`;
+    } else if (signal._activityFlow && flow?.entryV5) {
       activityReason =
         `activity_burst_v5: 1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(2)}SOL ` +
         `wallets=${flow.s60.uniqueTraders} topBuy=${(flow.s60.largestBuyShare * 100).toFixed(1)}% ` +
