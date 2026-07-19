@@ -172,6 +172,18 @@ class PositionManager extends EventEmitter {
     else this._flowExitEvents.delete(mint);
   }
 
+  _recentNetFlow(mint, now, windowMs) {
+    const cutoff = now - windowMs;
+    const events = this._flowExitEvents.get(mint) || [];
+    let netFlow = 0;
+    for (const event of events) {
+      if (event.ts < cutoff || event.ts > now) continue;
+      if (event.side === 'BUY') netFlow += event.solVolume;
+      else if (event.side === 'SELL') netFlow -= event.solVolume;
+    }
+    return netFlow;
+  }
+
   _maybeFlowReversalExit(pos, price, now) {
     const s = config.strategy;
     if (!s.flowReversalExitEnabled) return;
@@ -182,14 +194,18 @@ class PositionManager extends EventEmitter {
     const holdStart = pos.reconciledAt || pos.openedAt || now;
     const events = this._flowExitEvents.get(pos.mint) || [];
     const observedSince = events.length > 0 ? Math.max(holdStart, events[0].ts) : holdStart;
-    const pattern = evaluateFlowTurnExit(events, now, { sinceTs: observedSince });
+    const pattern = evaluateFlowTurnExit(events, now, {
+      sinceTs: observedSince,
+      requireSellerBreadth: s.flowReversalExitRequireSellerBreadth,
+    });
     if (!pattern.matched) return;
 
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
     console.log(
       `[PositionManager] FLOW_REVERSAL_EXIT ${pos.symbol || pos.mint.slice(0, 6)} ` +
         `mode=FLOW_TURN_15S pnl=${pnlPct.toFixed(2)}% ` +
-        `netFlow=${pattern.previousNetFlow.toFixed(2)}->${pattern.currentNetFlow.toFixed(2)}SOL`,
+        `netFlow=${pattern.previousNetFlow.toFixed(2)}->${pattern.currentNetFlow.toFixed(2)}SOL ` +
+        `wallets=${pattern.currentUniqueBuyers}B/${pattern.currentUniqueSellers}S`,
     );
     monitor.inc('PositionManager.flowReversalExit', 1, 'PositionManager');
     this._exitForCondition(pos, price, 'FLOW_REVERSAL_EXIT');
@@ -971,21 +987,42 @@ class PositionManager extends EventEmitter {
 
       this._fillPreVolFallback(pos);
       const age = now - pos.openedAt;
-      // v3.19: peak 感知梯度超时 — 替代固定 maxHoldMs
-      // peak<=0 → 5min, peak 0-5% → 10min, peak 5-8% → 25min, peak>=8% → maxHoldMs
+      // Strategy V5 uses peak only for the 90-second no-bounce rule;
+      // maxHoldMs remains an unconditional hard timeout.
       const peakPnlForTimeout = (pos.highWaterMark && pos.entryPrice > 0)
         ? ((pos.highWaterMark - pos.entryPrice) / pos.entryPrice) * 100
         : 0;
-      const timeoutMs = this.getPeakAwareTimeoutMs(peakPnlForTimeout, pos.preVol5m, pos.mint);
+      const noBounceEnabled = config.strategy.noBounceExitEnabled;
+      if (
+        noBounceEnabled &&
+        (pos.reconciled || pos.dryRun) &&
+        config.strategy.noBounceExitMs > 0 &&
+        age >= config.strategy.noBounceExitMs &&
+        peakPnlForTimeout < config.strategy.noBounceMaxPeakPnlPct
+      ) {
+        const netFlow = this._recentNetFlow(pos.mint, now, config.strategy.noBounceFlowWindowMs);
+        if (netFlow <= 0) {
+          const lastPrice = this.priceTracker.getPrice(pos.mint) || pos.entryPrice;
+          console.log(
+            `[PositionManager] NO_BOUNCE_EXIT ${pos.symbol || pos.mint.slice(0, 6)} ` +
+              `peak=${peakPnlForTimeout.toFixed(2)}% net${config.strategy.noBounceFlowWindowMs / 1000}s=` +
+              `${netFlow.toFixed(2)}SOL age=${(age / 1000).toFixed(0)}s`,
+          );
+          monitor.inc('PositionManager.noBounceExit', 1, 'PositionManager');
+          this._exitForCondition(pos, lastPrice, 'NO_BOUNCE_EXIT');
+          continue;
+        }
+      }
+      const timeoutMs = config.strategy.maxHoldMs;
       if (timeoutMs > 0 && age >= timeoutMs) {
         const lastPrice = this.priceTracker.getPrice(pos.mint) || pos.entryPrice;
         console.log(
-          `[PositionManager] ⏱️ TIMEOUT (peak-aware) ${pos.symbol || pos.mint.slice(0, 6)} ` +
+          `[PositionManager] TIMEOUT ${pos.symbol || pos.mint.slice(0, 6)} ` +
           `peak=${peakPnlForTimeout.toFixed(1)}% timeout=${(timeoutMs/1000).toFixed(0)}s age=${(age/1000).toFixed(0)}s`,
         );
-        // v3.19: exit_reason 带 timeout 时长，区分不同梯度
         const timeoutMin = Math.round(timeoutMs / 60000);
         this._exitForCondition(pos, lastPrice, `TIMEOUT_${timeoutMin}M`);
+        continue;
       }
 
       // v3.18: EARLY_LOW_PEAK_CUT — 死币早砍,连续时间覆盖

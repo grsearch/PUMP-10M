@@ -40,11 +40,14 @@ async function main() {
     `Entry: ACTIVITY_FLOW ` +
       `(${config.activityFlow.entryMode}: 1m volume>=${config.activityFlow.minVolume1mSol.toFixed(2)}SOL ` +
       `(~$${Math.round(config.activityFlow.minVolume1mUsd)}), trades>=${config.activityFlow.minTrades1m}, ` +
-      `3 increasing closed 15s net-flow values, flow acceleration - to +, ratio filters disabled)`,
+      `wallets>=${config.activityFlow.armMinUniqueTraders1m}, largest buy<=` +
+      `${Math.round(config.activityFlow.armMaxLargestBuyShare1m * 100)}%, ` +
+      `5s flow-turn confirmation)`,
   );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
-      `(2 closed 15s net-flow values, + to -)`
+      `(2 closed 15s net-flow values, + to -` +
+      `${config.strategy.flowReversalExitRequireSellerBreadth ? ', sellers>=buyers' : ''})`
     : 'Flow exit: disabled');
   console.log(`Legacy dumpSignal: ${config.activityFlow.replaceDumpSignal ? 'suppressed' : 'allowed fallback'}`);
   console.log(`Rebuy cooldown: ${config.strategy.rebuyCooldownMs > 0 ? config.strategy.rebuyCooldownMs / 60_000 + 'min after close' : 'disabled'}`);
@@ -55,7 +58,12 @@ async function main() {
   );
   console.log(`Fixed stop loss: ${config.strategy.fixedStopLossPct < 0 ? config.strategy.fixedStopLossPct + '%' : 'disabled'}`);
   console.log(`Emergency stop: ${config.strategy.emergencyStopLossPct < 0 ? config.strategy.emergencyStopLossPct + '%' : 'disabled'}`);
-  console.log(`Max hold: ${config.strategy.maxHoldMs > 0 ? config.strategy.maxHoldMs + 'ms' : 'disabled'}`);
+  console.log(`No-bounce exit: ${config.strategy.noBounceExitEnabled ? config.strategy.noBounceExitMs / 1000 + 's' : 'disabled'}`);
+  console.log(`Max hold: ${config.strategy.maxHoldMs > 0 ? config.strategy.maxHoldMs / 1000 + 's' : 'disabled'}`);
+  console.log(
+    `Buy slippage: tolerance=${(config.strategy.buySlippageBps / 100).toFixed(1)}% ` +
+      `estimated<=${config.strategy.buyMaxEstimatedSlippagePct}%`,
+  );
   console.log('Add-on: disabled');
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
   console.log(`Pump graduation discovery: ${config.pumpDiscovery.enabled ? 'enabled' : 'disabled'}`);
@@ -212,9 +220,9 @@ async function main() {
       `mode=${activityFlowTracker.entryMode} ` +
       `1m>=${activityFlowTracker.minVolume1mSol.toFixed(2)}SOL(~$${Math.round(activityFlowTracker.minVolume1mUsd)}) ` +
       `trades>=${activityFlowTracker.minTrades1m} ` +
-      `entry=3x15s-net-flow-up+accel-cross ` +
-      `ratioFilters=disabled ` +
-      `pool>=${activityFlowTracker.minPoolQuoteSol}SOL ` +
+      `arm=${activityFlowTracker.armWindowMs / 1000}s ` +
+      `wallets>=${activityFlowTracker.armMinUniqueTraders1m} ` +
+      `entry=5s-flow-turn+2x-confirm ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(

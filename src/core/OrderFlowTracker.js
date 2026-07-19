@@ -30,6 +30,14 @@ function sumVolume(items) {
   return items.reduce((sum, x) => sum + (Number.isFinite(x.solVolume) ? x.solVolume : 0), 0);
 }
 
+function stddev(values) {
+  const nums = values.filter(Number.isFinite);
+  if (nums.length < 2) return 0;
+  const mean = nums.reduce((sum, value) => sum + value, 0) / nums.length;
+  const variance = nums.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / nums.length;
+  return Math.sqrt(variance);
+}
+
 function round(n, digits = 3) {
   if (!Number.isFinite(n)) return 0;
   const m = 10 ** digits;
@@ -51,8 +59,8 @@ class OrderFlowTracker extends EventEmitter {
 
     this.entryMode =
       String(
-        (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'FLOW_ACCEL_15S') ||
-          'FLOW_ACCEL_15S',
+        (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'ACTIVITY_BURST_V5') ||
+          'ACTIVITY_BURST_V5',
       ).toUpperCase();
     this.minVolume1mUsd =
       opts.minVolume1mUsd ?? flowConfig.minVolume1mUsd ?? numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
@@ -62,6 +70,62 @@ class OrderFlowTracker extends EventEmitter {
       numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_SOL', this.minVolume1mUsd / Math.max(numEnv('SOL_PRICE_USD', 72), 0.001));
     this.minTrades1m =
       opts.minTrades1m ?? flowConfig.minTrades1m ?? numEnv('ACTIVITY_FLOW_1M_MIN_TRADES', 25);
+    this.armWindowMs =
+      opts.armWindowMs ?? flowConfig.armWindowMs ?? numEnv('ACTIVITY_FLOW_ARM_WINDOW_MS', 30_000);
+    this.armCancelMinVolume1mSol =
+      opts.armCancelMinVolume1mSol ??
+      flowConfig.armCancelMinVolume1mSol ??
+      numEnv('ACTIVITY_FLOW_ARM_CANCEL_MIN_VOLUME_1M_SOL', 2000 / Math.max(numEnv('SOL_PRICE_USD', 72), 0.001));
+    this.armMinUniqueTraders1m =
+      opts.armMinUniqueTraders1m ??
+      flowConfig.armMinUniqueTraders1m ??
+      numEnv('ACTIVITY_FLOW_ARM_MIN_UNIQUE_TRADERS_1M', 8);
+    this.armMaxLargestBuyShare1m =
+      opts.armMaxLargestBuyShare1m ??
+      flowConfig.armMaxLargestBuyShare1m ??
+      numEnv('ACTIVITY_FLOW_ARM_MAX_LARGEST_BUY_SHARE_1M', 0.25);
+    this.armCancelMaxLargestBuyShare1m =
+      opts.armCancelMaxLargestBuyShare1m ??
+      flowConfig.armCancelMaxLargestBuyShare1m ??
+      numEnv('ACTIVITY_FLOW_ARM_CANCEL_MAX_LARGEST_BUY_SHARE_1M', 0.40);
+    this.armMinVolatility1mPct =
+      opts.armMinVolatility1mPct ??
+      flowConfig.armMinVolatility1mPct ??
+      numEnv('ACTIVITY_FLOW_ARM_MIN_VOLATILITY_1M_PCT', 1.1);
+    this.triggerMinVolume5sSol =
+      opts.triggerMinVolume5sSol ??
+      flowConfig.triggerMinVolume5sSol ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_MIN_VOLUME_5S_SOL', 2);
+    this.triggerMinTrades5s =
+      opts.triggerMinTrades5s ?? flowConfig.triggerMinTrades5s ?? numEnv('ACTIVITY_FLOW_TRIGGER_MIN_TRADES_5S', 4);
+    this.triggerMinUniqueBuyers5s =
+      opts.triggerMinUniqueBuyers5s ??
+      flowConfig.triggerMinUniqueBuyers5s ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_MIN_UNIQUE_BUYERS_5S', 2);
+    this.triggerMinTxAcceleration5s =
+      opts.triggerMinTxAcceleration5s ??
+      flowConfig.triggerMinTxAcceleration5s ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_MIN_TX_ACCEL_5S', 2);
+    this.triggerMinRange5sPct =
+      opts.triggerMinRange5sPct ??
+      flowConfig.triggerMinRange5sPct ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_MIN_RANGE_5S_PCT', 1);
+    this.triggerMinPriceChange10sPct =
+      opts.triggerMinPriceChange10sPct ??
+      flowConfig.triggerMinPriceChange10sPct ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_MIN_PRICE_CHANGE_10S_PCT', 0);
+    this.triggerMaxPriceChange10sPct =
+      opts.triggerMaxPriceChange10sPct ??
+      flowConfig.triggerMaxPriceChange10sPct ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_MAX_PRICE_CHANGE_10S_PCT', 6);
+    this.triggerConfirmMinGapMs =
+      opts.triggerConfirmMinGapMs ??
+      flowConfig.triggerConfirmMinGapMs ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_CONFIRM_MIN_GAP_MS', 1_000);
+    this.triggerConfirmMaxGapMs =
+      opts.triggerConfirmMaxGapMs ??
+      flowConfig.triggerConfirmMaxGapMs ??
+      numEnv('ACTIVITY_FLOW_TRIGGER_CONFIRM_MAX_GAP_MS', 3_000);
     this.confirmMinBuyTrades5s =
       opts.confirmMinBuyTrades5s ??
       flowConfig.confirmMinBuyTrades5s ??
@@ -84,6 +148,7 @@ class OrderFlowTracker extends EventEmitter {
       numEnv('ACTIVITY_FLOW_CONFIRM_MAX_SINGLE_BUY_IMPACT_PCT', 4);
 
     this.window5Ms = opts.window5Ms ?? flowConfig.window5Ms ?? numEnv('ACTIVITY_FLOW_WINDOW_5S_MS', 5_000);
+    this.window10Ms = opts.window10Ms ?? flowConfig.window10Ms ?? numEnv('ACTIVITY_FLOW_WINDOW_10S_MS', 10_000);
     this.window15Ms = opts.window15Ms ?? flowConfig.window15Ms ?? numEnv('ACTIVITY_FLOW_WINDOW_15S_MS', 15_000);
     this.window30Ms = opts.window30Ms ?? flowConfig.window30Ms ?? numEnv('ACTIVITY_FLOW_WINDOW_30S_MS', 30_000);
     this.window60Ms = opts.window60Ms ?? flowConfig.window60Ms ?? numEnv('ACTIVITY_FLOW_WINDOW_60S_MS', 60_000);
@@ -148,11 +213,6 @@ class OrderFlowTracker extends EventEmitter {
       opts.maxPriceChange60sPct ??
       flowConfig.maxPriceChange60sPct ??
       numEnv('ACTIVITY_FLOW_MAX_PRICE_CHANGE_60S_PCT', 10);
-    this.minPoolQuoteSol =
-      opts.minPoolQuoteSol ??
-      flowConfig.minPoolQuoteSol ??
-      numEnv('ACTIVITY_FLOW_MIN_POOL_QUOTE_SOL', config.strategy.minPoolQuoteSol || 30);
-
     this.cooldownMs =
       opts.cooldownMs ??
       flowConfig.cooldownMs ??
@@ -217,7 +277,7 @@ class OrderFlowTracker extends EventEmitter {
     state.lastPoolQuoteAfter = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
     this._prune(state, ev.ts);
 
-    if (this.entryMode === 'FLOW_ACCEL_15S' || ev.side === 'BUY') {
+    if (this.entryMode === 'FLOW_ACCEL_15S' || this.entryMode === 'ACTIVITY_BURST_V5' || ev.side === 'BUY') {
       this._trySignal(state, ev);
     }
   }
@@ -239,6 +299,9 @@ class OrderFlowTracker extends EventEmitter {
         lastDumpSignal: null,
         lastEntrySignalBucket: null,
         firstSeenTs: null,
+        armedAt: null,
+        armedUntil: null,
+        triggerConfirmFirstTs: null,
       };
       this.states.set(mint, state);
     }
@@ -273,6 +336,7 @@ class OrderFlowTracker extends EventEmitter {
       buyerVolume.set(buyer, (buyerVolume.get(buyer) || 0) + buy.solVolume);
     }
     const largestBuyerSol = buyerVolume.size > 0 ? Math.max(...buyerVolume.values()) : 0;
+    const largestBuySol = buys.length > 0 ? Math.max(...buys.map((buy) => buy.solVolume)) : 0;
     const maxSingleBuyImpactPct = buys.reduce(
       (maxImpact, buy) => Math.max(maxImpact, Number.isFinite(buy.priceChangePct) ? buy.priceChangePct : 0),
       0,
@@ -282,6 +346,13 @@ class OrderFlowTracker extends EventEmitter {
     const firstPrice = first ? first.price : 0;
     const lastPrice = last ? last.price : 0;
     const priceChangePct = firstPrice > 0 && lastPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
+    const prices = events.map((event) => event.price).filter((value) => Number.isFinite(value) && value > 0);
+    const returns = [];
+    for (let index = 1; index < prices.length; index++) {
+      returns.push(((prices[index] - prices[index - 1]) / prices[index - 1]) * 100);
+    }
+    const highPrice = prices.length > 0 ? Math.max(...prices) : 0;
+    const lowPrice = prices.length > 0 ? Math.min(...prices) : 0;
 
     return {
       windowMs,
@@ -291,6 +362,7 @@ class OrderFlowTracker extends EventEmitter {
       sellCount: sells.length,
       buySol,
       sellSol,
+      netFlow: buySol - sellSol,
       volumeSol,
       buySellRatio: buySol / Math.max(sellSol, 0.001),
       buyCountRatio: buys.length / Math.max(sells.length, 1),
@@ -300,10 +372,16 @@ class OrderFlowTracker extends EventEmitter {
       uniqueTraders: uniqueCount(events, 'signer'),
       largestBuyerSol,
       largestBuyerShare: largestBuyerSol / Math.max(buySol, 0.001),
+      largestBuySol,
+      largestBuyShare: largestBuySol / Math.max(buySol, 0.001),
       maxSingleBuyImpactPct,
       firstPrice,
       lastPrice,
       priceChangePct,
+      highPrice,
+      lowPrice,
+      rangePct: lastPrice > 0 ? ((highPrice - lowPrice) / lastPrice) * 100 : 0,
+      volatilityPct: stddev(returns),
       lastSide: last ? last.side : null,
     };
   }
@@ -318,6 +396,11 @@ class OrderFlowTracker extends EventEmitter {
     const cooldownUntil = this.cooldowns.get(ev.mint) || 0;
     if (cooldownUntil > wallNow) return;
 
+    if (this.entryMode === 'ACTIVITY_BURST_V5') {
+      this._tryActivityBurstV5(state, ev, wallNow);
+      return;
+    }
+
     const entryPattern = evaluateFlowAccelerationEntry(state.events, ev.ts, {
       sinceTs: state.firstSeenTs,
     });
@@ -329,26 +412,186 @@ class OrderFlowTracker extends EventEmitter {
     }
 
     const s5 = this._stats(state, ev.ts, this.window5Ms);
+    const s10 = this._stats(state, ev.ts, this.window10Ms);
     const s15 = this._stats(state, ev.ts, this.window15Ms);
     const s30 = this._stats(state, ev.ts, this.window30Ms);
     const s60 = this._stats(state, ev.ts, this.window60Ms);
     const poolQuoteSol = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
-    const reject = this._firstReject(s5, s15, s30, s60, poolQuoteSol, entryPattern);
+    const reject = this._firstReject(s5, s15, s30, s60, entryPattern);
     if (reject) {
       this._debugReject(ev.mint, ev.ts, reject, s5, s15, s30, s60);
       return;
     }
 
+    this._emitBuySignal(state, ev, {
+      s5,
+      s10,
+      s15,
+      s30,
+      s60,
+      poolQuoteSol,
+      entryPattern,
+    });
+  }
+
+  _tryActivityBurstV5(state, ev, wallNow) {
+    const s5 = this._stats(state, ev.ts, this.window5Ms);
+    const s10 = this._stats(state, ev.ts, this.window10Ms);
+    const s15 = this._stats(state, ev.ts, this.window15Ms);
+    const s30 = this._stats(state, ev.ts, this.window30Ms);
+    const s60 = this._stats(state, ev.ts, this.window60Ms);
+
+    if (state.armedUntil != null && ev.ts > state.armedUntil) {
+      this._clearArm(state);
+    }
+
+    if (state.armedAt == null) {
+      const armReject = this._v5ArmReject(s10, s60);
+      if (armReject) {
+        this._debugReject(ev.mint, ev.ts, armReject, s5, s15, s30, s60);
+        return;
+      }
+      state.armedAt = ev.ts;
+      state.armedUntil = ev.ts + this.armWindowMs;
+      state.triggerConfirmFirstTs = null;
+      console.log(
+        `[ActivityFlow] ARMED ${state.symbol || ev.mint.slice(0, 6)} ` +
+          `1m=${s60.tradeCount}tx/${s60.volumeSol.toFixed(1)}SOL ` +
+          `wallets=${s60.uniqueTraders} topBuy=${(s60.largestBuyShare * 100).toFixed(1)}% ` +
+          `vol=${s60.volatilityPct.toFixed(2)}%`,
+      );
+      return;
+    }
+
+    const cancelReason = this._v5CancelReason(s10, s60);
+    if (cancelReason) {
+      console.log(`[ActivityFlow] ARM_CANCEL ${state.symbol || ev.mint.slice(0, 6)}: ${cancelReason}`);
+      this._clearArm(state);
+      return;
+    }
+
+    const previousNet5s = s10.netFlow - s5.netFlow;
+    const flowAcceleration5s = s5.netFlow - previousNet5s;
+    const txAcceleration5s = (2 * s5.tradeCount) - s10.tradeCount;
+    const trigger = {
+      currentNet5s: s5.netFlow,
+      previousNet5s,
+      flowAcceleration5s,
+      txAcceleration5s,
+      range5sPct: s5.rangePct,
+      priceChange10sPct: s10.priceChangePct,
+    };
+
+    const triggerReject = this._v5TriggerReject(s5, s10, trigger);
+    if (triggerReject) {
+      state.triggerConfirmFirstTs = null;
+      this._debugReject(ev.mint, ev.ts, triggerReject, s5, s15, s30, s60);
+      return;
+    }
+
+    if (state.triggerConfirmFirstTs == null || ev.ts - state.triggerConfirmFirstTs > this.triggerConfirmMaxGapMs) {
+      state.triggerConfirmFirstTs = ev.ts;
+      return;
+    }
+    if (ev.ts - state.triggerConfirmFirstTs < this.triggerConfirmMinGapMs) return;
+
+    const poolQuoteSol = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
+    this._emitBuySignal(state, ev, {
+      s5,
+      s10,
+      s15,
+      s30,
+      s60,
+      poolQuoteSol,
+      v5Pattern: {
+        ...trigger,
+        armedAt: state.armedAt,
+        confirmGapMs: ev.ts - state.triggerConfirmFirstTs,
+      },
+    });
+    this._clearArm(state);
+    this.cooldowns.set(ev.mint, wallNow + Math.max(this.cooldownMs, 5_000));
+  }
+
+  _v5ArmReject(s10, s60) {
+    if (this.minTrades1m > 0 && s60.tradeCount < this.minTrades1m) {
+      return `1m trades ${s60.tradeCount}<${this.minTrades1m}`;
+    }
+    if (s60.volumeSol < this.minVolume1mSol) {
+      return `1m volume ${s60.volumeSol.toFixed(2)}<${this.minVolume1mSol.toFixed(2)}SOL`;
+    }
+    if (s60.uniqueTraders < this.armMinUniqueTraders1m) {
+      return `1m wallets ${s60.uniqueTraders}<${this.armMinUniqueTraders1m}`;
+    }
+    if (s60.largestBuyShare > this.armMaxLargestBuyShare1m) {
+      return `1m largest buy ${(s60.largestBuyShare * 100).toFixed(1)}%>${(this.armMaxLargestBuyShare1m * 100).toFixed(1)}%`;
+    }
+    if (s60.volatilityPct < this.armMinVolatility1mPct) {
+      return `1m volatility ${s60.volatilityPct.toFixed(2)}%<${this.armMinVolatility1mPct}%`;
+    }
+    if (s10.priceChangePct > this.triggerMaxPriceChange10sPct) {
+      return `10s price ${s10.priceChangePct.toFixed(1)}%>${this.triggerMaxPriceChange10sPct}%`;
+    }
+    return null;
+  }
+
+  _v5CancelReason(s10, s60) {
+    if (s60.volumeSol < this.armCancelMinVolume1mSol) {
+      return `1m volume ${s60.volumeSol.toFixed(2)}<${this.armCancelMinVolume1mSol.toFixed(2)}SOL`;
+    }
+    if (s60.largestBuyShare > this.armCancelMaxLargestBuyShare1m) {
+      return `1m largest buy ${(s60.largestBuyShare * 100).toFixed(1)}%>${(this.armCancelMaxLargestBuyShare1m * 100).toFixed(1)}%`;
+    }
+    if (s10.priceChangePct > this.triggerMaxPriceChange10sPct) {
+      return `10s price ${s10.priceChangePct.toFixed(1)}%>${this.triggerMaxPriceChange10sPct}%`;
+    }
+    return null;
+  }
+
+  _v5TriggerReject(s5, s10, trigger) {
+    if (trigger.previousNet5s > 0 || trigger.currentNet5s <= 0) return '5s net flow did not turn non-positive to positive';
+    if (trigger.flowAcceleration5s <= 0) return '5s flow acceleration is not positive';
+    if (trigger.txAcceleration5s < this.triggerMinTxAcceleration5s) {
+      return `5s tx acceleration ${trigger.txAcceleration5s}<${this.triggerMinTxAcceleration5s}`;
+    }
+    if (s5.volumeSol < this.triggerMinVolume5sSol) {
+      return `5s volume ${s5.volumeSol.toFixed(2)}<${this.triggerMinVolume5sSol}SOL`;
+    }
+    if (s5.tradeCount < this.triggerMinTrades5s) return `5s trades ${s5.tradeCount}<${this.triggerMinTrades5s}`;
+    if (s5.uniqueBuyers < this.triggerMinUniqueBuyers5s) {
+      return `5s buyers ${s5.uniqueBuyers}<${this.triggerMinUniqueBuyers5s}`;
+    }
+    if (s5.rangePct < this.triggerMinRange5sPct) {
+      return `5s range ${s5.rangePct.toFixed(2)}%<${this.triggerMinRange5sPct}%`;
+    }
+    if (s10.priceChangePct < this.triggerMinPriceChange10sPct) {
+      return `10s price ${s10.priceChangePct.toFixed(1)}%<${this.triggerMinPriceChange10sPct}%`;
+    }
+    if (s10.priceChangePct > this.triggerMaxPriceChange10sPct) {
+      return `10s price ${s10.priceChangePct.toFixed(1)}%>${this.triggerMaxPriceChange10sPct}%`;
+    }
+    return null;
+  }
+
+  _clearArm(state) {
+    state.armedAt = null;
+    state.armedUntil = null;
+    state.triggerConfirmFirstTs = null;
+  }
+
+  _emitBuySignal(state, ev, { s5, s10, s15, s30, s60, poolQuoteSol, entryPattern = null, v5Pattern = null }) {
     const flow = {
       s5: this._compactStats(s5),
+      s10: this._compactStats(s10),
       s15: this._compactStats(s15),
       s30: this._compactStats(s30),
       s60: this._compactStats(s60),
-      entry15s: this._compactEntryPattern(entryPattern),
+      entry15s: entryPattern ? this._compactEntryPattern(entryPattern) : null,
+      entryV5: v5Pattern ? this._compactV5Pattern(v5Pattern) : null,
     };
-    const entryStats = this.entryMode === 'FLOW_ACCEL_15S' || this.entryMode === 'VOLUME_RATIO_1M'
-      ? s60
-      : s15;
+    const entryStats = this.entryMode === 'FLOW_ACCEL_15S' ||
+      this.entryMode === 'VOLUME_RATIO_1M' ||
+      this.entryMode === 'ACTIVITY_BURST_V5' ? s60 : s15;
 
     const signal = {
       mint: ev.mint,
@@ -371,28 +614,36 @@ class OrderFlowTracker extends EventEmitter {
       _totalSellSol10s: round(entryStats.sellSol, 4),
       _sellers: [...new Set(entryStats.events.filter((x) => x.side === 'SELL').map((x) => x.signer).filter(Boolean))],
       _flow: flow,
-      _flowPattern: flow.entry15s,
+      _flowPattern: flow.entryV5 || flow.entry15s,
     };
 
-    console.log(
-      `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} ` +
-        `mode=${this.entryMode} ` +
-        `1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(1)}SOL ` +
-        `15sNet=${flow.entry15s.netFlows.map((value) => value.toFixed(2)).join('/')}SOL ` +
-        `accel=${flow.entry15s.previousAcceleration.toFixed(2)}->` +
-        `${flow.entry15s.currentAcceleration.toFixed(2)}->` +
-        `${flow.entry15s.latestAcceleration.toFixed(2)}`,
-    );
+    if (flow.entryV5) {
+      console.log(
+        `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=${this.entryMode} ` +
+          `1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(1)}SOL ` +
+          `net5=${flow.entryV5.previousNet5s.toFixed(2)}->${flow.entryV5.currentNet5s.toFixed(2)}SOL ` +
+          `flowAccel=${flow.entryV5.flowAcceleration5s.toFixed(2)} ` +
+          `txAccel=${flow.entryV5.txAcceleration5s.toFixed(0)} ` +
+          `range5=${flow.entryV5.range5sPct.toFixed(2)}%`,
+      );
+    } else {
+      console.log(
+        `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} ` +
+          `mode=${this.entryMode} ` +
+          `1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(1)}SOL ` +
+          `15sNet=${flow.entry15s.netFlows.map((value) => value.toFixed(2)).join('/')}SOL ` +
+          `accel=${flow.entry15s.previousAcceleration.toFixed(2)}->` +
+          `${flow.entry15s.currentAcceleration.toFixed(2)}->` +
+          `${flow.entry15s.latestAcceleration.toFixed(2)}`,
+      );
+    }
 
-    state.lastEntrySignalBucket = entryPattern.triggerBucketTs;
-    this.cooldowns.set(ev.mint, wallNow + this.cooldownMs);
+    if (entryPattern) state.lastEntrySignalBucket = entryPattern.triggerBucketTs;
+    this.cooldowns.set(ev.mint, Date.now() + this.cooldownMs);
     this.emit('flowReversalSignal', signal);
   }
 
-  _firstReject(s5, s15, s30, s60, poolQuoteSol, entryPattern) {
-    if (this.minPoolQuoteSol > 0 && (!poolQuoteSol || poolQuoteSol < this.minPoolQuoteSol)) {
-      return `pool ${poolQuoteSol ? poolQuoteSol.toFixed(1) : 'unknown'}SOL<${this.minPoolQuoteSol}`;
-    }
+  _firstReject(s5, s15, s30, s60, entryPattern) {
     if (this.entryMode === 'FLOW_ACCEL_15S') {
       if (this.minTrades1m > 0 && s60.tradeCount < this.minTrades1m) {
         return `1m trades ${s60.tradeCount}<${this.minTrades1m}`;
@@ -484,6 +735,7 @@ class OrderFlowTracker extends EventEmitter {
       sellCount: stats.sellCount,
       buySol: round(stats.buySol, 4),
       sellSol: round(stats.sellSol, 4),
+      netFlow: round(stats.netFlow, 4),
       volumeSol: round(stats.volumeSol, 4),
       buySellRatio: round(stats.buySellRatio, 3),
       buyCountRatio: round(stats.buyCountRatio, 3),
@@ -492,8 +744,24 @@ class OrderFlowTracker extends EventEmitter {
       uniqueSellers: stats.uniqueSellers,
       uniqueTraders: stats.uniqueTraders,
       largestBuyerShare: round(stats.largestBuyerShare, 3),
+      largestBuyShare: round(stats.largestBuyShare, 3),
       maxSingleBuyImpactPct: round(stats.maxSingleBuyImpactPct, 3),
       priceChangePct: round(stats.priceChangePct, 3),
+      rangePct: round(stats.rangePct, 3),
+      volatilityPct: round(stats.volatilityPct, 3),
+    };
+  }
+
+  _compactV5Pattern(pattern) {
+    return {
+      armedAt: pattern.armedAt,
+      confirmGapMs: pattern.confirmGapMs,
+      previousNet5s: round(pattern.previousNet5s, 4),
+      currentNet5s: round(pattern.currentNet5s, 4),
+      flowAcceleration5s: round(pattern.flowAcceleration5s, 4),
+      txAcceleration5s: round(pattern.txAcceleration5s, 2),
+      range5sPct: round(pattern.range5sPct, 3),
+      priceChange10sPct: round(pattern.priceChange10sPct, 3),
     };
   }
 

@@ -650,13 +650,21 @@ class SignalEngine extends EventEmitter {
     const latestSlot = this.tickStream ? (this.tickStream.latestSlot || 0) : 0;
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
-    const activityReason = signal._activityFlow && flow
-      ? `activity_flow_15s: 1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(2)}SOL ` +
+    let activityReason = null;
+    if (signal._activityFlow && flow?.entryV5) {
+      activityReason =
+        `activity_burst_v5: 1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(2)}SOL ` +
+        `wallets=${flow.s60.uniqueTraders} topBuy=${(flow.s60.largestBuyShare * 100).toFixed(1)}% ` +
+        `net5=${flow.entryV5.previousNet5s.toFixed(2)}->${flow.entryV5.currentNet5s.toFixed(2)}SOL ` +
+        `flowAccel=${flow.entryV5.flowAcceleration5s.toFixed(2)} txAccel=${flow.entryV5.txAcceleration5s.toFixed(0)}`;
+    } else if (signal._activityFlow && flow?.entry15s) {
+      activityReason =
+        `activity_flow_15s: 1m=${flow.s60.tradeCount}tx/${flow.s60.volumeSol.toFixed(2)}SOL ` +
         `net=${flow.entry15s.netFlows.map((value) => value.toFixed(2)).join('/')}SOL ` +
         `accel=${flow.entry15s.previousAcceleration.toFixed(2)}->` +
         `${flow.entry15s.currentAcceleration.toFixed(2)}->` +
-        `${flow.entry15s.latestAcceleration.toFixed(2)}`
-      : null;
+        `${flow.entry15s.latestAcceleration.toFixed(2)}`;
+    }
 
     // v3.10: 先 emit buyOrder（让 Executor 立即开始工作），再异步写 DB
     // SQLite WAL 模式下写入也要 1-3ms，省下来给关键路径

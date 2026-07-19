@@ -41,6 +41,7 @@ const {
 
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
+const { estimateBuySlippagePct } = require('./ExecutionMath');
 
 // AllenHark Slipstream SDK (lazy load)
 let SlipstreamClient = null;
@@ -917,6 +918,7 @@ class Executor {
         tokenAmount,
         solIn: sizeSol,
         price: fillPrice,
+        estimatedSlippagePct: 0.5,
         latencyMs: Date.now() - t0,
         dryRun: true,
       };
@@ -1111,6 +1113,34 @@ class Executor {
       const baseRaw = this._extractBaseAmount(buyResult, swapState, sizeLamportsBN, 'buy');
       const tokenAmount = Number(baseRaw) / Math.pow(10, baseDecimals);
       const realPrice = tokenAmount > 0 ? sizeSol / tokenAmount : 0;
+      const estimatedSlippagePct = this._estimateBuySlippagePct(
+        swapState,
+        sizeSol,
+        tokenAmount,
+        baseDecimals,
+      );
+      const maxEstimatedSlippagePct = config.strategy.buyMaxEstimatedSlippagePct;
+      if (!Number.isFinite(estimatedSlippagePct)) {
+        monitor.inc('Executor.buySlippageEstimateUnavailable', 1, 'Executor');
+        return {
+          success: false,
+          error: 'estimated_buy_slippage_unavailable',
+          latencyMs: Date.now() - t0,
+        };
+      }
+      if (maxEstimatedSlippagePct > 0 && estimatedSlippagePct > maxEstimatedSlippagePct) {
+        monitor.inc('Executor.buyEstimatedSlippageRejected', 1, 'Executor');
+        console.warn(
+          `[Executor:LIVE] BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
+            `estimated slippage ${estimatedSlippagePct.toFixed(2)}%>${maxEstimatedSlippagePct}%`,
+        );
+        return {
+          success: false,
+          error: `estimated_buy_slippage:${estimatedSlippagePct.toFixed(2)}%>${maxEstimatedSlippagePct}%`,
+          estimatedSlippagePct,
+          latencyMs: Date.now() - t0,
+        };
+      }
 
       // 3. 构造、签名、提交
       // v3.32: 传入 baseTokenProgram 支持 Token-2022 币
@@ -1142,6 +1172,7 @@ class Executor {
         tokenAmount,
         solIn: sizeSol,
         price: realPrice,
+        estimatedSlippagePct,
         latencyMs: Date.now() - t0,
         stateLatencyMs,
         buildLatencyMs,
@@ -1391,6 +1422,10 @@ class Executor {
     if (baseStr && baseStr !== WSOL) return baseStr;
     if (quoteStr && quoteStr !== WSOL) return quoteStr;
     return null;
+  }
+
+  _estimateBuySlippagePct(state, sizeSol, tokenAmount, baseDecimals = 6) {
+    return estimateBuySlippagePct(state, sizeSol, tokenAmount, baseDecimals);
   }
 
   /**
