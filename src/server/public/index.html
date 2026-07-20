@@ -172,7 +172,7 @@
   .pill.success { background: rgba(38, 166, 154, 0.2); color: var(--green); }
   .pill.fail { background: rgba(239, 83, 80, 0.2); color: var(--red); }
   .pill.monitoring { background: rgba(139, 148, 170, 0.14); color: var(--text-dim); }
-  .pill.ready, .pill.armed { background: rgba(245, 176, 65, 0.2); color: var(--yellow); }
+  .pill.ready, .pill.armed, .pill.waiting { background: rgba(245, 176, 65, 0.2); color: var(--yellow); }
   .pill.confirming { background: rgba(41, 182, 246, 0.2); color: var(--accent); }
   .pill.signaled { background: rgba(38, 166, 154, 0.24); color: var(--green); }
   .pill.cancelled { background: rgba(239, 83, 80, 0.14); color: #ff8a87; }
@@ -287,8 +287,8 @@
       <div class="status-grid">
         <div class="status-item"><div class="label">监控代币</div><div class="value" id="stat-watched">-</div></div>
         <div class="status-item"><div class="label">当前持仓</div><div class="value" id="stat-open">-</div></div>
-        <div class="status-item"><div class="label">1m 成交量</div><div class="value" id="stat-volume1m">-</div></div>
-        <div class="status-item"><div class="label">1m 交易数</div><div class="value" id="stat-trades1m">-</div></div>
+        <div class="status-item"><div class="label">10m 成交量区间</div><div class="value" id="stat-volume1m">-</div></div>
+        <div class="status-item"><div class="label">入场模式</div><div class="value" id="stat-trades1m">-</div></div>
         <div class="status-item"><div class="label">每笔仓位</div><div class="value" id="stat-size">-</div></div>
         <div class="status-item"><div class="label">止盈</div><div class="value" id="stat-tp">-</div></div>
         <div class="status-item"><div class="label">最大持仓</div><div class="value" id="stat-hold">-</div></div>
@@ -388,7 +388,7 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>1m 成交量</th><th>1m 买入笔数</th><th>1m 买家</th><th>1m 新买家</th><th>最大单买</th><th>5s 买家</th><th>5s 人均买量</th><th>5s 买卖比</th><th>5s 加速</th><th>1m 涨幅</th><th>10s 涨幅</th><th>确认</th><th>阶段</th></tr></thead>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>AGE</th><th>10m 成交量</th><th>参考价</th><th>当前/参考</th><th>回踩</th><th>反弹</th><th>15s 买量</th><th>15s 卖量</th><th>15s 买家</th><th>预估滑点</th><th>首笔延迟</th><th>等待原因</th><th>阶段</th></tr></thead>
             <tbody id="signalsTbody"><tr><td colspan="16" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
@@ -486,8 +486,12 @@ async function refreshStatus() {
   $('modeBadge').className = 'badge ' + (r.dryRun ? 'dry' : 'live');
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
-  $('stat-volume1m').textContent = fmtMoney(r.config.activityVolume1mUsd);
-  $('stat-trades1m').textContent = r.config.activityTrades1m;
+  $('stat-volume1m').textContent = r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
+    ? `${fmtMoney(r.config.pullbackVolume10mMinUsd)} - ${fmtMoney(r.config.pullbackVolume10mMaxUsd)}`
+    : fmtMoney(r.config.activityVolume1mUsd);
+  $('stat-trades1m').textContent = r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
+    ? (r.config.pullbackShadowOnly ? '10m回踩·影子' : '10m回踩·实盘')
+    : r.config.activityTrades1m;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-tp').textContent = '+' + r.config.takeProfitPct + '%';
   $('stat-hold').textContent = r.config.maxHoldMs / 1000 + 's';
@@ -721,17 +725,22 @@ function _strategyNumber(value, digits = 2) {
 function _strategyStage(candidate, now) {
   const labels = {
     monitoring: '扫描',
+    collecting: '累计10m',
     cancelled: '已取消',
     ready: '待激活',
     armed: '已激活',
+    waiting: '等待恢复',
     confirming: '确认 1/2',
-    signaled: '买入信号',
+    signaled: '入场信号',
+    expired: '已过期',
+    ineligible: '不符合',
   };
   const stage = candidate.stage || 'monitoring';
-  const remaining = candidate.armedUntil
-    ? ` ${Math.max(0, Math.ceil((candidate.armedUntil - now) / 1000))}s`
+  const deadline = candidate.waitUntil || candidate.armedUntil;
+  const remaining = deadline
+    ? ` ${Math.max(0, Math.ceil((deadline - now) / 1000))}s`
     : '';
-  const title = candidate.cancelReason || '';
+  const title = candidate.waitReason || candidate.cancelReason || '';
   return `<span class="pill ${stage}" title="${escapeHtml(title)}">${labels[stage] || escapeHtml(stage)}${remaining}</span>`;
 }
 
@@ -748,12 +757,54 @@ async function refreshSignals() {
   const summary = r.summary || {};
   const thresholds = r.thresholds || {};
   const rows = r.candidates || [];
+  if (r.mode === 'TEN_MIN_PULLBACK') {
+    meta.innerHTML = [
+      `<span>模式 <b>10m回踩恢复${r.shadowOnly ? '·影子' : '·实盘'}</b></span>`,
+      `<span>活跃 <b>${summary.active || 0}</b></span>`,
+      `<span>累计中 <b>${summary.collecting || 0}</b></span>`,
+      `<span>10m量达标 <b>${summary.volumeReady || 0}</b></span>`,
+      `<span>等待恢复 <b>${summary.waiting || 0}</b></span>`,
+      `<span>${r.shadowOnly ? '影子信号' : '实盘信号'} <b>${summary.signaled || 0}</b></span>`,
+      `<span>过期/淘汰 <b>${(summary.expired || 0) + (summary.ineligible || 0)}</b></span>`,
+    ].join('');
+
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="16" class="empty">暂无活跃成交</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(candidate => {
+      const conditions = candidate.conditions || {};
+      const metrics = candidate.metrics || {};
+      const waitReason = candidate.waitReason || candidate.ineligibleReason || '-';
+      return `
+        <tr>
+          <td class="mono">${fmtTime(candidate.updatedAt)}</td>
+          <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
+          ${caCell(candidate.mint)}
+          <td>${_strategyNumber((candidate.migrationAgeMs || 0) / 60000, 2)}m</td>
+          <td>${_strategyCondition(`${fmtMoney(candidate.volume10mUsd)} / ${fmtMoney(thresholds.minVolume10mUsd)}-${fmtMoney(thresholds.maxVolume10mUsd)}`, conditions.volume10m)}</td>
+          <td class="mono">${_strategyNumber(candidate.referencePrice, 8)}</td>
+          <td>${_strategyCondition(`${_strategyNumber(metrics.priceVsReferencePct)}%`, conditions.atOrBelowReference)}</td>
+          <td>${_strategyCondition(`${_strategyNumber(metrics.drawdownPct)}%`, conditions.pullback)}</td>
+          <td>${_strategyCondition(`${_strategyNumber(metrics.reboundPct)}%`, conditions.rebound)}</td>
+          <td>${_strategyCondition(`${_strategyNumber(metrics.buyVolume15sSol)} SOL`, conditions.buyFlow15s)}</td>
+          <td>${_strategyCondition(`${_strategyNumber(metrics.sellVolume15sSol)} SOL`, conditions.buyFlow15s)}</td>
+          <td>${_strategyCondition(`${metrics.uniqueBuyers15s || 0} / ${thresholds.minUniqueBuyers || 0}`, conditions.buyers15s)}</td>
+          <td>${_strategyCondition(`${_strategyNumber(metrics.estimatedSlippagePct)}%`, conditions.slippage)}</td>
+          <td>${_strategyNumber((candidate.firstSeenDelayMs || 0) / 1000, 1)}s</td>
+          <td style="max-width:260px" title="${escapeHtml(waitReason)}">${escapeHtml(waitReason.slice(0, 45))}</td>
+          <td>${_strategyStage(candidate, r.now || Date.now())}</td>
+        </tr>`;
+    }).join('');
+    return;
+  }
   meta.innerHTML = [
     `<span>模式 <b>${escapeHtml(r.mode || '-')}</b></span>`,
     `<span>活跃 <b>${summary.active || 0}</b></span>`,
     `<span>1m量达标 <b>${summary.volumeReady || 0}</b></span>`,
     `<span>预备 <b>${summary.armReady || 0}</b></span>`,
     `<span>激活 <b>${summary.armed || 0}</b></span>`,
+    `<span>等待恢复 <b>${summary.waiting || 0}</b></span>`,
     `<span>确认 <b>${summary.confirming || 0}</b></span>`,
     `<span>信号 <b>${summary.signaled || 0}</b></span>`,
   ].join('');

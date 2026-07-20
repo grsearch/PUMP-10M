@@ -22,29 +22,27 @@ used to backfill its migration AGE even when that pair does not yet expose compl
 FDV/LP data. Legacy `WATCHDOG_CHECK_INTERVAL_MS` values above one minute are clamped
 to `60000`.
 
-Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **15 秒资金流加速度反转**。
+Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **迁移后 10 分钟中等放量，回踩恢复后实盘买入**。
 
 ## 当前买入策略
 
-每个监控代币收到实时 swap 后，程序使用已完成的 15 秒资金流窗口判断：
+程序以确认的 Pump 迁移时间计算 AGE，并按以下顺序判断：
 
-- 1 分钟总成交量默认必须达到 `$3,000`，按 `SOL_PRICE_USD` 换算成 SOL。`.env.example` 默认 `SOL_PRICE_USD=72`，所以约等于 `41.7 SOL/分钟`。
-- 1 分钟交易次数默认必须 `>=25`，过滤低频小量币。
-- 每个 15 秒窗口的净资金流为 `买入 SOL - 卖出 SOL`；相邻净资金流的差值作为资金流加速度。
-- 最近 `3` 个完整 15 秒窗口的净资金流必须严格递增。
-- 最近一次资金流加速度必须从负数变为正数。
-- 价格涨跌和 K 线方向不参与买入判断。
-- 买卖比过滤全部删除；买卖比仍可记录到特征库用于分析，但不会阻止买入。
-- 同一个已完成 15 秒窗口最多产生一次信号，避免重复买入。
-- 池子 SOL 默认仍需 `>=30 SOL`。
-- 信号必须足够新，默认 `ACTIVITY_FLOW_MAX_SIGNAL_AGE_MS=5000`。
+- 只处理迁移后 `60 秒` 内已经开始记录真实成交的新币；迁移时间未知或启动记录太晚的币不参与。
+- 累计迁移后前 `10 分钟`真实买卖成交量，按 `SOL_PRICE_USD` 换算为美元；只保留 `$20,000～$50,000`。
+- 第 10 分钟不直接买，最多继续等待 `5 分钟`。
+- 相对 10 分钟参考价必须先回踩 `>=10%`，再从回踩低点反弹 `>=5%`。
+- 当前价仍不得高于 10 分钟参考价。
+- 最近 `15 秒`买入量必须大于卖出量，且独立买家 `>=2`。
+- 按当前仓位和池子报价储备估算的买入滑点必须 `<=5%`；实盘提交前 Executor 还会使用 SDK 报价做第二次精确滑点校验。
+- 默认 `TEN_MIN_PULLBACK_SHADOW_ONLY=false`，合格信号直接进入实盘下单链路。改为 `true` 可只记录不交易。
 
 默认入口日志应显示：
 
 ```text
-Entry: ACTIVITY_FLOW (FLOW_ACCEL_15S: 1m volume>=...SOL (~$3000), 3 increasing closed 15s net-flow values, flow acceleration - to +, ratio filters disabled)
+Entry: ACTIVITY_FLOW (TEN_MIN_PULLBACK: first 10m $20000-$50000, pullback>=10%, rebound>=5%, 15s buyers>=2, slippage<=5%, LIVE)
 Legacy dumpSignal: suppressed
-[main] ActivityFlow enabled: mode=FLOW_ACCEL_15S ...
+[main] ActivityFlow enabled: mode=TEN_MIN_PULLBACK ... shadow=false ...
 ```
 
 ## 当前卖出策略
@@ -55,7 +53,7 @@ Legacy dumpSignal: suppressed
 - 固定止盈：上涨 `100%` 立即卖出。
 - 固定止损：下跌 `20%` 立即卖出。
 - RSI 买卖过滤和 RSI 退出均关闭。
-- TIMEOUT 卖出：关闭。
+- 最长持仓：`180 秒`，到时强制退出。
 - 加仓：关闭。
 - 卖出冷静期：实际平仓完成后，同币 `5 分钟` 内禁止再次买入；多仓分批卖出时从最后一笔完成卖出重新计时。
 

@@ -36,15 +36,27 @@ async function main() {
   console.log(`TP: +${config.strategy.takeProfitPct}% (immediate, no confirm)`);
   console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}% (priority: TP > trailing)`);
   console.log('RSI exit: disabled');
-  console.log(
-    `Entry: ACTIVITY_FLOW ` +
-      `(${config.activityFlow.entryMode}: 1m volume>=${config.activityFlow.minVolume1mSol.toFixed(2)}SOL ` +
-      `(~$${Math.round(config.activityFlow.minVolume1mUsd)}), ` +
-      `buyers>=${config.activityFlow.breadthMinUniqueBuyers1m}, ` +
-      `newBuyers>=${config.activityFlow.breadthMinNewBuyers1m}, ` +
-      `avgBuy5<=${config.activityFlow.breadthMaxAvgBuyPerWallet5sSol}SOL, ` +
-      `support>=${config.activityFlow.breadthMinConfirmations}/5 + 2x confirmation)`,
-  );
+  if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
+    console.log(
+      `Entry: ACTIVITY_FLOW (TEN_MIN_PULLBACK: first 10m ` +
+        `$${config.activityFlow.pullbackMinVolumeUsd}-$${config.activityFlow.pullbackMaxVolumeUsd}, ` +
+        `pullback>=${config.activityFlow.pullbackMinDrawdownPct}%, ` +
+        `rebound>=${config.activityFlow.pullbackMinReboundPct}%, ` +
+        `15s buyers>=${config.activityFlow.pullbackMinUniqueBuyers}, ` +
+        `slippage<=${config.activityFlow.pullbackMaxEstimatedSlippagePct}%, ` +
+        `${config.activityFlow.pullbackShadowOnly ? 'SHADOW ONLY' : 'LIVE'})`,
+    );
+  } else {
+    console.log(
+      `Entry: ACTIVITY_FLOW ` +
+        `(${config.activityFlow.entryMode}: 1m volume>=${config.activityFlow.minVolume1mSol.toFixed(2)}SOL ` +
+        `(~$${Math.round(config.activityFlow.minVolume1mUsd)}), ` +
+        `buyers>=${config.activityFlow.breadthMinUniqueBuyers1m}, ` +
+        `newBuyers>=${config.activityFlow.breadthMinNewBuyers1m}, ` +
+        `avgBuy5<=${config.activityFlow.breadthMaxAvgBuyPerWallet5sSol}SOL, ` +
+        `support>=${config.activityFlow.breadthMinConfirmations}/5 + 2x confirmation)`,
+    );
+  }
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
       `(2 closed 15s net-flow values, + to -` +
@@ -216,20 +228,37 @@ async function main() {
       `jump<=${swapSanitizer.maxJumpRatio}x market<=${swapSanitizer.marketMaxRatio}x ` +
       `independentSources>=${swapSanitizer.confirmMinIndependentSources}`,
   );
-  console.log(
-    `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
-      `mode=${activityFlowTracker.entryMode} ` +
-      `1m>=${activityFlowTracker.minVolume1mSol.toFixed(2)}SOL(~$${Math.round(activityFlowTracker.minVolume1mUsd)}) ` +
-      `arm=${activityFlowTracker.armWindowMs / 1000}s ` +
-      `buyers>=${activityFlowTracker.breadthMinUniqueBuyers1m} ` +
-      `newBuyers>=${activityFlowTracker.breadthMinNewBuyers1m} ` +
-      `avgBuy5<=${activityFlowTracker.breadthMaxAvgBuyPerWallet5sSol}SOL ` +
-      `price60<=${activityFlowTracker.breadthMaxPriceChange60sPct}% ` +
-      `entry=breadth-score-${activityFlowTracker.breadthMinConfirmations}/5+2x-confirm ` +
-      `warmup=${activityFlowTracker.breadthWarmupMs / 1000}s ` +
-      `cooldown=${activityFlowTracker.breadthCooldownMs / 1000}s ` +
-      `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
-  );
+  if (activityFlowTracker.entryMode === 'TEN_MIN_PULLBACK') {
+    console.log(
+      `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
+        `mode=${activityFlowTracker.entryMode} ` +
+        `firstSeen<=${activityFlowTracker.pullbackMaxFirstSeenDelayMs / 1000}s ` +
+        `vol10m=$${activityFlowTracker.pullbackMinVolumeUsd}-$${activityFlowTracker.pullbackMaxVolumeUsd} ` +
+        `wait=${activityFlowTracker.pullbackMaxWaitMs / 1000}s ` +
+        `pullback>=${activityFlowTracker.pullbackMinDrawdownPct}% ` +
+        `rebound>=${activityFlowTracker.pullbackMinReboundPct}% ` +
+        `flow=${activityFlowTracker.pullbackFlowWindowMs / 1000}s ` +
+        `buyers>=${activityFlowTracker.pullbackMinUniqueBuyers} ` +
+        `slippage<=${activityFlowTracker.pullbackMaxEstimatedSlippagePct}% ` +
+        `shadow=${activityFlowTracker.pullbackShadowOnly} ` +
+        `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
+    );
+  } else {
+    console.log(
+      `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
+        `mode=${activityFlowTracker.entryMode} ` +
+        `1m>=${activityFlowTracker.minVolume1mSol.toFixed(2)}SOL(~$${Math.round(activityFlowTracker.minVolume1mUsd)}) ` +
+        `arm=${activityFlowTracker.armWindowMs / 1000}s ` +
+        `buyers>=${activityFlowTracker.breadthMinUniqueBuyers1m} ` +
+        `newBuyers>=${activityFlowTracker.breadthMinNewBuyers1m} ` +
+        `avgBuy5<=${activityFlowTracker.breadthMaxAvgBuyPerWallet5sSol}SOL ` +
+        `price60<=${activityFlowTracker.breadthMaxPriceChange60sPct}% ` +
+        `entry=breadth-score-${activityFlowTracker.breadthMinConfirmations}/5+2x-confirm ` +
+        `warmup=${activityFlowTracker.breadthWarmupMs / 1000}s ` +
+        `cooldown=${activityFlowTracker.breadthCooldownMs / 1000}s ` +
+        `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
+    );
+  }
   console.log(
     `[main] StrategyLab ${featureRecorder.enabled ? 'enabled' : 'disabled'}: ` +
       `snapshot=${featureRecorder.snapshotIntervalMs}ms ` +
@@ -251,6 +280,12 @@ async function main() {
         console.warn(`[FlowExit] handleSwap failed: ${err.message}`);
       }
     } else {
+      // The ten-minute gate is based on true traded volume. Price-ineligible
+      // sanitized events still retain valid volume, so count them without
+      // letting their untrusted price enter the pullback/flow calculation.
+      try { activityFlowTracker.handleVolumeSwap(swap); } catch (err) {
+        console.warn(`[ActivityFlow] handleVolumeSwap failed: ${err.message}`);
+      }
       monitor.inc('main.filteredSwapEvent', 1, 'main');
     }
   });
@@ -295,6 +330,26 @@ async function main() {
     Promise.resolve(signalEngine.handleDumpSignal(signal)).catch((err) => {
       console.error(`[ActivityFlow] SignalEngine error: ${err.message}`);
     });
+  });
+  activityFlowTracker.on('shadowSignal', (signal) => {
+    const entry = signal._flow?.entry10mPullback || {};
+    try {
+      tradeLogger.logSignal({
+        ts: signal.ts,
+        mint: signal.mint,
+        symbol: signal.symbol,
+        kind: 'TEN_MIN_PULLBACK_SHADOW',
+        sellSol: signal.sellSol,
+        priceImpactPct: signal.priceImpactPct,
+        seller: null,
+        sellerTx: signal.signature,
+        notes: JSON.stringify(entry),
+        accepted: false,
+        rejectReason: 'SHADOW_ONLY',
+      });
+    } catch (err) {
+      console.warn(`[ActivityFlow] failed to record shadow signal: ${err.message}`);
+    }
   });
 
   // ============ 服务器 ============
