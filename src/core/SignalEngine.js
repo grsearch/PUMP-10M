@@ -652,7 +652,15 @@ class SignalEngine extends EventEmitter {
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
     let activityReason = null;
-    if (signal._activityFlow && flow?.entryV6) {
+    if (signal._activityFlow && flow?.entry10mPullback) {
+      const entry = flow.entry10mPullback;
+      activityReason =
+        `ten_min_pullback: age=${(entry.migrationAgeMs / 60000).toFixed(2)}m ` +
+        `vol10m=$${entry.volume10mUsd.toFixed(0)} ` +
+        `drawdown=${entry.drawdownPct.toFixed(2)}% rebound=${entry.reboundPct.toFixed(2)}% ` +
+        `flow15=${entry.buyVolume15sSol.toFixed(2)}/${entry.sellVolume15sSol.toFixed(2)}SOL ` +
+        `buyers=${entry.uniqueBuyers15s} slip~${entry.estimatedSlippagePct.toFixed(2)}%`;
+    } else if (signal._activityFlow && flow?.entryV6) {
       activityReason =
         `breadth_burst_v6: 1m=${flow.s60.buyCount}buys/${flow.s60.volumeSol.toFixed(2)}SOL ` +
         `buyers=${flow.s60.uniqueBuyers} new=${flow.s60.newUniqueBuyers} ` +

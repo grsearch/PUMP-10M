@@ -47,7 +47,7 @@ function candleEvents(bucketTs, open, close, buySol, sellSol) {
 
 function run() {
   assert.strictEqual(config.activityFlow.minVolume1mUsd, 3000);
-  assert.strictEqual(config.activityFlow.entryMode, 'BREADTH_BURST_V6');
+  assert.strictEqual(config.activityFlow.entryMode, 'TEN_MIN_PULLBACK');
   assert.strictEqual(config.strategy.flowReversalExitEnabled, true);
   assert.strictEqual(config.strategy.flowReversalExitMode, 'FLOW_TURN_15S');
 

@@ -230,7 +230,32 @@ const config = {
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL ?? process.env.ORDER_FLOW_REPLACE_DUMP_SIGNAL ?? 'true')
         .toLowerCase() === 'true',
-    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'BREADTH_BURST_V6').toUpperCase(),
+    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'TEN_MIN_PULLBACK').toUpperCase(),
+    // Research entry: observe a complete first 10 minutes after Pump migration,
+    // then wait at most five minutes for a >=10% pullback and >=5% recovery.
+    // Set TEN_MIN_PULLBACK_SHADOW_ONLY=true to record signals without trading.
+    pullbackShadowOnly:
+      (process.env.TEN_MIN_PULLBACK_SHADOW_ONLY ?? 'false').toLowerCase() === 'true',
+    pullbackReferenceAgeMs: parseInt(process.env.TEN_MIN_PULLBACK_REFERENCE_AGE_MS || '600000', 10),
+    pullbackMaxWaitMs: parseInt(process.env.TEN_MIN_PULLBACK_MAX_WAIT_MS || '300000', 10),
+    pullbackMaxFirstSeenDelayMs: parseInt(
+      process.env.TEN_MIN_PULLBACK_MAX_FIRST_SEEN_DELAY_MS || '60000',
+      10,
+    ),
+    pullbackMinVolumeUsd: parseFloat(process.env.TEN_MIN_PULLBACK_MIN_VOLUME_USD || '20000'),
+    pullbackMaxVolumeUsd: parseFloat(process.env.TEN_MIN_PULLBACK_MAX_VOLUME_USD || '50000'),
+    pullbackMinDrawdownPct: parseFloat(process.env.TEN_MIN_PULLBACK_MIN_DRAWDOWN_PCT || '10'),
+    pullbackMinReboundPct: parseFloat(process.env.TEN_MIN_PULLBACK_MIN_REBOUND_PCT || '5'),
+    pullbackMaxPriceVsReferencePct: parseFloat(
+      process.env.TEN_MIN_PULLBACK_MAX_PRICE_VS_REFERENCE_PCT || '0',
+    ),
+    pullbackFlowWindowMs: parseInt(process.env.TEN_MIN_PULLBACK_FLOW_WINDOW_MS || '15000', 10),
+    pullbackMinUniqueBuyers: parseInt(process.env.TEN_MIN_PULLBACK_MIN_UNIQUE_BUYERS || '2', 10),
+    pullbackMaxEstimatedSlippagePct: parseFloat(
+      process.env.TEN_MIN_PULLBACK_MAX_ESTIMATED_SLIPPAGE_PCT ||
+        process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT ||
+        '5',
+    ),
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -562,6 +587,32 @@ function validateConfig() {
   if (!config.birdeye.apiKey) errors.push('BIRDEYE_API_KEY missing');
   if (!config.DRY_RUN && !config.wallet.privateKeyBs58) {
     errors.push('WALLET_PRIVATE_KEY_BS58 required for LIVE mode');
+  }
+  if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
+    if (config.activityFlow.pullbackReferenceAgeMs <= 0) {
+      errors.push('TEN_MIN_PULLBACK_REFERENCE_AGE_MS must be > 0');
+    }
+    if (config.activityFlow.pullbackMaxWaitMs <= 0) {
+      errors.push('TEN_MIN_PULLBACK_MAX_WAIT_MS must be > 0');
+    }
+    if (
+      config.activityFlow.pullbackMinVolumeUsd <= 0 ||
+      config.activityFlow.pullbackMaxVolumeUsd < config.activityFlow.pullbackMinVolumeUsd
+    ) {
+      errors.push('TEN_MIN_PULLBACK volume range is invalid');
+    }
+    if (config.activityFlow.pullbackMinDrawdownPct <= 0) {
+      errors.push('TEN_MIN_PULLBACK_MIN_DRAWDOWN_PCT must be > 0');
+    }
+    if (config.activityFlow.pullbackMinReboundPct <= 0) {
+      errors.push('TEN_MIN_PULLBACK_MIN_REBOUND_PCT must be > 0');
+    }
+    if (config.activityFlow.pullbackMinUniqueBuyers < 2) {
+      errors.push('TEN_MIN_PULLBACK_MIN_UNIQUE_BUYERS must be >= 2');
+    }
+    if (config.activityFlow.pullbackMaxEstimatedSlippagePct <= 0) {
+      errors.push('TEN_MIN_PULLBACK_MAX_ESTIMATED_SLIPPAGE_PCT must be > 0');
+    }
   }
   return errors;
 }
