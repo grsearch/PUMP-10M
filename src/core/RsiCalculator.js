@@ -52,10 +52,12 @@ class RsiCalculator {
   constructor({
     period1 = 14,
     period5 = 7,
+    period15 = 7,
     period30 = 7,
     period60 = 7,
     bucketMs1 = 1000,
     bucketMs5 = 5000,
+    bucketMs15 = 15000,
     bucketMs30 = 30000,
     bucketMs60 = 60000,
     maxBuckets = 120,
@@ -63,12 +65,14 @@ class RsiCalculator {
   } = {}) {
     this.period1 = period1;
     this.period5 = period5;
+    this.period15 = Math.max(1, period15);
     this.period30 = period30;
     this.period60 = Math.max(1, period60);
     // 向后兼容:旧代码用 this.period
     this.period = period1;
     this.bucketMs1 = bucketMs1;
     this.bucketMs5 = bucketMs5;
+    this.bucketMs15 = bucketMs15;
     this.bucketMs30 = bucketMs30;
     this.bucketMs60 = bucketMs60;
     this.maxBuckets = maxBuckets;
@@ -86,6 +90,7 @@ class RsiCalculator {
     if (!Number.isFinite(price) || price <= 0) return;
     const s = this._prepareStateForPrice(mint, price, ts);
     if (!s) return;
+    this._updateRsi15sState(s, price, ts);
     this._updateRsi1mState(s, price, ts);
     this._touchBucket(s.buckets1s, price, 0, ts, this.bucketMs1);
     this._touchBucket(s.buckets5s, price, 0, ts, this.bucketMs5);
@@ -128,6 +133,7 @@ class RsiCalculator {
       s._snapshotBeforeFeed = null;
     }
 
+    this._updateRsi15sState(s, price, ts);
     this._updateRsi1mState(s, price, ts);
     this._touchBucket(s.buckets1s, price, solVolume, ts, this.bucketMs1);
     this._touchBucket(s.buckets5s, price, solVolume, ts, this.bucketMs5);
@@ -147,6 +153,18 @@ class RsiCalculator {
         lastPrice: null,
         lastTs: null,
         lastPoolQuoteSol: null,
+        rsi15sCurrentIdx: null,
+        rsi15sCurrentClose: null,
+        rsi15sFinalIdx: null,
+        rsi15sFinalClose: null,
+        rsi15sCloseCount: 0,
+        rsi15sSeedChanges: 0,
+        rsi15sSeedGain: 0,
+        rsi15sSeedLoss: 0,
+        rsi15sAvgGain: null,
+        rsi15sAvgLoss: null,
+        rsi15sClosed: null,
+        rsi15sPreviousClosed: null,
         rsi1mCurrentIdx: null,
         rsi1mCurrentClose: null,
         rsi1mFinalClose: null,
@@ -254,6 +272,63 @@ class RsiCalculator {
     s.rsi1mCloseCount += 1;
   }
 
+  _commitRsi15sClose(s, close, bucketIdx) {
+    if (s.rsi15sFinalClose == null) {
+      s.rsi15sFinalClose = close;
+      s.rsi15sFinalIdx = bucketIdx;
+      s.rsi15sCloseCount = 1;
+      return;
+    }
+
+    const delta = close - s.rsi15sFinalClose;
+    const gain = delta > 0 ? delta : 0;
+    const loss = delta < 0 ? -delta : 0;
+    if (s.rsi15sSeedChanges < this.period15) {
+      s.rsi15sSeedGain += gain;
+      s.rsi15sSeedLoss += loss;
+      s.rsi15sSeedChanges += 1;
+      if (s.rsi15sSeedChanges === this.period15) {
+        s.rsi15sAvgGain = s.rsi15sSeedGain / this.period15;
+        s.rsi15sAvgLoss = s.rsi15sSeedLoss / this.period15;
+      }
+    } else {
+      s.rsi15sAvgGain = (s.rsi15sAvgGain * (this.period15 - 1) + gain) / this.period15;
+      s.rsi15sAvgLoss = (s.rsi15sAvgLoss * (this.period15 - 1) + loss) / this.period15;
+    }
+    s.rsi15sFinalClose = close;
+    s.rsi15sFinalIdx = bucketIdx;
+    s.rsi15sCloseCount += 1;
+
+    if (
+      s.rsi15sSeedChanges >= this.period15 &&
+      Number.isFinite(s.rsi15sAvgGain) &&
+      Number.isFinite(s.rsi15sAvgLoss)
+    ) {
+      s.rsi15sPreviousClosed = s.rsi15sClosed;
+      s.rsi15sClosed = this._rsiFromAverages(s.rsi15sAvgGain, s.rsi15sAvgLoss);
+    }
+  }
+
+  _updateRsi15sState(s, price, ts) {
+    const idx = Math.floor(ts / this.bucketMs15);
+    if (s.rsi15sCurrentIdx == null) {
+      s.rsi15sCurrentIdx = idx;
+      s.rsi15sCurrentClose = price;
+      return;
+    }
+    if (idx < s.rsi15sCurrentIdx) return;
+    if (idx === s.rsi15sCurrentIdx) {
+      s.rsi15sCurrentClose = price;
+      return;
+    }
+
+    // Empty time buckets are deliberately not synthesized. The next real
+    // trade opens the next tradable 15-second candle.
+    this._commitRsi15sClose(s, s.rsi15sCurrentClose, s.rsi15sCurrentIdx);
+    s.rsi15sCurrentIdx = idx;
+    s.rsi15sCurrentClose = price;
+  }
+
   _commitFlatRsi1mBars(s, close, count) {
     let remaining = count;
     while (remaining > 0 && s.rsi1mSeedChanges < this.period60) {
@@ -311,6 +386,26 @@ class RsiCalculator {
     return this._rsiFromAverages(
       (s.rsi1mAvgGain * (this.period60 - 1) + gain) / this.period60,
       (s.rsi1mAvgLoss * (this.period60 - 1) + loss) / this.period60,
+    );
+  }
+
+  _currentRsi15s(s) {
+    if (s.rsi15sFinalClose == null || s.rsi15sCurrentClose == null) return null;
+    const delta = s.rsi15sCurrentClose - s.rsi15sFinalClose;
+    const gain = delta > 0 ? delta : 0;
+    const loss = delta < 0 ? -delta : 0;
+
+    if (s.rsi15sSeedChanges < this.period15) {
+      if (s.rsi15sSeedChanges + 1 < this.period15) return null;
+      return this._rsiFromAverages(
+        (s.rsi15sSeedGain + gain) / this.period15,
+        (s.rsi15sSeedLoss + loss) / this.period15,
+      );
+    }
+
+    return this._rsiFromAverages(
+      (s.rsi15sAvgGain * (this.period15 - 1) + gain) / this.period15,
+      (s.rsi15sAvgLoss * (this.period15 - 1) + loss) / this.period15,
     );
   }
 
@@ -411,9 +506,13 @@ class RsiCalculator {
     const rsi1s = this._wildersRsi(prices1s, this.period1);
     const rsi5s = this._wildersRsi(prices5s, this.period5);
     const rsi30s = this._wildersRsi(prices30s, this.period30);
+    const rsi15sLive = this._currentRsi15s(s);
     const rsi1mLive = this._currentRsi1m(s);
     const rsi1mClosed = this._closedRsi1m(s);
-    if (rsi1s == null && rsi5s == null && rsi30s == null && rsi1mLive == null && rsi1mClosed == null) {
+    if (
+      rsi1s == null && rsi5s == null && rsi15sLive == null && rsi30s == null &&
+      rsi1mLive == null && rsi1mClosed == null
+    ) {
       return null;
     }
 
@@ -429,6 +528,10 @@ class RsiCalculator {
     return {
       rsi1s,
       rsi5s,
+      rsi15s: rsi15sLive,
+      rsi15sLive,
+      rsi15sClosed: s.rsi15sClosed,
+      rsi15sPreviousClosed: s.rsi15sPreviousClosed,
       rsi30s,
       // rsi1m remains an alias for the live value for backward compatibility.
       rsi1m: rsi1mLive,
@@ -437,6 +540,13 @@ class RsiCalculator {
       rsi1sSlope,
       bucketCount1s: s.buckets1s.length,
       bucketCount5s: s.buckets5s.length,
+      rsi15sClosedBars: s.rsi15sCloseCount,
+      rsi15sCurrentBucketTs:
+        s.rsi15sCurrentIdx == null ? null : s.rsi15sCurrentIdx * this.bucketMs15,
+      rsi15sClosedBucketTs:
+        s.rsi15sFinalIdx == null ? null : s.rsi15sFinalIdx * this.bucketMs15,
+      rsi15sLiveClose: s.rsi15sCurrentClose,
+      rsi15sLastClosedClose: s.rsi15sFinalClose,
       bucketCount30s: s.buckets30s.length,
       bucketCount1m: s.buckets60s.length,
       rsi1mClosedBars: s.rsi1mCloseCount,

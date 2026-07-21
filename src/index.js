@@ -33,10 +33,21 @@ async function main() {
   console.log('🎯 Dump Sniper V3.17.20 starting...');
   console.log(`Mode: ${config.DRY_RUN ? 'DRY_RUN' : '⚠️  LIVE TRADING ⚠️'}`);
   console.log(`Position: ${config.strategy.positionSizeSol} SOL`);
-  console.log(`TP: +${config.strategy.takeProfitPct}% (immediate, no confirm)`);
-  console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}% (priority: TP > trailing)`);
-  console.log('RSI exit: disabled');
-  if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
+  console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
+  console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}%`);
+  console.log(
+    `RSI(15s) exit: ${config.strategy.rsi15sExitEnabled
+      ? `> ${config.strategy.rsi15sOverboughtExit} or cross below ${config.strategy.rsi15sCrossDownExit}`
+      : 'disabled'}`,
+  );
+  if (config.activityFlow.entryMode === 'RSI_CROSS_15S') {
+    console.log(
+      `Entry: RSI(${config.activityFlow.rsi15sPeriod},15s) cross above ` +
+        `${config.activityFlow.rsi15sEntryThreshold}, trailing ` +
+        `${config.activityFlow.rsi15sVolumeWindowMs / 1000}s volume>=` +
+        `$${config.activityFlow.rsi15sMinVolume60sUsd}, buy next tradable candle open`,
+    );
+  } else if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
     console.log(
       `Entry: ACTIVITY_FLOW (TEN_MIN_PULLBACK: first 10m ` +
         `$${config.activityFlow.pullbackMinVolumeUsd}-$${config.activityFlow.pullbackMaxVolumeUsd}, ` +
@@ -149,11 +160,12 @@ async function main() {
   // RsiCalculator remains for price-history helpers; RSI buy/sell filters are disabled.
   const RsiCalculator = require('./core/RsiCalculator');
   const rsiCalculator = new RsiCalculator({
+    period15: config.activityFlow.rsi15sPeriod,
     period60: config.activityFlow.rsi1mPeriod,
     priceScaleResetRatio: config.activityFlow.rsiPriceScaleResetRatio,
   });
   if (rsiCalculator) {
-    console.log('[main] RSI filters disabled; RSI data kept for price-history helpers only');
+    console.log('[main] RSI calculator enabled for 15s entry/exit and price-history helpers');
     setInterval(() => rsiCalculator.cleanup(), 60_000);
 
     // Rebuild RSI from captured swaps. The lookback is a maximum, not a token-age
@@ -228,7 +240,16 @@ async function main() {
       `jump<=${swapSanitizer.maxJumpRatio}x market<=${swapSanitizer.marketMaxRatio}x ` +
       `independentSources>=${swapSanitizer.confirmMinIndependentSources}`,
   );
-  if (activityFlowTracker.entryMode === 'TEN_MIN_PULLBACK') {
+  if (activityFlowTracker.entryMode === 'RSI_CROSS_15S') {
+    console.log(
+      `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
+        `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi15sPeriod}) ` +
+        `cross>${activityFlowTracker.rsi15sEntryThreshold} ` +
+        `vol${activityFlowTracker.rsi15sVolumeWindowMs / 1000}s>=` +
+        `$${activityFlowTracker.rsi15sMinVolume60sUsd} next-tradable-open ` +
+        `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
+    );
+  } else if (activityFlowTracker.entryMode === 'TEN_MIN_PULLBACK') {
     console.log(
       `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
         `mode=${activityFlowTracker.entryMode} ` +
@@ -717,7 +738,11 @@ async function main() {
       } else {
         rsiCalculator.feedTick(mint, price, ts);
       }
-
+      const rsiSnapshot = rsiCalculator.snapshot(mint);
+      if (rsiSnapshot) {
+        activityFlowTracker.updateRsiSnapshot(mint, rsiSnapshot);
+        positionManager.handleRsiForExit(mint, price, rsiSnapshot);
+      }
     }
   });
 

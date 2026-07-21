@@ -652,7 +652,13 @@ class SignalEngine extends EventEmitter {
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
     let activityReason = null;
-    if (signal._activityFlow && flow?.entry10mPullback) {
+    if (signal._activityFlow && flow?.entryRsi15s) {
+      const entry = flow.entryRsi15s;
+      activityReason =
+        `rsi_15s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
+        `${entry.currentRsi.toFixed(2)} cross>${entry.threshold} ` +
+        `vol60=$${entry.volume60sUsd.toFixed(0)} next_candle_open=${entry.entryOpenPrice}`;
+    } else if (signal._activityFlow && flow?.entry10mPullback) {
       const entry = flow.entry10mPullback;
       activityReason =
         `ten_min_pullback: age=${(entry.migrationAgeMs / 60000).toFixed(2)}m ` +

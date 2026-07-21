@@ -3,7 +3,7 @@
 process.env.RSI_1M_EXIT_ENABLED = 'false';
 process.env.RSI_1M_EXIT_THRESHOLD = '80';
 process.env.ACTIVITY_FLOW_RSI_1M_MIN_BARS = '8';
-process.env.FIXED_STOP_LOSS_PCT = '-20';
+process.env.FIXED_STOP_LOSS_PCT = '0';
 
 const assert = require('assert');
 const Module = require('module');
@@ -39,6 +39,7 @@ function managerWith(...positions) {
   manager.positions = new Map();
   manager.byMint = new Map();
   manager._rsiExitSkipLogAt = new Map();
+  manager._rsi15sLastByMint = new Map();
   manager._exitCalls = [];
   manager._exit = function mockExit(pos, price, reason) {
     if (pos.exiting) return;
@@ -57,6 +58,7 @@ function managerWith(...positions) {
 
 function rsiSnapshot(live, overrides = {}) {
   return {
+    rsi15sLive: live,
     rsi1mLive: live,
     rsi1mClosed: 75,
     rsi1mClosedBars: 8,
@@ -67,10 +69,11 @@ function rsiSnapshot(live, overrides = {}) {
 function run() {
   const mint = 'TestMint111111111111111111111111111111111';
   assert.strictEqual(config.strategy.rebuyCooldownMs, 300_000, 'default post-sale cooldown must be 5 minutes');
-  assert.strictEqual(config.strategy.trailingActivatePct, 20);
-  assert.strictEqual(config.strategy.trailingDrawdownPct, 10);
-  assert.strictEqual(config.strategy.takeProfitPct, 100);
-  assert.strictEqual(config.strategy.fixedStopLossPct, -20);
+  assert.strictEqual(config.strategy.trailingActivatePct, 30);
+  assert.strictEqual(config.strategy.trailingDrawdownPct, 8);
+  assert.strictEqual(config.strategy.takeProfitPct, 0);
+  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
+  assert.strictEqual(config.strategy.maxHoldMs, 300_000);
 
   {
     const now = Date.now();
@@ -85,8 +88,7 @@ function run() {
     const second = position('p2', mint, { entryPrice: 1, highWaterMark: 1 });
     const manager = managerWith(first, second);
     manager._checkExit('p1', 0.79);
-    assert.deepStrictEqual(manager._exitCalls.map((x) => x.id), ['p1', 'p2']);
-    assert(manager._exitCalls.every((x) => x.reason === 'FIXED_STOP_LOSS'));
+    assert.strictEqual(manager._exitCalls.length, 0, 'fixed stop is not part of the RSI exit policy');
   }
 
   {
@@ -106,24 +108,34 @@ function run() {
 
   {
     const manager = managerWith(position('p1', mint), position('p2', mint));
-    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(95)), false);
-    assert.strictEqual(manager._exitCalls.length, 0, 'RSI exit must stay disabled');
+    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(80)), false, 'RSI=80 is not >80');
+    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(81)), true);
+    assert.deepStrictEqual(manager._exitCalls.map((x) => x.id), ['p1', 'p2']);
+    assert(manager._exitCalls.every((x) => x.reason === 'RSI_15S_OVERBOUGHT'));
+  }
+
+  {
+    const manager = managerWith(position('p1', mint));
+    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(75)), false);
+    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(70)), false, 'touching 70 is not below 70');
+    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(69.9)), true);
+    assert.strictEqual(manager._exitCalls[0].reason, 'RSI_15S_CROSS_DOWN');
   }
 
   {
     const now = Date.now();
     const first = position('p1', mint, {
       entryPrice: 1,
-      highWaterMark: 1.2,
+      highWaterMark: 1.3,
       openedAt: now - 10_000,
       reconciledAt: now - 10_000,
       trailingArmed: true,
-      _armedHwm: 1.2,
+      _armedHwm: 1.3,
       _armedHwmTs: now - 5_000,
     });
     const manager = managerWith(first);
-    manager._checkExit('p1', 1.079);
-    assert.strictEqual(manager._exitCalls.length, 1, '10% drawdown after +20% trailing arm should sell');
+    manager._checkExit('p1', 1.19);
+    assert.strictEqual(manager._exitCalls.length, 1, '8% drawdown after +30% trailing arm should sell');
     assert.strictEqual(manager._exitCalls[0].reason, 'TRAILING_STOP');
   }
 
