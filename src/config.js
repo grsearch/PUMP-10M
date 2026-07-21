@@ -50,14 +50,9 @@ const config = {
     // 仓位
     positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.1'),
 
-    // Exit model for current activity-flow strategy:
-    //   1) TAKE_PROFIT_PCT: fixed TP, sells immediately when reached.
-    //   2) TRAILING_*: arms after enough upside, then sells on drawdown from HWM.
-    //   3) EMERGENCY_STOP_LOSS_PCT and MAX_HOLD_MS remain as safety exits.
-    // 当前固定止盈：达到 TAKE_PROFIT_PCT 立即卖，不等双确认。
-    //   优先级高于移动止盈（_checkExit 里先检查 TP 再检查 trailing）。
-    //   tpConfirmCount/tpConfirmMinGapMs 保留字段但已不在固定止盈路径使用。
-    takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '100'),
+    // RSI strategy exit model: live 15s RSI, +30%/8% trailing, and 300s timeout.
+    // Fixed TP remains configurable but is disabled by default.
+    takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '0'),
     tpConfirmCount: parseInt(process.env.TP_CONFIRM_COUNT || '2', 10),
     tpConfirmMinGapMs: parseInt(process.env.TP_CONFIRM_MIN_GAP_MS || '300', 10),
 
@@ -66,12 +61,15 @@ const config = {
     //   trailingDrawdownPct: armed 后，价格从 HWM 回撤此 % 立即 SELL
     //   trailingMinHwmAgeMs: HWM 必须稳定至少此毫秒数（防单 tick 污染）
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
-    trailingActivatePct: parseFloat(process.env.TRAILING_ACTIVATE_PCT || '20'),
-    trailingDrawdownPct: parseFloat(process.env.TRAILING_DRAWDOWN_PCT || '10'),
+    trailingActivatePct: parseFloat(process.env.TRAILING_ACTIVATE_PCT || '30'),
+    trailingDrawdownPct: parseFloat(process.env.TRAILING_DRAWDOWN_PCT || '8'),
     trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '2000', 10),
 
-    // RSI 超买退出：使用当前未收盘的 1 分钟 RSI，便于在 swap 到达时立即响应。
-    // 一旦同币任一仓位已经激活移动止盈，RSI 退出让位于移动止盈。
+    // 使用当前未收盘的 15 秒 RSI：>80 或从 >=70 跌到 <70 时立即退出。
+    rsi15sExitEnabled:
+      (process.env.RSI_15S_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
+    rsi15sOverboughtExit: parseFloat(process.env.RSI_15S_OVERBOUGHT_EXIT || '80'),
+    rsi15sCrossDownExit: parseFloat(process.env.RSI_15S_CROSS_DOWN_EXIT || '70'),
     rsi1mExitEnabled: false,
     rsi1mExitThreshold: parseFloat(process.env.RSI_1M_EXIT_THRESHOLD || '80'),
 
@@ -101,9 +99,8 @@ const config = {
       process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '0',
     ),
 
-    // 紧急止损（防止灾难性下跌）
-    // 设置为 0 可禁用紧急止损（恢复"硬扛"行为）
-    fixedStopLossPct: parseFloat(process.env.FIXED_STOP_LOSS_PCT || '-20'),
+    // Optional stop-loss paths; both are disabled by default for this policy.
+    fixedStopLossPct: parseFloat(process.env.FIXED_STOP_LOSS_PCT || '0'),
     emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '0'),
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
@@ -116,22 +113,18 @@ const config = {
     // 智能止损最小持仓时间(ms) — 避免刚买入就被止损
     smartStopGraceMs: parseInt(process.env.SMART_STOP_GRACE_MS || '300000', 10),  // 默认5min
 
-    // 持仓上限时间
-    //   v3.17:    30min (1800000ms)
-    //   v3.17.19: 30秒 (30000ms) — 反弹窗口通常 5-30 秒
-    //   v3.17.20: 设 0 禁用 TIMEOUT 卖出，持仓靠 TP/Trailing/Emergency 退出
-    //   v3.17.32: 恢复为 4h 强制退出(数据回测: 4h+ 只有 30% 胜率, 平均亏 -13%)
-    // Activity strategies hard timeout: close every remaining position after 180 seconds.
-    maxHoldMs: parseInt(process.env.MAX_HOLD_MS || '180000', 10),
+    // Hard timeout: close every remaining position after 300 seconds.
+    maxHoldMs: parseInt(process.env.MAX_HOLD_MS || '300000', 10),
 
-    // Activity strategies exit quiet positions before the hard 180s timeout.
-    noBounceExitEnabled: (process.env.NO_BOUNCE_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
+    // Legacy optional exits remain available but are disabled by default.
+    noBounceExitEnabled: (process.env.NO_BOUNCE_EXIT_ENABLED ?? 'false').toLowerCase() === 'true',
     noBounceExitMs: parseInt(process.env.NO_BOUNCE_EXIT_MS || '90000', 10),
     noBounceMaxPeakPnlPct: parseFloat(process.env.NO_BOUNCE_MAX_PEAK_PNL_PCT || '5'),
     noBounceFlowWindowMs: parseInt(process.env.NO_BOUNCE_FLOW_WINDOW_MS || '30000', 10),
     lowPeakTimeoutMs: parseInt(process.env.LOW_PEAK_TIMEOUT_MS || '0', 10),
     // Exit when two closed 15-second net-flow values turn positive to negative.
-    flowReversalExitEnabled: true,
+    flowReversalExitEnabled:
+      (process.env.FLOW_REVERSAL_EXIT_ENABLED ?? 'false').toLowerCase() === 'true',
     flowReversalExitMode: 'FLOW_TURN_15S',
     flowReversalExitRequireSellerBreadth:
       (process.env.FLOW_REVERSAL_EXIT_REQUIRE_SELLER_BREADTH ?? 'true').toLowerCase() === 'true',
@@ -230,7 +223,11 @@ const config = {
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL ?? process.env.ORDER_FLOW_REPLACE_DUMP_SIGNAL ?? 'true')
         .toLowerCase() === 'true',
-    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'TEN_MIN_PULLBACK').toUpperCase(),
+    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'RSI_CROSS_15S').toUpperCase(),
+    rsi15sPeriod: parseInt(process.env.RSI_15S_PERIOD || '7', 10),
+    rsi15sEntryThreshold: parseFloat(process.env.RSI_15S_ENTRY_THRESHOLD || '30'),
+    rsi15sVolumeWindowMs: parseInt(process.env.RSI_15S_VOLUME_WINDOW_MS || '60000', 10),
+    rsi15sMinVolume60sUsd: parseFloat(process.env.RSI_15S_MIN_VOLUME_60S_USD || '5000'),
     // Research entry: observe a complete first 10 minutes after Pump migration,
     // then wait at most five minutes for a >=10% pullback and >=5% recovery.
     // Set TEN_MIN_PULLBACK_SHADOW_ONLY=true to record signals without trading.
@@ -587,6 +584,30 @@ function validateConfig() {
   if (!config.birdeye.apiKey) errors.push('BIRDEYE_API_KEY missing');
   if (!config.DRY_RUN && !config.wallet.privateKeyBs58) {
     errors.push('WALLET_PRIVATE_KEY_BS58 required for LIVE mode');
+  }
+  if (
+    config.strategy.rsi15sCrossDownExit <= 0 ||
+    config.strategy.rsi15sOverboughtExit <= config.strategy.rsi15sCrossDownExit ||
+    config.strategy.rsi15sOverboughtExit >= 100
+  ) {
+    errors.push('RSI_15S exit thresholds must satisfy 0 < cross-down < overbought < 100');
+  }
+  if (config.activityFlow.entryMode === 'RSI_CROSS_15S') {
+    if (config.activityFlow.rsi15sPeriod < 1) {
+      errors.push('RSI_15S_PERIOD must be >= 1');
+    }
+    if (
+      config.activityFlow.rsi15sEntryThreshold <= 0 ||
+      config.activityFlow.rsi15sEntryThreshold >= 100
+    ) {
+      errors.push('RSI_15S_ENTRY_THRESHOLD must be between 0 and 100');
+    }
+    if (config.activityFlow.rsi15sVolumeWindowMs <= 0) {
+      errors.push('RSI_15S_VOLUME_WINDOW_MS must be > 0');
+    }
+    if (config.activityFlow.rsi15sMinVolume60sUsd <= 0) {
+      errors.push('RSI_15S_MIN_VOLUME_60S_USD must be > 0');
+    }
   }
   if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
     if (config.activityFlow.pullbackReferenceAgeMs <= 0) {

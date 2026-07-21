@@ -231,7 +231,10 @@ function runExitTests() {
     pos.exiting = true;
     this._exitCalls.push({ pos, price, reason });
   };
+  const noBounceDefault = config.strategy.noBounceExitEnabled;
+  config.strategy.noBounceExitEnabled = true;
   manager._tick();
+  config.strategy.noBounceExitEnabled = noBounceDefault;
   assert.strictEqual(manager._exitCalls.length, 1);
   assert.strictEqual(manager._exitCalls[0].reason, 'NO_BOUNCE_EXIT');
 
@@ -242,7 +245,7 @@ function runExitTests() {
     symbol: 'TEST',
     entryPrice: 1,
     highWaterMark: 1.10,
-    openedAt: now - 181_000,
+    openedAt: now - 301_000,
     reconciled: true,
     dryRun: false,
     exiting: false,
@@ -255,7 +258,7 @@ function runExitTests() {
   timeout._exitForCondition = manager._exitForCondition;
   timeout._tick();
   assert.strictEqual(timeout._exitCalls.length, 1);
-  assert.strictEqual(timeout._exitCalls[0].reason, 'TIMEOUT_3M');
+  assert.strictEqual(timeout._exitCalls[0].reason, 'TIMEOUT_5M');
 }
 
 function runSlippageTests() {
@@ -270,9 +273,9 @@ function runSlippageTests() {
   assert.strictEqual(config.strategy.buySlippageBps, 500);
   assert.strictEqual(config.strategy.buyMaxEstimatedSlippagePct, 5);
   assert.strictEqual(config.strategy.noBounceExitMs, 90_000);
-  assert.strictEqual(config.strategy.maxHoldMs, 180_000);
+  assert.strictEqual(config.strategy.maxHoldMs, 300_000);
   assert.strictEqual(config.activityFlow.minPoolQuoteSol, undefined);
-  assert.strictEqual(config.activityFlow.entryMode, 'TEN_MIN_PULLBACK');
+  assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_15S');
   assert.strictEqual(config.activityFlow.pullbackShadowOnly, false);
   assert.strictEqual(config.activityFlow.pullbackMinVolumeUsd, 20_000);
   assert.strictEqual(config.activityFlow.pullbackMaxVolumeUsd, 50_000);

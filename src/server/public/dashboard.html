@@ -171,7 +171,8 @@
   .pill.live { background: rgba(38, 166, 154, 0.2); color: var(--green); }
   .pill.success { background: rgba(38, 166, 154, 0.2); color: var(--green); }
   .pill.fail { background: rgba(239, 83, 80, 0.2); color: var(--red); }
-  .pill.monitoring { background: rgba(139, 148, 170, 0.14); color: var(--text-dim); }
+  .pill.monitoring, .pill.warming { background: rgba(139, 148, 170, 0.14); color: var(--text-dim); }
+  .pill.volume-blocked { background: rgba(239, 83, 80, 0.14); color: #ff8a87; }
   .pill.ready, .pill.armed, .pill.waiting { background: rgba(245, 176, 65, 0.2); color: var(--yellow); }
   .pill.confirming { background: rgba(41, 182, 246, 0.2); color: var(--accent); }
   .pill.signaled { background: rgba(38, 166, 154, 0.24); color: var(--green); }
@@ -287,7 +288,7 @@
       <div class="status-grid">
         <div class="status-item"><div class="label">监控代币</div><div class="value" id="stat-watched">-</div></div>
         <div class="status-item"><div class="label">当前持仓</div><div class="value" id="stat-open">-</div></div>
-        <div class="status-item"><div class="label">10m 成交量区间</div><div class="value" id="stat-volume1m">-</div></div>
+        <div class="status-item"><div class="label">60s 成交量门槛</div><div class="value" id="stat-volume1m">-</div></div>
         <div class="status-item"><div class="label">入场模式</div><div class="value" id="stat-trades1m">-</div></div>
         <div class="status-item"><div class="label">每笔仓位</div><div class="value" id="stat-size">-</div></div>
         <div class="status-item"><div class="label">止盈</div><div class="value" id="stat-tp">-</div></div>
@@ -340,7 +341,7 @@
     <div class="panel-head"><h2>📜 实时日志</h2></div>
     <div class="tabs">
       <div class="tab active" data-tab="positions">持仓 / 平仓</div>
-      <div class="tab" data-tab="signals">V5 信号</div>
+      <div class="tab" data-tab="signals">RSI 信号</div>
       <div class="tab" data-tab="trades">交易</div>
     </div>
     <div class="panel-body">
@@ -388,7 +389,7 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>AGE</th><th>10m 成交量</th><th>参考价</th><th>当前/参考</th><th>回踩</th><th>反弹</th><th>15s 买量</th><th>15s 卖量</th><th>15s 买家</th><th>预估滑点</th><th>首笔延迟</th><th>等待原因</th><th>阶段</th></tr></thead>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一 RSI</th><th>收盘 RSI</th><th>实时 RSI</th><th>K线数</th><th>60s 成交量</th><th>信号 K</th><th>入场 K</th><th>状态说明</th><th>阶段</th></tr></thead>
             <tbody id="signalsTbody"><tr><td colspan="16" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
@@ -486,14 +487,18 @@ async function refreshStatus() {
   $('modeBadge').className = 'badge ' + (r.dryRun ? 'dry' : 'live');
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
-  $('stat-volume1m').textContent = r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
-    ? `${fmtMoney(r.config.pullbackVolume10mMinUsd)} - ${fmtMoney(r.config.pullbackVolume10mMaxUsd)}`
-    : fmtMoney(r.config.activityVolume1mUsd);
-  $('stat-trades1m').textContent = r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
-    ? (r.config.pullbackShadowOnly ? '10m回踩·影子' : '10m回踩·实盘')
-    : r.config.activityTrades1m;
+  $('stat-volume1m').textContent = r.config.activityEntryMode === 'RSI_CROSS_15S'
+    ? `>= ${fmtMoney(r.config.rsi15sMinVolume60sUsd)}`
+    : r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
+      ? `${fmtMoney(r.config.pullbackVolume10mMinUsd)} - ${fmtMoney(r.config.pullbackVolume10mMaxUsd)}`
+      : fmtMoney(r.config.activityVolume1mUsd);
+  $('stat-trades1m').textContent = r.config.activityEntryMode === 'RSI_CROSS_15S'
+    ? `RSI(${r.config.rsi15sPeriod}) ↑ ${r.config.rsi15sEntryThreshold}`
+    : r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
+      ? (r.config.pullbackShadowOnly ? '10m回踩·影子' : '10m回踩·实盘')
+      : r.config.activityTrades1m;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
-  $('stat-tp').textContent = '+' + r.config.takeProfitPct + '%';
+  $('stat-tp').textContent = r.config.takeProfitPct > 0 ? '+' + r.config.takeProfitPct + '%' : '关闭';
   $('stat-hold').textContent = r.config.maxHoldMs / 1000 + 's';
   $('statusMeta').textContent = new Date().toLocaleTimeString();
 }
@@ -724,6 +729,8 @@ function _strategyNumber(value, digits = 2) {
 function _strategyStage(candidate, now) {
   const labels = {
     monitoring: '扫描',
+    warming: 'RSI预热',
+    'volume-blocked': '成交量不足',
     collecting: '累计10m',
     cancelled: '已取消',
     ready: '待激活',
@@ -756,6 +763,35 @@ async function refreshSignals() {
   const summary = r.summary || {};
   const thresholds = r.thresholds || {};
   const rows = r.candidates || [];
+  if (r.mode === 'RSI_CROSS_15S') {
+    meta.innerHTML = [
+      `<span>模式 <b>15s RSI(${thresholds.rsiPeriod || 7}) 上穿 ${thresholds.entryCross || 30}</b></span>`,
+      `<span>活跃 <b>${summary.active || 0}</b></span>`,
+      `<span>预热 <b>${summary.warming || 0}</b></span>`,
+      `<span>量不足 <b>${summary.volumeBlocked || 0}</b></span>`,
+      `<span>实盘信号 <b>${summary.signaled || 0}</b></span>`,
+    ].join('');
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="12" class="empty">暂无活跃成交</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(candidate => `
+      <tr>
+        <td class="mono">${fmtTime(candidate.updatedAt)}</td>
+        <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
+        ${caCell(candidate.mint)}
+        <td>${_strategyNumber(candidate.rsiPrevious)}</td>
+        <td>${_strategyNumber(candidate.rsiCurrent)}</td>
+        <td>${_strategyNumber(candidate.rsiLive)}</td>
+        <td>${candidate.closedBars || 0}</td>
+        <td>${fmtMoney(candidate.volume60sUsd)} / ${fmtMoney(thresholds.minVolume60sUsd)}</td>
+        <td class="mono">${candidate.signalCandleTs ? fmtTime(candidate.signalCandleTs) : '-'}</td>
+        <td class="mono">${candidate.entryCandleTs ? fmtTime(candidate.entryCandleTs) : '-'}</td>
+        <td style="max-width:260px">${escapeHtml(candidate.waitReason || '-')}</td>
+        <td>${_strategyStage(candidate, r.now || Date.now())}</td>
+      </tr>`).join('');
+    return;
+  }
   if (r.mode === 'TEN_MIN_PULLBACK') {
     meta.innerHTML = [
       `<span>模式 <b>10m回踩恢复${r.shadowOnly ? '·影子' : '·实盘'}</b></span>`,

@@ -19,6 +19,7 @@
     "verify:strategy-lab": "node scripts/verify-strategy-lab-quality.js",
     "backfill:strategy-labels": "node scripts/backfill-strategy-labels.js",
     "test:rsi": "node scripts/test-rsi-calculator.js",
+    "test:rsi-15s-strategy": "node scripts/test-rsi-15s-strategy.js",
     "test:exit-policy": "node scripts/test-position-exit-policy.js",
     "test:flow-candles": "node scripts/test-flow-candle-strategy.js",
     "test:strategy-v5": "node scripts/test-strategy-v5.js",

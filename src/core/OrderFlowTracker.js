@@ -61,11 +61,21 @@ class OrderFlowTracker extends EventEmitter {
       boolEnv('ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL', boolEnv('ORDER_FLOW_REPLACE_DUMP_SIGNAL', true));
 
     const requestedEntryMode = String(
-      (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'TEN_MIN_PULLBACK') ||
-        'TEN_MIN_PULLBACK',
+      (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'RSI_CROSS_15S') ||
+        'RSI_CROSS_15S',
     ).toUpperCase();
     // Existing production .env files still name V5. Remap them so deployment cannot silently keep old entry rules.
     this.entryMode = requestedEntryMode === 'ACTIVITY_BURST_V5' ? 'BREADTH_BURST_V6' : requestedEntryMode;
+    this.rsi15sPeriod =
+      opts.rsi15sPeriod ?? flowConfig.rsi15sPeriod ?? numEnv('RSI_15S_PERIOD', 7);
+    this.rsi15sEntryThreshold =
+      opts.rsi15sEntryThreshold ?? flowConfig.rsi15sEntryThreshold ?? numEnv('RSI_15S_ENTRY_THRESHOLD', 30);
+    this.rsi15sVolumeWindowMs =
+      opts.rsi15sVolumeWindowMs ?? flowConfig.rsi15sVolumeWindowMs ?? numEnv('RSI_15S_VOLUME_WINDOW_MS', 60_000);
+    this.rsi15sMinVolume60sUsd =
+      opts.rsi15sMinVolume60sUsd ??
+      flowConfig.rsi15sMinVolume60sUsd ??
+      numEnv('RSI_15S_MIN_VOLUME_60S_USD', 5_000);
     this.pullbackShadowOnly =
       opts.pullbackShadowOnly ?? flowConfig.pullbackShadowOnly ?? boolEnv('TEN_MIN_PULLBACK_SHADOW_ONLY', false);
     this.pullbackReferenceAgeMs =
@@ -345,7 +355,12 @@ class OrderFlowTracker extends EventEmitter {
   }
 
   handleVolumeSwap(swap) {
-    if (!this.enabled || this.entryMode !== 'TEN_MIN_PULLBACK' || !swap || !swap.mint) return;
+    if (
+      !this.enabled ||
+      (this.entryMode !== 'TEN_MIN_PULLBACK' && this.entryMode !== 'RSI_CROSS_15S') ||
+      !swap ||
+      !swap.mint
+    ) return;
     const side = String(swap.side || '').toUpperCase();
     const solVolume = Number(swap.solVolume);
     if ((side !== 'BUY' && side !== 'SELL') || !Number.isFinite(solVolume) || solVolume <= 0) return;
@@ -361,7 +376,16 @@ class OrderFlowTracker extends EventEmitter {
     const state = this._stateOf(ev.mint);
     if (state.firstSeenTs == null) state.firstSeenTs = ev.ts;
     state.symbol = ev.symbol || state.symbol;
-    this._recordTenMinutePullbackObservation(state, ev);
+    if (this.entryMode === 'TEN_MIN_PULLBACK') {
+      this._recordTenMinutePullbackObservation(state, ev);
+    } else {
+      this._recordRsi15sVolume(state, ev);
+    }
+  }
+
+  updateRsiSnapshot(mint, snapshot) {
+    if (!this.enabled || this.entryMode !== 'RSI_CROSS_15S' || !mint || !snapshot) return;
+    this._stateOf(mint).rsi15sSnapshot = snapshot;
   }
 
   handleSwap(swap) {
@@ -408,6 +432,8 @@ class OrderFlowTracker extends EventEmitter {
     if (state.firstSeenTs == null) state.firstSeenTs = ev.ts;
     if (this.entryMode === 'TEN_MIN_PULLBACK') {
       this._recordTenMinutePullbackObservation(state, ev);
+    } else if (this.entryMode === 'RSI_CROSS_15S') {
+      this._recordRsi15sVolume(state, ev);
     }
     state.events.push(ev);
     state.symbol = ev.symbol || state.symbol;
@@ -424,6 +450,7 @@ class OrderFlowTracker extends EventEmitter {
       this.entryMode === 'ACTIVITY_BURST_V5' ||
       this.entryMode === 'BREADTH_BURST_V6' ||
       this.entryMode === 'TEN_MIN_PULLBACK' ||
+      this.entryMode === 'RSI_CROSS_15S' ||
       ev.side === 'BUY'
     ) {
       this._trySignal(state, ev);
@@ -437,6 +464,9 @@ class OrderFlowTracker extends EventEmitter {
   }
 
   getStrategyCandidates(limit = 100, now = Date.now()) {
+    if (this.entryMode === 'RSI_CROSS_15S') {
+      return this._getRsi15sCandidates(limit, now);
+    }
     if (this.entryMode === 'TEN_MIN_PULLBACK') {
       return this._getTenMinutePullbackCandidates(limit, now);
     }
@@ -717,6 +747,72 @@ class OrderFlowTracker extends EventEmitter {
     };
   }
 
+  _getRsi15sCandidates(limit = 100, now = Date.now()) {
+    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
+    const candidates = [];
+    const summary = { active: 0, warming: 0, monitoring: 0, volumeBlocked: 0, signaled: 0 };
+
+    for (const [mint, state] of this.states) {
+      const snapshot = state.rsi15sSnapshot || {};
+      const latest = state.events[state.events.length - 1];
+      const updatedAt = latest?.ts || snapshot.rsi15sCurrentBucketTs || 0;
+      if (!updatedAt) continue;
+      const volumeEnd = Number(snapshot.rsi15sCurrentBucketTs) || now;
+      const volumeStart = volumeEnd - this.rsi15sVolumeWindowMs;
+      const liveVolume60sUsd = state.rsiVolumeEvents.reduce((total, row) => {
+        if (row.ts < volumeStart || row.ts >= volumeEnd) return total;
+        return total + row.solVolume * this.solPriceUsd;
+      }, 0);
+
+      let stage = state.rsi15sStage || 'warming';
+      if (
+        stage === 'signaled' &&
+        state.rsi15sSignalTs != null &&
+        now - state.rsi15sSignalTs > this.rsi15sVolumeWindowMs
+      ) {
+        stage = 'monitoring';
+      }
+      summary.active++;
+      if (stage === 'volume-blocked') summary.volumeBlocked++;
+      else if (Object.prototype.hasOwnProperty.call(summary, stage)) summary[stage]++;
+
+      candidates.push({
+        mint,
+        symbol: state.symbol || null,
+        updatedAt,
+        ageMs: Math.max(0, now - updatedAt),
+        stage,
+        rsiPrevious: state.rsi15sPreviousClosed ?? snapshot.rsi15sPreviousClosed ?? null,
+        rsiCurrent: state.rsi15sClosed ?? snapshot.rsi15sClosed ?? null,
+        rsiLive: snapshot.rsi15sLive ?? null,
+        closedBars: snapshot.rsi15sClosedBars || 0,
+        volume60sUsd: round(liveVolume60sUsd, 2),
+        signalCandleTs: state.rsi15sSignalCandleTs || null,
+        entryCandleTs: state.rsi15sEntryCandleTs || null,
+        waitReason: state.rsi15sWaitReason || null,
+      });
+    }
+
+    const rank = { signaled: 4, 'volume-blocked': 3, monitoring: 2, warming: 1 };
+    candidates.sort((a, b) =>
+      ((rank[b.stage] || 0) - (rank[a.stage] || 0)) ||
+      (b.volume60sUsd - a.volume60sUsd) ||
+      (b.updatedAt - a.updatedAt));
+
+    return {
+      mode: this.entryMode,
+      now,
+      thresholds: {
+        rsiPeriod: this.rsi15sPeriod,
+        entryCross: this.rsi15sEntryThreshold,
+        volumeWindowMs: this.rsi15sVolumeWindowMs,
+        minVolume60sUsd: this.rsi15sMinVolume60sUsd,
+      },
+      summary,
+      candidates: candidates.slice(0, safeLimit),
+    };
+  }
+
   _stateOf(mint) {
     let state = this.states.get(mint);
     if (!state) {
@@ -756,6 +852,19 @@ class OrderFlowTracker extends EventEmitter {
         pullbackLastMetrics: null,
         pullbackLastWaitReason: null,
         pullbackSignalTs: null,
+        rsiVolumeEvents: [],
+        rsiVolumeBuckets: new Map(),
+        rsi15sSnapshot: null,
+        rsi15sLastEvaluatedOpenBucketTs: null,
+        rsi15sLastSignalCandleTs: null,
+        rsi15sStage: 'warming',
+        rsi15sPreviousClosed: null,
+        rsi15sClosed: null,
+        rsi15sVolume60sUsd: 0,
+        rsi15sSignalCandleTs: null,
+        rsi15sEntryCandleTs: null,
+        rsi15sSignalTs: null,
+        rsi15sWaitReason: null,
       };
       this.states.set(mint, state);
     }
@@ -767,6 +876,10 @@ class OrderFlowTracker extends EventEmitter {
     while (state.events.length > 0 && state.events[0].ts < cutoff) state.events.shift();
     if (state.events.length > this.maxEventsPerMint) {
       state.events.splice(0, state.events.length - this.maxEventsPerMint);
+    }
+    const rsiVolumeCutoff = now - this.rsi15sVolumeWindowMs - 1_000;
+    while (state.rsiVolumeEvents.length > 0 && state.rsiVolumeEvents[0].ts < rsiVolumeCutoff) {
+      state.rsiVolumeEvents.shift();
     }
     if (now - state.lastWalletPruneTs >= 60_000) {
       const walletCutoff = now - 24 * 60 * 60 * 1000;
@@ -1099,6 +1212,140 @@ class OrderFlowTracker extends EventEmitter {
     };
   }
 
+  _recordRsi15sVolume(state, ev) {
+    const ts = Number(ev.ts);
+    const solVolume = Number(ev.solVolume);
+    if (!Number.isFinite(ts) || !Number.isFinite(solVolume) || solVolume <= 0) return;
+    state.rsiVolumeEvents.push({ ts, solVolume });
+    const bucketTs = Math.floor(ts / 15_000) * 15_000;
+    state.rsiVolumeBuckets.set(bucketTs, (state.rsiVolumeBuckets.get(bucketTs) || 0) + solVolume);
+    if (state.rsiVolumeBuckets.size > 200) {
+      const oldestBuckets = [...state.rsiVolumeBuckets.keys()].sort((a, b) => a - b);
+      for (let index = 0; index < oldestBuckets.length - 200; index++) {
+        state.rsiVolumeBuckets.delete(oldestBuckets[index]);
+      }
+    }
+    const cutoff = ts - this.rsi15sVolumeWindowMs - 1_000;
+    while (state.rsiVolumeEvents.length > 0 && state.rsiVolumeEvents[0].ts < cutoff) {
+      state.rsiVolumeEvents.shift();
+    }
+  }
+
+  _tryRsiCross15s(state, ev) {
+    const snapshot = state.rsi15sSnapshot;
+    if (!snapshot) return;
+
+    const entryBucketTs = snapshot.rsi15sCurrentBucketTs == null
+      ? NaN
+      : Number(snapshot.rsi15sCurrentBucketTs);
+    const signalBucketTs = snapshot.rsi15sClosedBucketTs == null
+      ? NaN
+      : Number(snapshot.rsi15sClosedBucketTs);
+    const eventBucketTs = Math.floor(ev.ts / 15_000) * 15_000;
+    if (
+      !Number.isFinite(entryBucketTs) ||
+      !Number.isFinite(signalBucketTs) ||
+      entryBucketTs !== eventBucketTs ||
+      state.rsi15sLastEvaluatedOpenBucketTs === entryBucketTs
+    ) return;
+
+    // Only the first trusted trade in this bucket is its executable open.
+    state.rsi15sLastEvaluatedOpenBucketTs = entryBucketTs;
+    const previousRsi = snapshot.rsi15sPreviousClosed == null
+      ? NaN
+      : Number(snapshot.rsi15sPreviousClosed);
+    const currentRsi = snapshot.rsi15sClosed == null
+      ? NaN
+      : Number(snapshot.rsi15sClosed);
+    state.rsi15sPreviousClosed = Number.isFinite(previousRsi) ? previousRsi : null;
+    state.rsi15sClosed = Number.isFinite(currentRsi) ? currentRsi : null;
+
+    if (!Number.isFinite(previousRsi) || !Number.isFinite(currentRsi)) {
+      state.rsi15sStage = 'warming';
+      state.rsi15sWaitReason = `need ${this.rsi15sPeriod + 2} tradable 15s candles`;
+      return;
+    }
+
+    const crossedUp = previousRsi <= this.rsi15sEntryThreshold && currentRsi > this.rsi15sEntryThreshold;
+    if (!crossedUp) {
+      state.rsi15sStage = 'monitoring';
+      state.rsi15sWaitReason =
+        `RSI ${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} did not cross ${this.rsi15sEntryThreshold}`;
+      return;
+    }
+    if (state.rsi15sLastSignalCandleTs === signalBucketTs) return;
+
+    const signalCloseTs = signalBucketTs + 15_000;
+    const volumeStart = signalCloseTs - this.rsi15sVolumeWindowMs;
+    const volume60sSol = [...state.rsiVolumeBuckets].reduce((total, [bucketTs, bucketVolume]) => {
+      if (bucketTs < volumeStart || bucketTs >= signalCloseTs) return total;
+      return total + bucketVolume;
+    }, 0);
+    const volume60sUsd = volume60sSol * this.solPriceUsd;
+    state.rsi15sVolume60sUsd = volume60sUsd;
+    state.rsi15sSignalCandleTs = signalBucketTs;
+    state.rsi15sEntryCandleTs = entryBucketTs;
+
+    if (volume60sUsd < this.rsi15sMinVolume60sUsd) {
+      state.rsi15sStage = 'volume-blocked';
+      state.rsi15sWaitReason =
+        `60s volume $${volume60sUsd.toFixed(0)}<${this.rsi15sMinVolume60sUsd}`;
+      return;
+    }
+
+    const s60 = this._stats(state, entryBucketTs - 1, this.rsi15sVolumeWindowMs);
+    const entry = {
+      period: this.rsi15sPeriod,
+      previousRsi: round(previousRsi, 4),
+      currentRsi: round(currentRsi, 4),
+      threshold: this.rsi15sEntryThreshold,
+      volume60sSol: round(volume60sSol, 4),
+      volume60sUsd: round(volume60sUsd, 2),
+      signalCandleTs: signalBucketTs,
+      signalCloseTs,
+      entryCandleTs: entryBucketTs,
+      entryOpenPrice: ev.price,
+    };
+    const signal = {
+      mint: ev.mint,
+      symbol: state.symbol || ev.symbol,
+      sellSol: round(s60.sellSol, 4),
+      priceImpactPct: 0,
+      poolQuoteAfter: ev.poolQuoteAfter || state.lastPoolQuoteAfter || null,
+      poolQuoteSol: ev.poolQuoteAfter || state.lastPoolQuoteAfter || null,
+      seller: null,
+      signature: `rsi15s:${ev.mint}:${signalBucketTs}`,
+      ts: ev.ts,
+      slot: ev.slot || 0,
+      poolAddress: ev.poolAddress || state.poolAddress,
+      priceAfter: ev.price,
+      priceBefore: snapshot.rsi15sLastClosedClose || ev.price,
+      _aggregated: true,
+      _activityFlow: true,
+      _sellCount: s60.sellCount,
+      _sellCount10s: s60.sellCount,
+      _totalSellSol10s: round(s60.sellSol, 4),
+      _sellers: [],
+      _flow: {
+        s60: this._compactStats(s60),
+        entryRsi15s: entry,
+      },
+      _flowPattern: entry,
+    };
+
+    state.rsi15sLastSignalCandleTs = signalBucketTs;
+    state.rsi15sSignalTs = ev.ts;
+    state.rsi15sStage = 'signaled';
+    state.rsi15sWaitReason = null;
+    this.cooldowns.set(ev.mint, Date.now() + this.cooldownMs);
+    console.log(
+      `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_15S ` +
+        `RSI(${this.rsi15sPeriod})=${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} ` +
+        `vol60=$${volume60sUsd.toFixed(0)} entryOpen=${ev.price}`,
+    );
+    this.emit('flowReversalSignal', signal);
+  }
+
   _trySignal(state, ev) {
     const wallNow = Date.now();
     if (this.maxSignalAgeMs > 0 && wallNow - ev.ts > this.maxSignalAgeMs) {
@@ -1108,6 +1355,11 @@ class OrderFlowTracker extends EventEmitter {
 
     const cooldownUntil = this.cooldowns.get(ev.mint) || 0;
     if (cooldownUntil > wallNow) return;
+
+    if (this.entryMode === 'RSI_CROSS_15S') {
+      this._tryRsiCross15s(state, ev);
+      return;
+    }
 
     if (this.entryMode === 'TEN_MIN_PULLBACK') {
       this._tryTenMinutePullback(state, ev);

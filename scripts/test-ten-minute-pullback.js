@@ -185,17 +185,17 @@ function runLiveOverrideAndDefaultsTests() {
   assert.strictEqual(estimateBuySlippageFromQuoteReservePct(100, 1), 1);
   assert.strictEqual(estimateBuySlippageFromQuoteReservePct(10, 1), 10);
   assert.strictEqual(estimateBuySlippageFromQuoteReservePct(null, 1), null);
-  assert.strictEqual(config.activityFlow.entryMode, 'TEN_MIN_PULLBACK');
+  assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_15S');
   assert.strictEqual(config.activityFlow.pullbackShadowOnly, false);
   assert.strictEqual(config.activityFlow.pullbackMinVolumeUsd, 20_000);
   assert.strictEqual(config.activityFlow.pullbackMaxVolumeUsd, 50_000);
-  assert.strictEqual(config.strategy.fixedStopLossPct, -20);
-  assert.strictEqual(config.strategy.trailingActivatePct, 20);
-  assert.strictEqual(config.strategy.trailingDrawdownPct, 10);
-  assert.strictEqual(config.strategy.takeProfitPct, 100);
-  assert.strictEqual(config.strategy.maxHoldMs, 180_000);
-  assert.strictEqual(config.strategy.noBounceExitEnabled, true);
-  assert.strictEqual(config.strategy.flowReversalExitEnabled, true);
+  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
+  assert.strictEqual(config.strategy.trailingActivatePct, 30);
+  assert.strictEqual(config.strategy.trailingDrawdownPct, 8);
+  assert.strictEqual(config.strategy.takeProfitPct, 0);
+  assert.strictEqual(config.strategy.maxHoldMs, 300_000);
+  assert.strictEqual(config.strategy.noBounceExitEnabled, false);
+  assert.strictEqual(config.strategy.flowReversalExitEnabled, false);
   assert.strictEqual(config.strategy.buyMaxEstimatedSlippagePct, 5);
 }
 

@@ -56,6 +56,7 @@ class PositionManager extends EventEmitter {
     this._tickCount = 0;  // v3.26: tick counter for PoolStateCache price check
     this._flowExitEvents = new Map(); // mint -> recent BUY/SELL swaps while holding
     this._rsiExitSkipLogAt = new Map(); // mint -> { ts, reason }; throttle diagnostic logs
+    this._rsi15sLastByMint = new Map(); // mint -> latest live RSI(7,15s)
 
     this.positions = new Map(); // positionId → position obj
     this.byMint = new Map();    // mint → Set<positionId> (v3.17.13: 同币多仓)
@@ -250,6 +251,7 @@ class PositionManager extends EventEmitter {
       this.byMint.delete(mint);
       this._flowExitEvents.delete(mint);
       this._rsiExitSkipLogAt.delete(mint);
+      this._rsi15sLastByMint.delete(mint);
     }
   }
 
@@ -313,7 +315,41 @@ class PositionManager extends EventEmitter {
   }
 
   handleRsiForExit(mint, price, snapshot) {
-    return false;
+    const liveRsi = snapshot?.rsi15sLive == null ? NaN : Number(snapshot.rsi15sLive);
+    if (!Number.isFinite(liveRsi)) return false;
+
+    const previousRsi = this._rsi15sLastByMint.get(mint);
+    this._rsi15sLastByMint.set(mint, liveRsi);
+    if (!config.strategy.rsi15sExitEnabled) return false;
+
+    const pids = this.byMint.get(mint);
+    if (!pids || pids.size === 0) return false;
+    const active = [...pids]
+      .map((pid) => this.positions.get(pid))
+      .filter((pos) => pos && !pos.exiting && pos.status !== 'stuck');
+    if (active.length === 0) return false;
+
+    let reason = null;
+    if (liveRsi > config.strategy.rsi15sOverboughtExit) {
+      reason = 'RSI_15S_OVERBOUGHT';
+    } else if (
+      Number.isFinite(previousRsi) &&
+      previousRsi >= config.strategy.rsi15sCrossDownExit &&
+      liveRsi < config.strategy.rsi15sCrossDownExit
+    ) {
+      reason = 'RSI_15S_CROSS_DOWN';
+    }
+    if (!reason) return false;
+
+    const symbol = active[0].symbol || mint.slice(0, 6);
+    console.log(
+      `[PositionManager] ${reason} ${symbol} ` +
+        `RSI15=${Number.isFinite(previousRsi) ? previousRsi.toFixed(2) : 'n/a'}->${liveRsi.toFixed(2)} ` +
+        `price=${price}`,
+    );
+    monitor.inc(`PositionManager.${reason}`, 1, 'PositionManager');
+    this._exitAllByMint(mint, price, reason);
+    return true;
   }
 
   openPositionCount() {

@@ -22,38 +22,33 @@ used to backfill its migration AGE even when that pair does not yet expose compl
 FDV/LP data. Legacy `WATCHDOG_CHECK_INTERVAL_MS` values above one minute are clamped
 to `60000`.
 
-Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **迁移后 10 分钟中等放量，回踩恢复后实盘买入**。
+Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **15 秒 RSI(7) 上穿 30，并在下一根可成交 K 线开盘买入**。
 
 ## 当前买入策略
 
-程序以确认的 Pump 迁移时间计算 AGE，并按以下顺序判断：
+程序用真实成交的收盘价计算 15 秒 RSI，并按以下顺序判断：
 
-- 只处理迁移后 `60 秒` 内已经开始记录真实成交的新币；迁移时间未知或启动记录太晚的币不参与。
-- 累计迁移后前 `10 分钟`真实买卖成交量，按 `SOL_PRICE_USD` 换算为美元；只保留 `$20,000～$50,000`。
-- 第 10 分钟不直接买，最多继续等待 `5 分钟`。
-- 相对 10 分钟参考价必须先回踩 `>=10%`，再从回踩低点反弹 `>=5%`。
-- 当前价仍不得高于 10 分钟参考价。
-- 最近 `15 秒`买入量必须大于卖出量，且独立买家 `>=2`。
-- 按当前仓位和池子报价储备估算的买入滑点必须 `<=5%`；实盘提交前 Executor 还会使用 SDK 报价做第二次精确滑点校验。
-- 默认 `TEN_MIN_PULLBACK_SHADOW_ONLY=false`，合格信号直接进入实盘下单链路。改为 `true` 可只记录不交易。
+- RSI 周期为 `7`，只用已经收盘的可成交 15 秒 K 线确认信号。
+- 上一根已收盘 RSI `<=30`、最新已收盘 RSI `>30`，构成从下向上突破 30。
+- 信号确认时，之前 `60 秒`真实买卖总成交量必须 `>= $5,000`；美元金额按 `SOL_PRICE_USD` 换算。
+- 不在信号 K 线收盘价追单。等下一根有可信成交的 15 秒 K 线出现，以其第一笔成交作为可执行开盘并进入现有实盘下单链路。
+- 无成交的时间桶不会伪造开盘；下一根实际有成交的 K 线才是“下一根可成交 K 线”。
 
 默认入口日志应显示：
 
 ```text
-Entry: ACTIVITY_FLOW (TEN_MIN_PULLBACK: first 10m $20000-$50000, pullback>=10%, rebound>=5%, 15s buyers>=2, slippage<=5%, LIVE)
+Entry: RSI(7,15s) cross above 30, trailing 60s volume >= $5000, buy next tradable candle open
 Legacy dumpSignal: suppressed
-[main] ActivityFlow enabled: mode=TEN_MIN_PULLBACK ... shadow=false ...
+[main] ActivityFlow enabled: mode=RSI_CROSS_15S ... next-tradable-open ...
 ```
 
 ## 当前卖出策略
 
-- 资金流退出：连续 `2` 个完整 15 秒窗口的净资金流从正数变为负数时卖出，价格涨跌不参与判断。
-- 为避免使用入场前数据，卖出判断只使用买入后完整形成的 15 秒资金流窗口。
-- 移动止盈：上涨 `20%` 激活，从最高点回撤 `10%` 卖出。
-- 固定止盈：上涨 `100%` 立即卖出。
-- 固定止损：下跌 `20%` 立即卖出。
-- RSI 买卖过滤和 RSI 退出均关闭。
-- 最长持仓：`180 秒`，到时强制退出。
+- 实时 15 秒 RSI(7) `>80` 时立即卖出。
+- 实时 15 秒 RSI(7) 从 `>=70` 下穿到 `<70` 时立即卖出。
+- 移动止盈：上涨 `30%` 激活，从最高点回撤 `8%` 卖出。
+- 最长持仓：`300 秒`，到时强制退出。
+- 固定止盈、固定止损、无反弹退出和资金流反转退出默认关闭，避免加入未列出的卖出条件。
 - 加仓：关闭。
 - 卖出冷静期：实际平仓完成后，同币 `5 分钟` 内禁止再次买入；多仓分批卖出时从最后一笔完成卖出重新计时。
 
@@ -111,26 +106,26 @@ npm run backtest:flow-candles
 ```env
 ACTIVITY_FLOW_ENABLED=true
 ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL=true
-ACTIVITY_FLOW_ENTRY_MODE=FLOW_ACCEL_15S
-ACTIVITY_FLOW_1M_MIN_VOLUME_USD=3000
-ACTIVITY_FLOW_1M_MIN_VOLUME_SOL=
-ACTIVITY_FLOW_1M_MIN_TRADES=25
+ACTIVITY_FLOW_ENTRY_MODE=RSI_CROSS_15S
+RSI_15S_PERIOD=7
+RSI_15S_ENTRY_THRESHOLD=30
+RSI_15S_VOLUME_WINDOW_MS=60000
+RSI_15S_MIN_VOLUME_60S_USD=5000
 ACTIVITY_FLOW_COOLDOWN_MS=0
-ACTIVITY_FLOW_MIN_POOL_QUOTE_SOL=30
 ACTIVITY_FLOW_MAX_SIGNAL_AGE_MS=5000
 
-FLOW_REVERSAL_EXIT_ENABLED=true
-FLOW_REVERSAL_EXIT_MODE=FLOW_TURN_15S
-
-TRAILING_ACTIVATE_PCT=20
-TRAILING_DRAWDOWN_PCT=10
-TAKE_PROFIT_PCT=100
-RSI_1M_EXIT_ENABLED=false
-RSI_1M_EXIT_THRESHOLD=80
-FIXED_STOP_LOSS_PCT=-20
+RSI_15S_EXIT_ENABLED=true
+RSI_15S_OVERBOUGHT_EXIT=80
+RSI_15S_CROSS_DOWN_EXIT=70
+FLOW_REVERSAL_EXIT_ENABLED=false
+TRAILING_ACTIVATE_PCT=30
+TRAILING_DRAWDOWN_PCT=8
+TAKE_PROFIT_PCT=0
+FIXED_STOP_LOSS_PCT=0
 EMERGENCY_STOP_LOSS_PCT=0
+NO_BOUNCE_EXIT_ENABLED=false
 STABILIZATION_EMERGENCY_DRAWDOWN_PCT=0
-MAX_HOLD_MS=0
+MAX_HOLD_MS=300000
 
 ADDON_ENABLED=0
 ADDON_DROP_PCT=20
@@ -159,4 +154,4 @@ STRATEGY_LAB_TPS_DOUBLE_MIN=5
 STRATEGY_LAB_LP_CHANGE_PCT=10
 ```
 
-上线前核对 `.env` 已填好 Helius、Birdeye 和钱包密钥，并确认启动日志显示 `FLOW_ACCEL_15S`。
+上线前核对 `.env` 已填好 Helius、Birdeye 和钱包密钥，并确认启动日志显示 `RSI_CROSS_15S`。
