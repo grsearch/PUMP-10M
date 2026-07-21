@@ -127,6 +127,33 @@ function run() {
     const first = position('p1', mint, {
       entryPrice: 1,
       highWaterMark: 1.3,
+      highWaterMarkTs: now,
+      openedAt: now,
+      reconciledAt: now,
+    });
+    const manager = managerWith(first);
+    manager._checkExit('p1', 1.3);
+    assert.strictEqual(first.trailingArmed, true, '+30% must arm trailing before RSI is evaluated');
+    assert.strictEqual(manager.handleRsiForExit(mint, 1.3, rsiSnapshot(81)), false);
+    assert.strictEqual(manager.handleRsiForExit(mint, 1.3, rsiSnapshot(75)), false);
+    assert.strictEqual(manager.handleRsiForExit(mint, 1.3, rsiSnapshot(70)), false);
+    assert.strictEqual(manager.handleRsiForExit(mint, 1.3, rsiSnapshot(69.9)), false);
+    assert.strictEqual(manager._exitCalls.length, 0, 'armed trailing must block both RSI exits');
+  }
+
+  {
+    const first = position('p1', mint, { trailingArmed: true });
+    const second = position('p2', mint, { trailingArmed: false });
+    const manager = managerWith(first, second);
+    assert.strictEqual(manager.handleRsiForExit(mint, 1, rsiSnapshot(81)), false);
+    assert.strictEqual(manager._exitCalls.length, 0, 'one armed position must protect the same-mint group');
+  }
+
+  {
+    const now = Date.now();
+    const first = position('p1', mint, {
+      entryPrice: 1,
+      highWaterMark: 1.3,
       openedAt: now - 10_000,
       reconciledAt: now - 10_000,
       trailingArmed: true,

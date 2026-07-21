@@ -290,8 +290,8 @@ class PositionManager extends EventEmitter {
   }
 
   /**
-   * 每笔 swap 更新 RSI 后调用。RSI 使用当前 1 分钟实时值；移动止盈一旦
-   * 在同币任一仓位上激活，便接管整组仓位，后续不再走 RSI 超买退出。
+   * 每笔 swap 更新 RSI 后调用。RSI 使用当前 15 秒实时值；移动止盈一旦
+   * 在同币任一仓位上先激活，便接管整组仓位，后续不再走两类 RSI 退出。
    */
   _logRsiExitSkip(mint, active, snapshot, reason, details = '') {
     const now = Date.now();
@@ -300,9 +300,9 @@ class PositionManager extends EventEmitter {
     if (last && last.reason === reason && now - last.ts < throttleMs) return;
     this._rsiExitSkipLogAt.set(mint, { ts: now, reason });
 
-    const liveRsi = snapshot?.rsi1mLive == null ? NaN : Number(snapshot.rsi1mLive);
-    const closedRsi = snapshot?.rsi1mClosed == null ? NaN : Number(snapshot.rsi1mClosed);
-    const bars = Number(snapshot?.rsi1mClosedBars || 0);
+    const liveRsi = snapshot?.rsi15sLive == null ? NaN : Number(snapshot.rsi15sLive);
+    const closedRsi = snapshot?.rsi15sClosed == null ? NaN : Number(snapshot.rsi15sClosed);
+    const bars = Number(snapshot?.rsi15sClosedBars || 0);
     const symbol = active?.[0]?.symbol || mint.slice(0, 6);
     console.log(
       `[PositionManager] RSI_EXIT_SKIPPED ${symbol} ` +
@@ -311,7 +311,7 @@ class PositionManager extends EventEmitter {
         `bars=${bars} positions=${active?.length || 0} reason=${reason}` +
         `${details ? ` ${details}` : ''}`,
     );
-    monitor.inc(`PositionManager.rsi1mExitSkipped.${reason}`, 1, 'PositionManager');
+    monitor.inc(`PositionManager.rsi15sExitSkipped.${reason}`, 1, 'PositionManager');
   }
 
   handleRsiForExit(mint, price, snapshot) {
@@ -340,6 +340,21 @@ class PositionManager extends EventEmitter {
       reason = 'RSI_15S_CROSS_DOWN';
     }
     if (!reason) return false;
+
+    // Once the +30% trailing stop is armed, it owns the exit for the whole
+    // same-mint position group. RSI >80 and the downward cross below 70 must
+    // not pre-empt the configured trailing drawdown.
+    const trailingOwners = active.filter((pos) => pos.trailingArmed);
+    if (trailingOwners.length > 0) {
+      this._logRsiExitSkip(
+        mint,
+        active,
+        snapshot,
+        'trailingArmed',
+        `blocked=${reason} armed=${trailingOwners.length}`,
+      );
+      return false;
+    }
 
     const symbol = active[0].symbol || mint.slice(0, 6);
     console.log(

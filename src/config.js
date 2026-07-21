@@ -65,7 +65,8 @@ const config = {
     trailingDrawdownPct: parseFloat(process.env.TRAILING_DRAWDOWN_PCT || '8'),
     trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '2000', 10),
 
-    // 使用当前未收盘的 15 秒 RSI：>80 或从 >=70 跌到 <70 时立即退出。
+    // 移动止盈未激活时，使用当前未收盘的 15 秒 RSI：
+    // >80 或从 >=70 跌到 <70 时立即退出；移动止盈激活后由 trailing 接管。
     rsi15sExitEnabled:
       (process.env.RSI_15S_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
     rsi15sOverboughtExit: parseFloat(process.env.RSI_15S_OVERBOUGHT_EXIT || '80'),

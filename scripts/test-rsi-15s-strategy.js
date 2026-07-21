@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
 const Module = require('module');
+const path = require('path');
 
 const originalLoad = Module._load;
 Module._load = function loadWithDotenvStub(request, parent, isMain) {
@@ -82,6 +84,11 @@ function runNextTradableOpenTest() {
   const view = tracker.getStrategyCandidates(10, open.ts);
   assert.strictEqual(view.mode, 'RSI_CROSS_15S');
   assert.strictEqual(view.candidates[0].stage, 'signaled');
+  assert.strictEqual(view.thresholds.exitOverbought, 80);
+  assert.strictEqual(view.thresholds.exitCrossDown, 70);
+  assert.strictEqual(view.thresholds.trailingActivatePct, 30);
+  assert.strictEqual(view.thresholds.trailingDrawdownPct, 8);
+  assert.strictEqual(view.thresholds.maxHoldMs, 300_000);
 }
 
 function runVolumeGateTests() {
@@ -146,8 +153,30 @@ function runDefaultsTest() {
   assert.strictEqual(config.strategy.flowReversalExitEnabled, false);
 }
 
+function runDashboardContractTest() {
+  for (const filename of ['dashboard.html', 'index.html']) {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'public', filename), 'utf8');
+    assert(html.includes('15s RSI Strategy'));
+    assert(html.includes('上一收盘 RSI(7)'));
+    assert(html.includes('当前收盘 RSI(7)'));
+    assert(html.includes('近 60s 真实成交量'));
+    assert(html.includes('下一可成交 K 开盘'));
+    assert(html.includes('移动止盈未激活时'));
+    assert(html.includes('已停止展示旧策略指标'));
+    assert(!html.includes('Strategy V6'));
+    assert(!html.includes('V5 信号'));
+    assert(!html.includes('10m回踩恢复'));
+    assert(!html.includes('10M 成交量'));
+    const inlineScripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
+      .map((match) => match[1].trim())
+      .filter(Boolean);
+    inlineScripts.forEach((source) => new Function(source));
+  }
+}
+
 runNextTradableOpenTest();
 runVolumeGateTests();
 runNextTradableAfterGapTest();
 runDefaultsTest();
+runDashboardContractTest();
 console.log('15s RSI entry strategy tests: PASS');
