@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0">
 <meta charset="UTF-8">
-<title>Dump Sniper Dashboard v3.20</title>
+<title>Dump Sniper · 15s RSI</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
@@ -271,7 +271,7 @@
 <body>
 
 <div class="header">
-  <h1>🎯 Dump Sniper <span class="v">Strategy V6</span></h1>
+  <h1>🎯 Dump Sniper <span class="v">15s RSI Strategy</span></h1>
   <div class="badges">
     <a href="/reports.html" style="color:var(--accent);text-decoration:none;font-size:12px;font-weight:500;margin-right:8px;">📅 报告</a>
     <span id="modeBadge" class="badge dry">DRY_RUN</span>
@@ -389,8 +389,8 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一 RSI</th><th>收盘 RSI</th><th>实时 RSI</th><th>K线数</th><th>60s 成交量</th><th>信号 K</th><th>入场 K</th><th>状态说明</th><th>阶段</th></tr></thead>
-            <tbody id="signalsTbody"><tr><td colspan="16" class="empty">暂无活跃成交</td></tr></tbody>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一收盘 RSI(7)</th><th>当前收盘 RSI(7)</th><th>实时 RSI(7)</th><th>已收盘 15s K</th><th>近 60s 真实成交量</th><th>信号 K 收盘</th><th>下一可成交 K 开盘</th><th>状态说明</th><th>阶段</th></tr></thead>
+            <tbody id="signalsTbody"><tr><td colspan="12" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -487,16 +487,13 @@ async function refreshStatus() {
   $('modeBadge').className = 'badge ' + (r.dryRun ? 'dry' : 'live');
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
-  $('stat-volume1m').textContent = r.config.activityEntryMode === 'RSI_CROSS_15S'
+  const isRsiMode = r.config.activityEntryMode === 'RSI_CROSS_15S';
+  $('stat-volume1m').textContent = isRsiMode
     ? `>= ${fmtMoney(r.config.rsi15sMinVolume60sUsd)}`
-    : r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
-      ? `${fmtMoney(r.config.pullbackVolume10mMinUsd)} - ${fmtMoney(r.config.pullbackVolume10mMaxUsd)}`
-      : fmtMoney(r.config.activityVolume1mUsd);
-  $('stat-trades1m').textContent = r.config.activityEntryMode === 'RSI_CROSS_15S'
+    : '配置错误';
+  $('stat-trades1m').textContent = isRsiMode
     ? `RSI(${r.config.rsi15sPeriod}) ↑ ${r.config.rsi15sEntryThreshold}`
-    : r.config.activityEntryMode === 'TEN_MIN_PULLBACK'
-      ? (r.config.pullbackShadowOnly ? '10m回踩·影子' : '10m回踩·实盘')
-      : r.config.activityTrades1m;
+    : `错误: ${r.config.activityEntryMode || 'UNKNOWN'}`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-tp').textContent = r.config.takeProfitPct > 0 ? '+' + r.config.takeProfitPct + '%' : '关闭';
   $('stat-hold').textContent = r.config.maxHoldMs / 1000 + 's';
@@ -716,11 +713,6 @@ function renderClosedPage() {
   }
 }
 
-function _strategyCondition(value, passed, title = '') {
-  const tooltip = title ? ` title="${escapeHtml(title)}"` : '';
-  return `<span class="condition ${passed ? 'pass' : 'pending'}"${tooltip}>${escapeHtml(value)}</span>`;
-}
-
 function _strategyNumber(value, digits = 2) {
   const n = Number(value);
   return Number.isFinite(n) ? n.toFixed(digits) : '-';
@@ -755,27 +747,44 @@ async function refreshSignals() {
   const meta = $('strategySignalMeta');
   const tbody = $('signalsTbody');
   if (!r.ok) {
-    meta.innerHTML = `<span class="neg">${escapeHtml(r.error || 'V6 实时数据不可用')}</span>`;
-    tbody.innerHTML = '<tr><td colspan="16" class="empty">等待 Strategy V6 数据</td></tr>';
+    meta.innerHTML = `<span class="neg">${escapeHtml(r.error || '15s RSI 实时数据不可用')}</span>`;
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">等待 15s RSI 数据</td></tr>';
     return;
   }
 
   const summary = r.summary || {};
   const thresholds = r.thresholds || {};
   const rows = r.candidates || [];
-  if (r.mode === 'RSI_CROSS_15S') {
-    meta.innerHTML = [
-      `<span>模式 <b>15s RSI(${thresholds.rsiPeriod || 7}) 上穿 ${thresholds.entryCross || 30}</b></span>`,
-      `<span>活跃 <b>${summary.active || 0}</b></span>`,
-      `<span>预热 <b>${summary.warming || 0}</b></span>`,
-      `<span>量不足 <b>${summary.volumeBlocked || 0}</b></span>`,
-      `<span>实盘信号 <b>${summary.signaled || 0}</b></span>`,
-    ].join('');
-    if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="12" class="empty">暂无活跃成交</td></tr>';
-      return;
-    }
-    tbody.innerHTML = rows.map(candidate => `
+  if (r.mode !== 'RSI_CROSS_15S') {
+    meta.innerHTML = `<span class="neg">配置错误：后端模式为 ${escapeHtml(r.mode || '未知')}，应为 RSI_CROSS_15S；请更新运行环境并重启服务</span>`;
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">已停止展示旧策略指标，等待后端切换到 15s RSI</td></tr>';
+    return;
+  }
+
+  const exitOverbought = thresholds.exitOverbought ?? 80;
+  const exitCrossDown = thresholds.exitCrossDown ?? 70;
+  const trailingActivate = thresholds.trailingActivatePct ?? 30;
+  const trailingDrawdown = thresholds.trailingDrawdownPct ?? 8;
+  const maxHoldSec = Math.round((thresholds.maxHoldMs ?? 300000) / 1000);
+  meta.innerHTML = [
+    `<span>买入 <b>15s RSI(${thresholds.rsiPeriod || 7}) 上穿 ${thresholds.entryCross ?? 30}</b></span>`,
+    `<span>近60s成交量 <b>≥ ${fmtMoney(thresholds.minVolume60sUsd ?? 5000)}</b></span>`,
+    `<span>卖出 <b>移动止盈未激活时：RSI &gt; ${exitOverbought} / 下穿 ${exitCrossDown}</b></span>`,
+    `<span>移动止盈 <b>+${trailingActivate}% / 回撤 ${trailingDrawdown}%</b></span>`,
+    `<span>最长持仓 <b>${maxHoldSec}s</b></span>`,
+    `<span>活跃 <b>${summary.active || 0}</b></span>`,
+    `<span>预热 <b>${summary.warming || 0}</b></span>`,
+    `<span>量不足 <b>${summary.volumeBlocked || 0}</b></span>`,
+    `<span>实盘信号 <b>${summary.signaled || 0}</b></span>`,
+  ].join('');
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">暂无活跃成交</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(candidate => {
+    const detail = candidate.waitReason ||
+      (candidate.stage === 'signaled' ? '已在下一根可成交 K 线开盘触发' : '等待 RSI 上穿与成交量确认');
+    return `
       <tr>
         <td class="mono">${fmtTime(candidate.updatedAt)}</td>
         <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
@@ -784,94 +793,10 @@ async function refreshSignals() {
         <td>${_strategyNumber(candidate.rsiCurrent)}</td>
         <td>${_strategyNumber(candidate.rsiLive)}</td>
         <td>${candidate.closedBars || 0}</td>
-        <td>${fmtMoney(candidate.volume60sUsd)} / ${fmtMoney(thresholds.minVolume60sUsd)}</td>
+        <td>${fmtMoney(candidate.volume60sUsd)} / ${fmtMoney(thresholds.minVolume60sUsd ?? 5000)}</td>
         <td class="mono">${candidate.signalCandleTs ? fmtTime(candidate.signalCandleTs) : '-'}</td>
         <td class="mono">${candidate.entryCandleTs ? fmtTime(candidate.entryCandleTs) : '-'}</td>
-        <td style="max-width:260px">${escapeHtml(candidate.waitReason || '-')}</td>
-        <td>${_strategyStage(candidate, r.now || Date.now())}</td>
-      </tr>`).join('');
-    return;
-  }
-  if (r.mode === 'TEN_MIN_PULLBACK') {
-    meta.innerHTML = [
-      `<span>模式 <b>10m回踩恢复${r.shadowOnly ? '·影子' : '·实盘'}</b></span>`,
-      `<span>活跃 <b>${summary.active || 0}</b></span>`,
-      `<span>累计中 <b>${summary.collecting || 0}</b></span>`,
-      `<span>10m量达标 <b>${summary.volumeReady || 0}</b></span>`,
-      `<span>等待恢复 <b>${summary.waiting || 0}</b></span>`,
-      `<span>${r.shadowOnly ? '影子信号' : '实盘信号'} <b>${summary.signaled || 0}</b></span>`,
-      `<span>过期/淘汰 <b>${(summary.expired || 0) + (summary.ineligible || 0)}</b></span>`,
-    ].join('');
-
-    if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="16" class="empty">暂无活跃成交</td></tr>';
-      return;
-    }
-    tbody.innerHTML = rows.map(candidate => {
-      const conditions = candidate.conditions || {};
-      const metrics = candidate.metrics || {};
-      const waitReason = candidate.waitReason || candidate.ineligibleReason || '-';
-      return `
-        <tr>
-          <td class="mono">${fmtTime(candidate.updatedAt)}</td>
-          <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
-          ${caCell(candidate.mint)}
-          <td>${_strategyNumber((candidate.migrationAgeMs || 0) / 60000, 2)}m</td>
-          <td>${_strategyCondition(`${fmtMoney(candidate.volume10mUsd)} / ${fmtMoney(thresholds.minVolume10mUsd)}-${fmtMoney(thresholds.maxVolume10mUsd)}`, conditions.volume10m)}</td>
-          <td class="mono">${_strategyNumber(candidate.referencePrice, 8)}</td>
-          <td>${_strategyCondition(`${_strategyNumber(metrics.priceVsReferencePct)}%`, conditions.atOrBelowReference)}</td>
-          <td>${_strategyCondition(`${_strategyNumber(metrics.drawdownPct)}%`, conditions.pullback)}</td>
-          <td>${_strategyCondition(`${_strategyNumber(metrics.reboundPct)}%`, conditions.rebound)}</td>
-          <td>${_strategyCondition(`${_strategyNumber(metrics.buyVolume15sSol)} SOL`, conditions.buyFlow15s)}</td>
-          <td>${_strategyCondition(`${_strategyNumber(metrics.sellVolume15sSol)} SOL`, conditions.buyFlow15s)}</td>
-          <td>${_strategyCondition(`${metrics.uniqueBuyers15s || 0} / ${thresholds.minUniqueBuyers || 0}`, conditions.buyers15s)}</td>
-          <td>${_strategyCondition(`${_strategyNumber(metrics.estimatedSlippagePct)}%`, conditions.slippage)}</td>
-          <td>${_strategyNumber((candidate.firstSeenDelayMs || 0) / 1000, 1)}s</td>
-          <td style="max-width:260px" title="${escapeHtml(waitReason)}">${escapeHtml(waitReason.slice(0, 45))}</td>
-          <td>${_strategyStage(candidate, r.now || Date.now())}</td>
-        </tr>`;
-    }).join('');
-    return;
-  }
-  meta.innerHTML = [
-    `<span>模式 <b>${escapeHtml(r.mode || '-')}</b></span>`,
-    `<span>活跃 <b>${summary.active || 0}</b></span>`,
-    `<span>1m量达标 <b>${summary.volumeReady || 0}</b></span>`,
-    `<span>预备 <b>${summary.armReady || 0}</b></span>`,
-    `<span>激活 <b>${summary.armed || 0}</b></span>`,
-    `<span>等待恢复 <b>${summary.waiting || 0}</b></span>`,
-    `<span>确认 <b>${summary.confirming || 0}</b></span>`,
-    `<span>信号 <b>${summary.signaled || 0}</b></span>`,
-  ].join('');
-
-  if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="16" class="empty">暂无活跃成交</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = rows.map(candidate => {
-    const conditions = candidate.conditions || {};
-    const minute = candidate.s60 || {};
-    const tenSeconds = candidate.s10 || {};
-    const fiveSeconds = candidate.s5 || {};
-    const trigger = candidate.trigger || {};
-    return `
-      <tr>
-        <td class="mono">${fmtTime(candidate.updatedAt)}</td>
-        <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
-        ${caCell(candidate.mint)}
-        <td>${_strategyCondition(`${fmtMoney(minute.volumeUsd)} / ${fmtMoney(thresholds.volume1mUsd)}`, conditions.volume1m)}</td>
-        <td>${_strategyCondition(`${minute.buyCount || 0} / ${thresholds.buyTrades1m || 0}`, conditions.buyTrades1m)}</td>
-        <td>${_strategyCondition(`${minute.uniqueBuyers || 0} / ${thresholds.buyers1m || 0}`, conditions.buyers1m)}</td>
-        <td>${_strategyCondition(`${minute.newUniqueBuyers || 0} / ${thresholds.newBuyers1m || 0}`, conditions.newBuyers1m)}</td>
-        <td>${_strategyCondition(`${_strategyNumber((minute.largestBuyShare || 0) * 100, 1)}%`, conditions.largestBuy1m, `上限 ${_strategyNumber((thresholds.breadthLargestBuyShare1m || 0) * 100, 0)}%`)}</td>
-        <td>${_strategyCondition(`${fiveSeconds.uniqueBuyers || 0} / ${thresholds.breadthBuyers5s || 0}`, conditions.buyers5s)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(trigger.avgBuyPerWallet5sSol, 3)} SOL`, conditions.avgBuyPerWallet5s, `上限 ${_strategyNumber(thresholds.maxAvgBuyPerWallet5sSol, 2)} SOL`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(trigger.previousBuySellRatio5s)}→${_strategyNumber(trigger.currentBuySellRatio5s)}`, conditions.ratioTurn5s, `${thresholds.currentRatioMin5s}～${thresholds.currentRatioMax5s}`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(trigger.txAccelerationFactor5s)}x / ${_strategyNumber(trigger.volumeAccelerationFactor5s)}x`, conditions.acceleration5s, `任一 ≥${thresholds.accelerationFactor5s}x`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(minute.priceChangePct)}%`, conditions.price60s, `上限 ${thresholds.breadthPriceChange60sMaxPct}%`)}</td>
-        <td>${_strategyCondition(`${_strategyNumber(tenSeconds.priceChangePct)}%`, conditions.price10s, `${thresholds.breadthPriceChange10sMinPct}%～${thresholds.breadthPriceChange10sMaxPct}%`)}</td>
-        <td>${_strategyCondition(`${trigger.supportScore || 0} / 5`, conditions.supportScore, `至少 ${thresholds.minConfirmations || 0}`)}</td>
+        <td style="max-width:260px">${escapeHtml(detail)}</td>
         <td>${_strategyStage(candidate, r.now || Date.now())}</td>
       </tr>`;
   }).join('');
