@@ -33,6 +33,17 @@ async function main() {
   console.log('🎯 Dump Sniper V3.17.20 starting...');
   console.log(`Mode: ${config.DRY_RUN ? 'DRY_RUN' : '⚠️  LIVE TRADING ⚠️'}`);
   console.log(`Position: ${config.strategy.positionSizeSol} SOL`);
+  console.log(
+    `BUY execution: PumpSwap SDK 1.19.0 / buy_exact_quote_in / ` +
+      `virtual reserves / fixed ${config.strategy.positionSizeSol} SOL / ` +
+      `signal cap +${config.strategy.buyMaxPriceDeviationPct}% / forced fresh RPC`,
+  );
+  if (process.env.BUY_MIN_EFFECTIVE_SLIPPAGE_PCT != null) {
+    console.warn(
+      'BUY_MIN_EFFECTIVE_SLIPPAGE_PCT is deprecated and ignored; ' +
+        'minimum token output now enforces the signal-price cap.',
+    );
+  }
   console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
   console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}%`);
   console.log(
@@ -389,11 +400,20 @@ async function main() {
       // v2: 同步 EMA 监控列表
     },
     onTokenAdded: async (token) => {
+      const prewarmTokenPool = () => {
+        const fresh = tokenRegistry.getToken(token.mint);
+        if (fresh?.pool_address && executor.poolStateCache) {
+          executor.poolStateCache.prewarmMint(fresh.mint, fresh.pool_address).catch(() => {});
+        }
+      };
+      prewarmTokenPool();
       // 新增代币 → 后台异步补 pool 信息
       if (config.autoFillPoolsOnStart) {
-        fillPoolForToken(tokenRegistry, token.mint).catch((err) => {
-          console.warn(`[onTokenAdded] fillPool failed for ${token.symbol || token.mint.slice(0,8)}: ${err.message}`);
-        });
+        fillPoolForToken(tokenRegistry, token.mint)
+          .then(prewarmTokenPool)
+          .catch((err) => {
+            console.warn(`[onTokenAdded] fillPool failed for ${token.symbol || token.mint.slice(0,8)}: ${err.message}`);
+          });
       }
       // v2: 新币加入 EMA 监控
     },
@@ -409,7 +429,7 @@ async function main() {
       const mints = tokenRegistry.listActive().map((t) => t.mint);
       tickStream.updateSubscription(mints);
       if (migration.poolAddress && executor.poolStateCache) {
-        executor.poolStateCache.refreshOne(migration.poolAddress).catch(() => {});
+        executor.poolStateCache.prewarmMint(token.mint, migration.poolAddress).catch(() => {});
       }
       server.broadcast({
         type: 'tokenAdded',
@@ -493,6 +513,7 @@ async function main() {
         const fresh = tokenRegistry.getToken(t.mint);
         if (fresh?.pool_address) {
           console.log(`[pool-refill] ${t.symbol || t.mint.slice(0,8)} pool filled`);
+          executor.poolStateCache?.prewarmMint(fresh.mint, fresh.pool_address).catch(() => {});
         }
       }).catch(() => {});
     }
@@ -529,6 +550,7 @@ async function main() {
     const vaultWatcher = new VaultBalanceWatcher({
       connection: executor.rpc,
       tokenRegistry,
+      poolStateCache: executor.poolStateCache || null,
     });
     vaultWatcher.on('vaultSell', (info) => {
       // v3.17.23: VaultWatcher 检测到的卖单作为辅助信号
@@ -539,7 +561,11 @@ async function main() {
 
       // 喂价给 PriceTracker
       if (info.priceAfter > 0) {
-        priceTracker.update(info.mint, info.priceAfter, info.ts, info.poolAddress);
+        priceTracker.update(info.mint, info.priceAfter, info.ts, info.poolAddress, {
+          rawPrice: info.rawPriceAfter,
+          virtualQuoteReserveSol: info.virtualQuoteReserveSol,
+          effectiveQuoteReserveSol: info.effectiveQuoteReserveSol,
+        });
       }
 
       // 预热 PoolStateCache
@@ -625,7 +651,7 @@ async function main() {
     // 立即 prewarm pool cache（不等 addToken 完成）
     // 这样 VaultWatcher 检测到 dump 时，buy 路径已经 ready
     if (info.poolAddress && executor.poolStateCache) {
-      executor.poolStateCache.refreshOne(info.poolAddress).catch(() => {});
+      executor.poolStateCache.prewarmMint(info.mint, info.poolAddress).catch(() => {});
     }
 
     // 异步添加到 tokenRegistry
@@ -643,6 +669,9 @@ async function main() {
           });
         }
         const freshToken = tokenRegistry.getToken(info.mint);
+        if (freshToken?.pool_address && executor.poolStateCache) {
+          executor.poolStateCache.prewarmMint(freshToken.mint, freshToken.pool_address).catch(() => {});
+        }
         console.log(
           `[main] 🆕 SS auto-added ${freshToken?.symbol || info.mint.slice(0, 8)}.. to tokenRegistry ` +
           `(pool=${freshToken?.pool_address?.slice(0, 6)}..)`,
@@ -718,8 +747,23 @@ async function main() {
     }
   }, 10_000);
 
-  dumpDetector.on('priceTick', ({ mint, price, ts, poolAddress, side, solVolume, poolQuoteAfter }) => {
-    priceTracker.update(mint, price, ts, poolAddress);
+  dumpDetector.on('priceTick', ({
+    mint,
+    price,
+    ts,
+    poolAddress,
+    side,
+    solVolume,
+    poolQuoteAfter,
+    rawPrice,
+    virtualQuoteReserveSol,
+    effectiveQuoteReserveSol,
+  }) => {
+    priceTracker.update(mint, price, ts, poolAddress, {
+      rawPrice,
+      virtualQuoteReserveSol,
+      effectiveQuoteReserveSol,
+    });
     // v3.17.41: 采样价格到长窗口缓存 (比 handleDumpSignal 更频繁，覆盖所有 priceTick)
     signalEngine._sampleLongPrice(mint, priceTracker.getPrice(mint));
     // v3.17.17: 喂 RSI - 用 feedTrade 带上 volume,RSI 能做 volume-weighted aggregation

@@ -61,6 +61,9 @@ class PoolStateCache {
     this.signalRefreshMs = parseInt(
       process.env.POOL_STATE_SIGNAL_REFRESH_MS || '2000', 10,
     );
+    this.baseRefreshMs = parseInt(
+      process.env.POOL_STATE_BASE_REFRESH_MS || '60000', 10,
+    );
     // 兼容旧 env 变量
     if (process.env.POOL_STATE_REFRESH_MS) {
       this.positionRefreshMs = parseInt(process.env.POOL_STATE_REFRESH_MS, 10);
@@ -72,6 +75,17 @@ class PoolStateCache {
     this.cache = new Map();   // poolAddress(string) → { state, fetchedAt }
     this.timer = null;
     this._refreshing = false;
+    this._inflightRefreshes = new Map();
+
+    // All active tokens with a known pool remain cached at a low frequency,
+    // before they ever become signal or position mints.
+    this.monitoredMints = new Map();
+    this.prewarmBatchSize = Math.max(1, parseInt(
+      process.env.POOL_STATE_PREWARM_BATCH_SIZE || '4', 10,
+    ));
+    this.prewarmBatchDelayMs = Math.max(0, parseInt(
+      process.env.POOL_STATE_PREWARM_BATCH_DELAY_MS || '100', 10,
+    ));
 
     // hotMints — 只有这些币才高频轮询
     // key: mint, value: { poolAddress, addedAt, isPosition }
@@ -88,6 +102,7 @@ class PoolStateCache {
     // 第三刀：分级 cursor
     this._positionCursor = 0;
     this._signalCursor = 0;
+    this._baseCursor = 0;
   }
 
   /**
@@ -117,6 +132,77 @@ class PoolStateCache {
       console.warn(`[PoolStateCache] ⚠️ global config prefetch failed: ${err.message}`);
       // 失败不阻断，后续 refresh 会 fallback 到 swapSolanaState
     }
+  }
+
+  _readMonitoredMintList() {
+    if (typeof this.getMintList !== 'function') return [];
+    try {
+      const list = this.getMintList();
+      if (!Array.isArray(list)) return [];
+      const deduped = new Map();
+      for (const item of list) {
+        const mint = String(item?.mint || '').trim();
+        const poolAddress = String(item?.poolAddress || item?.pool_address || '').trim();
+        if (!mint || !poolAddress || this.deadPools.has(poolAddress)) continue;
+        deduped.set(mint, { mint, poolAddress, tier: 'base', isPosition: false });
+      }
+      return Array.from(deduped.values());
+    } catch (err) {
+      monitor.recordError('PoolStateCache', err, { phase: 'get_mint_list' });
+      return [];
+    }
+  }
+
+  _syncMonitoredTargets({ prewarmNew = false } = {}) {
+    const previous = this.monitoredMints;
+    const next = new Map();
+    const targets = this._readMonitoredMintList();
+
+    for (const target of targets) {
+      next.set(target.mint, { poolAddress: target.poolAddress });
+      const old = previous.get(target.mint);
+      const isNewPool = !old || old.poolAddress !== target.poolAddress;
+      if (prewarmNew && isNewPool) {
+        this.refreshOne(target.poolAddress, { maxAgeMs: 0 }).catch(() => {});
+        monitor.inc('PoolStateCache.newMintPrewarm', 1, 'PoolStateCache');
+      }
+    }
+
+    this.monitoredMints = next;
+    monitor.set('PoolStateCache.monitoredMintsSize', next.size, 'PoolStateCache');
+    return targets;
+  }
+
+  prewarmMint(mint, poolAddress) {
+    if (!mint || !poolAddress || this.deadPools.has(poolAddress)) return Promise.resolve(null);
+    this.monitoredMints.set(mint, { poolAddress });
+    monitor.set('PoolStateCache.monitoredMintsSize', this.monitoredMints.size, 'PoolStateCache');
+    return this.refreshOne(poolAddress, { maxAgeMs: 0 });
+  }
+
+  async _prewarmMonitored() {
+    const targets = this._syncMonitoredTargets({ prewarmNew: false })
+      .filter((target) => !this.cache.has(target.poolAddress));
+    if (targets.length === 0) return;
+
+    console.log(
+      `[PoolStateCache] prewarming ${targets.length} monitored pool(s) ` +
+        `(batch=${this.prewarmBatchSize})`,
+    );
+    let warmed = 0;
+    for (let offset = 0; offset < targets.length; offset += this.prewarmBatchSize) {
+      if (!this.timer) break;
+      const batch = targets.slice(offset, offset + this.prewarmBatchSize);
+      const states = await Promise.all(batch.map((target) => (
+        this.refreshOne(target.poolAddress, { maxAgeMs: this.baseRefreshMs })
+      )));
+      warmed += states.filter(Boolean).length;
+      if (this.prewarmBatchDelayMs > 0 && offset + this.prewarmBatchSize < targets.length) {
+        await new Promise((resolve) => setTimeout(resolve, this.prewarmBatchDelayMs));
+      }
+    }
+    monitor.inc('PoolStateCache.prewarmOk', warmed, 'PoolStateCache');
+    console.log(`[PoolStateCache] prewarm complete (${warmed}/${targets.length})`);
   }
 
   /**
@@ -192,14 +278,21 @@ class PoolStateCache {
     // 第一刀：预取全局配置
     await this._prefetchGlobalConfig();
 
-    // 滚动刷新只遍历 hotMints
+    this._syncMonitoredTargets({ prewarmNew: false });
+
     this.timer = setInterval(() => {
       this._refreshAll().catch((err) => {
         monitor.recordError('PoolStateCache', err, { phase: 'periodic_refresh' });
       });
     }, this._tickIntervalMs);
+    this._prewarmMonitored().catch((err) => {
+      monitor.recordError('PoolStateCache', err, { phase: 'startup_prewarm' });
+    });
     console.log(
-      `[PoolStateCache] started (pos=${this.positionRefreshMs}ms, signal=${this.signalRefreshMs}ms, tick=${this._tickIntervalMs}ms, globalConfigCached=${this._globalConfigFetched})`,
+      `[PoolStateCache] started (pos=${this.positionRefreshMs}ms, ` +
+        `signal=${this.signalRefreshMs}ms, base=${this.baseRefreshMs}ms, ` +
+        `tick=${this._tickIntervalMs}ms, monitored=${this.monitoredMints.size}, ` +
+        `globalConfigCached=${this._globalConfigFetched})`,
     );
   }
 
@@ -210,6 +303,8 @@ class PoolStateCache {
     }
     this.cache.clear();
     this.hotMints.clear();
+    this.monitoredMints.clear();
+    this._inflightRefreshes.clear();
   }
 
   /**
@@ -236,20 +331,35 @@ class PoolStateCache {
    * 不阻塞调用方；后台异步刷新。如果该 pool 0.5s 内已经刷过则跳过。
    */
   async refreshOne(poolAddress, { maxAgeMs = 500, force = false } = {}) {
-    if (!this.onlineSdk || !this.user || !poolAddress) return null;
+    if (!this.onlineSdk || !this.user || !poolAddress || this.deadPools.has(poolAddress)) return null;
     const cached = this.cache.get(poolAddress);
     if (!force && cached && Date.now() - cached.fetchedAt <= maxAgeMs) return cached.state;
-    try {
-      const state = await this._fetchPoolState(poolAddress);
-      if (state) {
-        this.cache.set(poolAddress, { state, fetchedAt: Date.now() });
-        monitor.inc('PoolStateCache.refreshOneOk', 1, 'PoolStateCache');
-      }
-      return state || null;
-    } catch (err) {
-      monitor.inc('PoolStateCache.refreshOneFail', 1, 'PoolStateCache');
-      return null;
+
+    const inflight = this._inflightRefreshes.get(poolAddress);
+    if (inflight) {
+      monitor.inc('PoolStateCache.refreshDedup', 1, 'PoolStateCache');
+      return inflight;
     }
+
+    const request = (async () => {
+      try {
+        const state = await this._fetchPoolState(poolAddress);
+        if (state) {
+          this.cache.set(poolAddress, { state, fetchedAt: Date.now() });
+          monitor.inc('PoolStateCache.refreshOneOk', 1, 'PoolStateCache');
+        }
+        return state || null;
+      } catch (err) {
+        monitor.inc('PoolStateCache.refreshOneFail', 1, 'PoolStateCache');
+        return null;
+      } finally {
+        if (this._inflightRefreshes.get(poolAddress) === request) {
+          this._inflightRefreshes.delete(poolAddress);
+        }
+      }
+    })();
+    this._inflightRefreshes.set(poolAddress, request);
+    return request;
   }
 
   /**
@@ -490,50 +600,52 @@ class PoolStateCache {
     if (this._refreshing) return;
     this._refreshing = true;
     try {
-      const targets = [];
+      const monitoredTargets = this._syncMonitoredTargets({ prewarmNew: true });
+      const targetsByPool = new Map();
+
+      for (const target of monitoredTargets) {
+        targetsByPool.set(target.poolAddress, target);
+      }
       for (const [mint, info] of this.hotMints) {
-        targets.push({ mint, poolAddress: info.poolAddress, isPosition: info.isPosition });
+        if (!info?.isPosition && !this.monitoredMints.has(mint)) {
+          this.hotMints.delete(mint);
+          continue;
+        }
+        if (!info?.poolAddress || this.deadPools.has(info.poolAddress)) continue;
+        targetsByPool.set(info.poolAddress, {
+          mint,
+          poolAddress: info.poolAddress,
+          tier: info.isPosition ? 'position' : 'signal',
+          isPosition: Boolean(info.isPosition),
+        });
       }
 
-      if (targets.length === 0) {
-        // 无热币：只做清理
-        let removed = 0;
-        for (const addr of this.cache.keys()) {
-          this.cache.delete(addr);
-          removed += 1;
-        }
-        if (removed > 0) {
-          monitor.inc('PoolStateCache.evicted', removed, 'PoolStateCache');
-        }
-        monitor.beat('PoolStateCache', 'idle:0');
-        monitor.set('PoolStateCache.cacheSize', this.cache.size, 'PoolStateCache');
-        monitor.set('PoolStateCache.hotMintsSize', 0, 'PoolStateCache');
-        return;
-      }
-
-      // 清理 cache 中已不在 hotMints 的 entry
-      const hotAddresses = new Set(targets.map((t) => t.poolAddress));
+      const targets = Array.from(targetsByPool.values());
+      const activeAddresses = new Set(targetsByPool.keys());
       let removed = 0;
       for (const addr of this.cache.keys()) {
-        if (!hotAddresses.has(addr)) {
+        if (!activeAddresses.has(addr)) {
           this.cache.delete(addr);
           removed += 1;
         }
       }
       if (removed > 0) {
         monitor.inc('PoolStateCache.evicted', removed, 'PoolStateCache');
-        console.log(`[PoolStateCache] evicted ${removed} stale entries (not in hotMints)`);
+        console.log(`[PoolStateCache] evicted ${removed} pool(s) no longer monitored`);
       }
 
-      // 第三刀：分级刷新
-      const positionTargets = targets.filter(t => t.isPosition);
-      const signalTargets = targets.filter(t => !t.isPosition);
+      const positionTargets = targets.filter((target) => target.tier === 'position');
+      const signalTargets = targets.filter((target) => target.tier === 'signal');
+      const baseTargets = targets.filter((target) => target.tier === 'base');
 
       const positionBatchSize = positionTargets.length > 0
         ? Math.max(1, Math.ceil(positionTargets.length / (this.positionRefreshMs / this._tickIntervalMs)))
         : 0;
       const signalBatchSize = signalTargets.length > 0
         ? Math.max(1, Math.ceil(signalTargets.length / (this.signalRefreshMs / this._tickIntervalMs)))
+        : 0;
+      const baseBatchSize = baseTargets.length > 0
+        ? Math.max(1, Math.ceil(baseTargets.length / (this.baseRefreshMs / this._tickIntervalMs)))
         : 0;
 
       const slice = [];
@@ -552,37 +664,38 @@ class PoolStateCache {
         }
       }
 
+      if (baseTargets.length > 0) {
+        for (let i = 0; i < baseBatchSize; i++) {
+          slice.push(baseTargets[this._baseCursor % baseTargets.length]);
+          this._baseCursor++;
+        }
+      }
+
       if (slice.length === 0) {
-        monitor.beat('PoolStateCache', 'idle:0');
+        monitor.beat('PoolStateCache', 'idle:no_targets');
+        monitor.set('PoolStateCache.cacheSize', this.cache.size, 'PoolStateCache');
         return;
       }
 
-      monitor.beat('PoolStateCache', `refresh:${slice.length}/pos:${positionTargets.length}/sig:${signalTargets.length}`);
+      monitor.beat(
+        'PoolStateCache',
+        `refresh:${slice.length}/pos:${positionTargets.length}/sig:${signalTargets.length}/base:${baseTargets.length}`,
+      );
       const t0 = Date.now();
 
       let okCount = 0;
       let failCount = 0;
       for (const t of slice) {
-        try {
-          const state = await this._fetchPoolState(t.poolAddress);
-          if (state) {
-            this.cache.set(t.poolAddress, { state, fetchedAt: Date.now() });
-            okCount++;
-          } else {
-            failCount++;
-          }
-        } catch (err) {
-          failCount++;
-          if (err.message && err.message.includes('429')) {
-            await new Promise((r) => setTimeout(r, 200));
-          }
-        }
+        const state = await this.refreshOne(t.poolAddress, { maxAgeMs: 0, force: true });
+        if (state) okCount++;
+        else failCount++;
       }
 
       const elapsed = Date.now() - t0;
       monitor.set('PoolStateCache.lastRefreshMs', elapsed, 'PoolStateCache');
       monitor.set('PoolStateCache.cacheSize', this.cache.size, 'PoolStateCache');
       monitor.set('PoolStateCache.hotMintsSize', this.hotMints.size, 'PoolStateCache');
+      monitor.set('PoolStateCache.monitoredMintsSize', this.monitoredMints.size, 'PoolStateCache');
       monitor.inc('PoolStateCache.refreshOk', okCount, 'PoolStateCache');
       if (failCount > 0) monitor.inc('PoolStateCache.refreshFail', failCount, 'PoolStateCache');
     } finally {

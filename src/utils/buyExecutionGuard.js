@@ -8,7 +8,7 @@ function finitePositive(value) {
 }
 
 /**
- * Keep the on-chain max quote inside the signal-price cap.
+ * Keep the on-chain minimum token output inside the signal-price cap.
  * Slippage values are percentages (1 means 1%), matching PumpAmmSdk.
  */
 function calculateBuyPriceGuard({
@@ -74,7 +74,9 @@ function calculateBuyPriceGuard({
     priceDeviationPct,
     remainingPct,
     effectiveSlippagePct,
-    maxQuoteSol: input * (1 + effectiveSlippagePct / 100),
+    // buy_exact_quote_in fixes quote input; tolerance is enforced through the
+    // minimum base output rather than permission to spend extra quote tokens.
+    maxQuoteSol: input,
   };
 }
 
@@ -88,6 +90,7 @@ async function loadFreshBuyPoolState({
   maxAgeMs,
   poolStateCache,
   loadFromRpc,
+  forceRefresh = false,
   now = () => Date.now(),
 }) {
   const allowedAgeMs = Number(maxAgeMs);
@@ -103,6 +106,7 @@ async function loadFreshBuyPoolState({
     : null;
 
   if (
+    !forceRefresh &&
     cachedState &&
     Number.isFinite(cacheAgeBeforeMs) &&
     cacheAgeBeforeMs <= allowedAgeMs
@@ -119,12 +123,13 @@ async function loadFreshBuyPoolState({
   if (poolStateCache?.refreshOne) {
     const refreshedState = await poolStateCache.refreshOne(poolAddress, {
       maxAgeMs: allowedAgeMs,
+      force: forceRefresh,
     });
     if (refreshedState) {
       const refreshedAge = poolStateCache.getAge?.(poolAddress);
       return {
         state: refreshedState,
-        stateSource: 'rpc',
+        stateSource: forceRefresh ? 'rpc_forced' : 'rpc',
         cacheBacked: true,
         cacheAgeBeforeMs,
         stateFetchedAtMs: Number.isFinite(refreshedAge) ? now() - refreshedAge : now(),
@@ -139,7 +144,7 @@ async function loadFreshBuyPoolState({
   if (!state) throw new Error('pool state RPC returned no state');
   return {
     state,
-    stateSource: 'rpc',
+    stateSource: forceRefresh ? 'rpc_forced' : 'rpc',
     cacheBacked: false,
     cacheAgeBeforeMs,
     stateFetchedAtMs: now(),

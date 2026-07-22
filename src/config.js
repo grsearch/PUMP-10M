@@ -159,8 +159,9 @@ const config = {
     defenseProfitActivatePct: parseFloat(process.env.DEFENSE_PROFIT_ACTIVATE_PCT || '0'),
 
     // 滑点
-    // BUY_SLIPPAGE_BPS is only the absolute on-chain ceiling. Executor narrows
-    // it per order so the fill can never exceed the signal-price cap below.
+    // BUY_SLIPPAGE_BPS limits how far the minimum token output may be relaxed.
+    // BUYs use buy_exact_quote_in, so the SOL input is always fixed. Executor
+    // narrows this tolerance per order to stay inside the signal-price cap.
     buySlippageBps: Math.min(5000, parseInt(process.env.BUY_SLIPPAGE_BPS || '5000', 10)), // hard-capped at 50%
     buyMaxPriceDeviationPct: parseFloat(process.env.BUY_MAX_PRICE_DEVIATION_PCT || '15'),
     buyMaxPoolStateAgeMs: parseInt(process.env.BUY_MAX_POOL_STATE_AGE_MS || '500', 10),
