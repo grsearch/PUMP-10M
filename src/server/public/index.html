@@ -487,13 +487,8 @@ async function refreshStatus() {
   $('modeBadge').className = 'badge ' + (r.dryRun ? 'dry' : 'live');
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
-  const isRsiMode = r.config.activityEntryMode === 'RSI_CROSS_15S';
-  $('stat-volume1m').textContent = isRsiMode
-    ? `>= ${fmtMoney(r.config.rsi15sMinVolume60sUsd)}`
-    : '配置错误';
-  $('stat-trades1m').textContent = isRsiMode
-    ? `RSI(${r.config.rsi15sPeriod}) ↑ ${r.config.rsi15sEntryThreshold}`
-    : `错误: ${r.config.activityEntryMode || 'UNKNOWN'}`;
+  $('stat-volume1m').textContent = `>= ${fmtMoney(r.config.rsi15sMinVolume60sUsd)}`;
+  $('stat-trades1m').textContent = `RSI(${r.config.rsi15sPeriod}) ↑ ${r.config.rsi15sEntryThreshold}`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-tp').textContent = r.config.takeProfitPct > 0 ? '+' + r.config.takeProfitPct + '%' : '关闭';
   $('stat-hold').textContent = r.config.maxHoldMs / 1000 + 's';
@@ -756,12 +751,6 @@ async function refreshSignals() {
   const summary = r.summary || {};
   const thresholds = r.thresholds || {};
   const rows = r.candidates || [];
-  if (r.mode !== 'RSI_CROSS_15S') {
-    meta.innerHTML = `<span class="neg">配置错误：后端模式为 ${escapeHtml(r.mode || '未知')}，应为 RSI_CROSS_15S；请更新运行环境并重启服务</span>`;
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">已停止展示旧策略指标，等待后端切换到 15s RSI</td></tr>';
-    return;
-  }
-
   const exitOverbought = thresholds.exitOverbought ?? 80;
   const exitCrossDown = thresholds.exitCrossDown ?? 70;
   const trailingActivate = thresholds.trailingActivatePct ?? 30;

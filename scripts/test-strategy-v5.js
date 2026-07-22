@@ -288,9 +288,6 @@ function runSlippageTests() {
   assert.strictEqual(config.strategy.maxHoldMs, 300_000);
   assert.strictEqual(config.activityFlow.minPoolQuoteSol, undefined);
   assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_15S');
-  assert.strictEqual(config.activityFlow.pullbackShadowOnly, false);
-  assert.strictEqual(config.activityFlow.pullbackMinVolumeUsd, 20_000);
-  assert.strictEqual(config.activityFlow.pullbackMaxVolumeUsd, 50_000);
   assert.strictEqual(config.activityFlow.breadthMinUniqueBuyers1m, 100);
   assert.strictEqual(config.activityFlow.breadthMinNewBuyers1m, 40);
   assert.strictEqual(config.activityFlow.breadthMaxAvgBuyPerWallet5sSol, 0.4);

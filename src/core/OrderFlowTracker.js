@@ -3,8 +3,6 @@
 const EventEmitter = require('events');
 const { config } = require('../config');
 const { evaluateFlowAccelerationEntry } = require('./FlowCandleStrategy');
-const { estimateBuySlippageFromQuoteReservePct } = require('./ExecutionMath');
-const { normalizeUnixMs } = require('../utils/migrationTime');
 
 function boolEnv(name, fallback) {
   const raw = process.env[name];
@@ -61,8 +59,7 @@ class OrderFlowTracker extends EventEmitter {
       boolEnv('ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL', boolEnv('ORDER_FLOW_REPLACE_DUMP_SIGNAL', true));
 
     const requestedEntryMode = String(
-      (opts.entryMode ?? flowConfig.entryMode ?? process.env.ACTIVITY_FLOW_ENTRY_MODE ?? 'RSI_CROSS_15S') ||
-        'RSI_CROSS_15S',
+      (opts.entryMode ?? flowConfig.entryMode ?? 'RSI_CROSS_15S') || 'RSI_CROSS_15S',
     ).toUpperCase();
     // Existing production .env files still name V5. Remap them so deployment cannot silently keep old entry rules.
     this.entryMode = requestedEntryMode === 'ACTIVITY_BURST_V5' ? 'BREADTH_BURST_V6' : requestedEntryMode;
@@ -76,53 +73,6 @@ class OrderFlowTracker extends EventEmitter {
       opts.rsi15sMinVolume60sUsd ??
       flowConfig.rsi15sMinVolume60sUsd ??
       numEnv('RSI_15S_MIN_VOLUME_60S_USD', 5_000);
-    this.pullbackShadowOnly =
-      opts.pullbackShadowOnly ?? flowConfig.pullbackShadowOnly ?? boolEnv('TEN_MIN_PULLBACK_SHADOW_ONLY', false);
-    this.pullbackReferenceAgeMs =
-      opts.pullbackReferenceAgeMs ??
-      flowConfig.pullbackReferenceAgeMs ??
-      numEnv('TEN_MIN_PULLBACK_REFERENCE_AGE_MS', 600_000);
-    this.pullbackMaxWaitMs =
-      opts.pullbackMaxWaitMs ??
-      flowConfig.pullbackMaxWaitMs ??
-      numEnv('TEN_MIN_PULLBACK_MAX_WAIT_MS', 300_000);
-    this.pullbackMaxFirstSeenDelayMs =
-      opts.pullbackMaxFirstSeenDelayMs ??
-      flowConfig.pullbackMaxFirstSeenDelayMs ??
-      numEnv('TEN_MIN_PULLBACK_MAX_FIRST_SEEN_DELAY_MS', 60_000);
-    this.pullbackMinVolumeUsd =
-      opts.pullbackMinVolumeUsd ??
-      flowConfig.pullbackMinVolumeUsd ??
-      numEnv('TEN_MIN_PULLBACK_MIN_VOLUME_USD', 20_000);
-    this.pullbackMaxVolumeUsd =
-      opts.pullbackMaxVolumeUsd ??
-      flowConfig.pullbackMaxVolumeUsd ??
-      numEnv('TEN_MIN_PULLBACK_MAX_VOLUME_USD', 50_000);
-    this.pullbackMinDrawdownPct =
-      opts.pullbackMinDrawdownPct ??
-      flowConfig.pullbackMinDrawdownPct ??
-      numEnv('TEN_MIN_PULLBACK_MIN_DRAWDOWN_PCT', 10);
-    this.pullbackMinReboundPct =
-      opts.pullbackMinReboundPct ??
-      flowConfig.pullbackMinReboundPct ??
-      numEnv('TEN_MIN_PULLBACK_MIN_REBOUND_PCT', 5);
-    this.pullbackMaxPriceVsReferencePct =
-      opts.pullbackMaxPriceVsReferencePct ??
-      flowConfig.pullbackMaxPriceVsReferencePct ??
-      numEnv('TEN_MIN_PULLBACK_MAX_PRICE_VS_REFERENCE_PCT', 0);
-    this.pullbackFlowWindowMs =
-      opts.pullbackFlowWindowMs ??
-      flowConfig.pullbackFlowWindowMs ??
-      numEnv('TEN_MIN_PULLBACK_FLOW_WINDOW_MS', 15_000);
-    this.pullbackMinUniqueBuyers =
-      opts.pullbackMinUniqueBuyers ??
-      flowConfig.pullbackMinUniqueBuyers ??
-      numEnv('TEN_MIN_PULLBACK_MIN_UNIQUE_BUYERS', 2);
-    this.pullbackMaxEstimatedSlippagePct =
-      opts.pullbackMaxEstimatedSlippagePct ??
-      flowConfig.pullbackMaxEstimatedSlippagePct ??
-      numEnv('TEN_MIN_PULLBACK_MAX_ESTIMATED_SLIPPAGE_PCT', config.strategy.buyMaxEstimatedSlippagePct || 5);
-    this.positionSizeSol = opts.positionSizeSol ?? config.strategy.positionSizeSol;
     this.minVolume1mUsd =
       opts.minVolume1mUsd ?? flowConfig.minVolume1mUsd ?? numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
     this.minVolume1mSol =
@@ -355,12 +305,7 @@ class OrderFlowTracker extends EventEmitter {
   }
 
   handleVolumeSwap(swap) {
-    if (
-      !this.enabled ||
-      (this.entryMode !== 'TEN_MIN_PULLBACK' && this.entryMode !== 'RSI_CROSS_15S') ||
-      !swap ||
-      !swap.mint
-    ) return;
+    if (!this.enabled || this.entryMode !== 'RSI_CROSS_15S' || !swap || !swap.mint) return;
     const side = String(swap.side || '').toUpperCase();
     const solVolume = Number(swap.solVolume);
     if ((side !== 'BUY' && side !== 'SELL') || !Number.isFinite(solVolume) || solVolume <= 0) return;
@@ -376,11 +321,7 @@ class OrderFlowTracker extends EventEmitter {
     const state = this._stateOf(ev.mint);
     if (state.firstSeenTs == null) state.firstSeenTs = ev.ts;
     state.symbol = ev.symbol || state.symbol;
-    if (this.entryMode === 'TEN_MIN_PULLBACK') {
-      this._recordTenMinutePullbackObservation(state, ev);
-    } else {
-      this._recordRsi15sVolume(state, ev);
-    }
+    this._recordRsi15sVolume(state, ev);
   }
 
   updateRsiSnapshot(mint, snapshot) {
@@ -430,9 +371,7 @@ class OrderFlowTracker extends EventEmitter {
 
     const state = this._stateOf(ev.mint);
     if (state.firstSeenTs == null) state.firstSeenTs = ev.ts;
-    if (this.entryMode === 'TEN_MIN_PULLBACK') {
-      this._recordTenMinutePullbackObservation(state, ev);
-    } else if (this.entryMode === 'RSI_CROSS_15S') {
+    if (this.entryMode === 'RSI_CROSS_15S') {
       this._recordRsi15sVolume(state, ev);
     }
     state.events.push(ev);
@@ -449,7 +388,6 @@ class OrderFlowTracker extends EventEmitter {
       this.entryMode === 'FLOW_ACCEL_15S' ||
       this.entryMode === 'ACTIVITY_BURST_V5' ||
       this.entryMode === 'BREADTH_BURST_V6' ||
-      this.entryMode === 'TEN_MIN_PULLBACK' ||
       this.entryMode === 'RSI_CROSS_15S' ||
       ev.side === 'BUY'
     ) {
@@ -467,10 +405,6 @@ class OrderFlowTracker extends EventEmitter {
     if (this.entryMode === 'RSI_CROSS_15S') {
       return this._getRsi15sCandidates(limit, now);
     }
-    if (this.entryMode === 'TEN_MIN_PULLBACK') {
-      return this._getTenMinutePullbackCandidates(limit, now);
-    }
-
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
     const candidates = [];
     const summary = {
@@ -650,103 +584,6 @@ class OrderFlowTracker extends EventEmitter {
     };
   }
 
-  _getTenMinutePullbackCandidates(limit = 100, now = Date.now()) {
-    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
-    const candidates = [];
-    const summary = {
-      active: 0,
-      collecting: 0,
-      volumeReady: 0,
-      waiting: 0,
-      signaled: 0,
-      expired: 0,
-      ineligible: 0,
-    };
-
-    for (const [mint, state] of this.states) {
-      const latest = state.events[state.events.length - 1];
-      if (!latest) continue;
-
-      const migrationAgeMs = state.migrationTs == null ? null : Math.max(0, now - state.migrationTs);
-      const volumeUsd = state.pullbackWindowFinalized
-        ? state.pullbackVolumeUsd
-        : state.first10mVolumeSol * this.solPriceUsd;
-      let stage = state.pullbackStatus || 'monitoring';
-      if (
-        stage === 'waiting' &&
-        state.pullbackWaitUntil != null &&
-        now > state.pullbackWaitUntil
-      ) {
-        stage = 'expired';
-      }
-
-      summary.active++;
-      if (Object.prototype.hasOwnProperty.call(summary, stage)) summary[stage]++;
-      if (
-        state.pullbackWindowFinalized &&
-        Number.isFinite(volumeUsd) &&
-        volumeUsd >= this.pullbackMinVolumeUsd &&
-        volumeUsd <= this.pullbackMaxVolumeUsd
-      ) {
-        summary.volumeReady++;
-      }
-
-      candidates.push({
-        mint,
-        symbol: state.symbol || null,
-        updatedAt: latest.ts,
-        ageMs: Math.max(0, now - latest.ts),
-        migrationAgeMs,
-        stage,
-        firstSeenDelayMs: state.pullbackFirstSeenDelayMs,
-        ineligibleReason: state.pullbackIneligibleReason,
-        waitReason: state.pullbackLastWaitReason,
-        referencePrice: state.referencePrice,
-        referencePriceTs: state.referencePriceTs,
-        waitUntil: state.pullbackWaitUntil,
-        volume10mSol: round(state.first10mVolumeSol, 4),
-        volume10mUsd: round(volumeUsd, 2),
-        lowPrice: state.pullbackLowPrice,
-        conditions: state.pullbackLastConditions || {},
-        metrics: state.pullbackLastMetrics || {},
-      });
-    }
-
-    const stageRank = {
-      signaled: 6,
-      waiting: 5,
-      collecting: 4,
-      expired: 2,
-      ineligible: 1,
-      monitoring: 0,
-    };
-    candidates.sort((a, b) =>
-      ((stageRank[b.stage] || 0) - (stageRank[a.stage] || 0)) ||
-      (b.volume10mUsd - a.volume10mUsd) ||
-      (b.updatedAt - a.updatedAt));
-
-    return {
-      mode: this.entryMode,
-      shadowOnly: this.pullbackShadowOnly,
-      now,
-      thresholds: {
-        referenceAgeMs: this.pullbackReferenceAgeMs,
-        maxWaitMs: this.pullbackMaxWaitMs,
-        maxFirstSeenDelayMs: this.pullbackMaxFirstSeenDelayMs,
-        minVolume10mUsd: this.pullbackMinVolumeUsd,
-        maxVolume10mUsd: this.pullbackMaxVolumeUsd,
-        minDrawdownPct: this.pullbackMinDrawdownPct,
-        minReboundPct: this.pullbackMinReboundPct,
-        maxPriceVsReferencePct: this.pullbackMaxPriceVsReferencePct,
-        flowWindowMs: this.pullbackFlowWindowMs,
-        minUniqueBuyers: this.pullbackMinUniqueBuyers,
-        maxEstimatedSlippagePct: this.pullbackMaxEstimatedSlippagePct,
-      },
-      summary,
-      candidates: candidates.slice(0, safeLimit),
-    };
-  }
-
   _getRsi15sCandidates(limit = 100, now = Date.now()) {
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
     const candidates = [];
@@ -839,24 +676,6 @@ class OrderFlowTracker extends EventEmitter {
         lastV5SignalTs: null,
         firstBuySeen: new Map(),
         lastWalletPruneTs: 0,
-        pullbackInitialized: false,
-        migrationTs: null,
-        pullbackFirstSeenDelayMs: null,
-        pullbackStatus: 'monitoring',
-        pullbackIneligibleReason: null,
-        first10mVolumeSol: 0,
-        referencePrice: null,
-        referencePriceTs: null,
-        pullbackWindowFinalized: false,
-        pullbackVolumeUsd: null,
-        pullbackWaitUntil: null,
-        pullbackLowPrice: null,
-        pullbackLowTs: null,
-        pullbackSeenAt: null,
-        pullbackLastConditions: null,
-        pullbackLastMetrics: null,
-        pullbackLastWaitReason: null,
-        pullbackSignalTs: null,
         rsiVolumeEvents: [],
         rsiVolumeBuckets: new Map(),
         rsi15sSnapshot: null,
@@ -968,201 +787,6 @@ class OrderFlowTracker extends EventEmitter {
       volatilityPct: stddev(returns),
       lastSide: last ? last.side : null,
     };
-  }
-
-  _recordTenMinutePullbackObservation(state, ev) {
-    if (!state.pullbackInitialized) {
-      state.pullbackInitialized = true;
-      const tokenInfo = this.tokenRegistry ? this.tokenRegistry.getToken(ev.mint) : null;
-      const migrationTs = normalizeUnixMs(tokenInfo?.migration_time);
-      state.migrationTs = migrationTs;
-
-      if (migrationTs == null) {
-        state.pullbackStatus = 'ineligible';
-        state.pullbackIneligibleReason = 'migration time unavailable';
-        return;
-      }
-
-      const firstSeenDelayMs = ev.ts - migrationTs;
-      state.pullbackFirstSeenDelayMs = firstSeenDelayMs;
-      if (firstSeenDelayMs < -5_000 || firstSeenDelayMs > this.pullbackMaxFirstSeenDelayMs) {
-        state.pullbackStatus = 'ineligible';
-        state.pullbackIneligibleReason =
-          `first eligible swap delay ${firstSeenDelayMs}ms outside ` +
-          `[-5000, ${this.pullbackMaxFirstSeenDelayMs}]ms`;
-        return;
-      }
-
-      state.pullbackStatus = 'collecting';
-    }
-
-    if (state.pullbackStatus !== 'collecting' || state.migrationTs == null) return;
-    const referenceTs = state.migrationTs + this.pullbackReferenceAgeMs;
-    if (ev.ts <= referenceTs) {
-      state.first10mVolumeSol += ev.solVolume;
-      if (Number.isFinite(ev.price) && ev.price > 0) {
-        state.referencePrice = ev.price;
-        state.referencePriceTs = ev.ts;
-      }
-    }
-  }
-
-  _tryTenMinutePullback(state, ev) {
-    if (!state.pullbackInitialized || state.pullbackStatus === 'ineligible') return;
-    if (state.migrationTs == null || state.referencePrice == null || state.referencePrice <= 0) return;
-
-    const referenceTs = state.migrationTs + this.pullbackReferenceAgeMs;
-    if (ev.ts <= referenceTs) return;
-
-    if (!state.pullbackWindowFinalized) {
-      state.pullbackWindowFinalized = true;
-      state.pullbackVolumeUsd = state.first10mVolumeSol * this.solPriceUsd;
-      state.pullbackWaitUntil = referenceTs + this.pullbackMaxWaitMs;
-      const volumeReady =
-        state.pullbackVolumeUsd >= this.pullbackMinVolumeUsd &&
-        state.pullbackVolumeUsd <= this.pullbackMaxVolumeUsd;
-      if (!volumeReady) {
-        state.pullbackStatus = 'ineligible';
-        state.pullbackIneligibleReason =
-          `10m volume $${state.pullbackVolumeUsd.toFixed(2)} outside ` +
-          `$${this.pullbackMinVolumeUsd}-$${this.pullbackMaxVolumeUsd}`;
-        return;
-      }
-      state.pullbackStatus = 'waiting';
-    }
-
-    if (state.pullbackStatus === 'signaled' || state.pullbackStatus === 'expired') return;
-    if (ev.ts > state.pullbackWaitUntil) {
-      state.pullbackStatus = 'expired';
-      state.pullbackLastWaitReason = 'five-minute recovery window expired';
-      return;
-    }
-
-    if (state.pullbackLowPrice == null || ev.price < state.pullbackLowPrice) {
-      state.pullbackLowPrice = ev.price;
-      state.pullbackLowTs = ev.ts;
-    }
-
-    const drawdownPct = ((state.referencePrice - state.pullbackLowPrice) / state.referencePrice) * 100;
-    if (drawdownPct >= this.pullbackMinDrawdownPct && state.pullbackSeenAt == null) {
-      state.pullbackSeenAt = ev.ts;
-    }
-    const reboundPct = ((ev.price - state.pullbackLowPrice) / state.pullbackLowPrice) * 100;
-    const priceVsReferencePct = ((ev.price - state.referencePrice) / state.referencePrice) * 100;
-    const s15 = this._stats(state, ev.ts, this.pullbackFlowWindowMs);
-    const poolQuoteSol = ev.poolQuoteAfter || state.lastPoolQuoteAfter || null;
-    const estimatedSlippagePct = estimateBuySlippageFromQuoteReservePct(
-      poolQuoteSol,
-      this.positionSizeSol,
-    );
-    const conditions = {
-      completeFirst10m: state.pullbackFirstSeenDelayMs <= this.pullbackMaxFirstSeenDelayMs,
-      volume10m:
-        state.pullbackVolumeUsd >= this.pullbackMinVolumeUsd &&
-        state.pullbackVolumeUsd <= this.pullbackMaxVolumeUsd,
-      pullback: drawdownPct >= this.pullbackMinDrawdownPct,
-      rebound: reboundPct >= this.pullbackMinReboundPct,
-      atOrBelowReference: priceVsReferencePct <= this.pullbackMaxPriceVsReferencePct,
-      buyFlow15s: s15.buySol > s15.sellSol,
-      buyers15s: s15.uniqueBuyers >= this.pullbackMinUniqueBuyers,
-      slippage:
-        estimatedSlippagePct != null &&
-        estimatedSlippagePct <= this.pullbackMaxEstimatedSlippagePct,
-    };
-    const metrics = {
-      migrationAgeMs: ev.ts - state.migrationTs,
-      volume10mSol: round(state.first10mVolumeSol, 4),
-      volume10mUsd: round(state.pullbackVolumeUsd, 2),
-      referencePrice: state.referencePrice,
-      lowPrice: state.pullbackLowPrice,
-      currentPrice: ev.price,
-      drawdownPct: round(drawdownPct, 3),
-      reboundPct: round(reboundPct, 3),
-      priceVsReferencePct: round(priceVsReferencePct, 3),
-      buyVolume15sSol: round(s15.buySol, 4),
-      sellVolume15sSol: round(s15.sellSol, 4),
-      uniqueBuyers15s: s15.uniqueBuyers,
-      poolQuoteSol: round(poolQuoteSol, 4),
-      estimatedSlippagePct:
-        estimatedSlippagePct == null ? null : round(estimatedSlippagePct, 3),
-    };
-    state.pullbackLastConditions = conditions;
-    state.pullbackLastMetrics = metrics;
-
-    const waitReasons = [];
-    if (!conditions.pullback) waitReasons.push(`pullback ${drawdownPct.toFixed(2)}%<${this.pullbackMinDrawdownPct}%`);
-    if (!conditions.rebound) waitReasons.push(`rebound ${reboundPct.toFixed(2)}%<${this.pullbackMinReboundPct}%`);
-    if (!conditions.atOrBelowReference) {
-      waitReasons.push(`price vs reference ${priceVsReferencePct.toFixed(2)}%>${this.pullbackMaxPriceVsReferencePct}%`);
-    }
-    if (!conditions.buyFlow15s) waitReasons.push('15s buy volume <= sell volume');
-    if (!conditions.buyers15s) waitReasons.push(`15s buyers ${s15.uniqueBuyers}<${this.pullbackMinUniqueBuyers}`);
-    if (!conditions.slippage) {
-      waitReasons.push(
-        estimatedSlippagePct == null
-          ? 'estimated slippage unavailable'
-          : `estimated slippage ${estimatedSlippagePct.toFixed(2)}%>${this.pullbackMaxEstimatedSlippagePct}%`,
-      );
-    }
-    state.pullbackLastWaitReason = waitReasons.join('; ') || null;
-
-    if (!Object.values(conditions).every(Boolean)) return;
-    this._emitTenMinutePullbackSignal(state, ev, s15, metrics, conditions, poolQuoteSol);
-  }
-
-  _emitTenMinutePullbackSignal(state, ev, s15, metrics, conditions, poolQuoteSol) {
-    const entry = {
-      ...metrics,
-      conditions: { ...conditions },
-      shadowOnly: this.pullbackShadowOnly,
-      referencePriceTs: state.referencePriceTs,
-      pullbackLowTs: state.pullbackLowTs,
-    };
-    const flow = {
-      s15: this._compactStats(s15),
-      entry10mPullback: entry,
-    };
-    const signal = {
-      mint: ev.mint,
-      symbol: state.symbol || ev.symbol,
-      sellSol: round(s15.sellSol, 4),
-      priceImpactPct: metrics.drawdownPct,
-      poolQuoteAfter: poolQuoteSol,
-      poolQuoteSol,
-      seller: null,
-      signature: `ten_min_pullback:${ev.signature || `${ev.mint}:${ev.ts}`}`,
-      ts: ev.ts,
-      slot: ev.slot || 0,
-      poolAddress: ev.poolAddress || state.poolAddress,
-      priceAfter: ev.price,
-      priceBefore: state.referencePrice,
-      _aggregated: true,
-      _activityFlow: true,
-      _tenMinutePullback: true,
-      _shadowOnly: this.pullbackShadowOnly,
-      _sellCount: s15.sellCount,
-      _sellCount10s: s15.sellCount,
-      _totalSellSol10s: round(s15.sellSol, 4),
-      _sellers: [...new Set(s15.events.filter((x) => x.side === 'SELL').map((x) => x.signer).filter(Boolean))],
-      _flow: flow,
-      _flowPattern: entry,
-    };
-
-    state.pullbackStatus = 'signaled';
-    state.pullbackSignalTs = ev.ts;
-    state.lastV5SignalTs = ev.ts;
-    state.pullbackLastWaitReason = null;
-    this.cooldowns.set(ev.mint, Date.now() + this.cooldownMs);
-    console.log(
-      `[ActivityFlow] ${this.pullbackShadowOnly ? 'SHADOW' : 'BUY_CONFIRM'} ` +
-        `${signal.symbol || ev.mint.slice(0, 6)} mode=${this.entryMode} ` +
-        `age=${(metrics.migrationAgeMs / 60_000).toFixed(2)}m ` +
-        `vol10m=$${metrics.volume10mUsd.toFixed(0)} ` +
-        `drawdown=${metrics.drawdownPct.toFixed(2)}% rebound=${metrics.reboundPct.toFixed(2)}% ` +
-        `flow15=${metrics.buyVolume15sSol.toFixed(2)}/${metrics.sellVolume15sSol.toFixed(2)}SOL ` +
-        `buyers=${metrics.uniqueBuyers15s} slip~${metrics.estimatedSlippagePct.toFixed(2)}%`,
-    );
-    this.emit(this.pullbackShadowOnly ? 'shadowSignal' : 'flowReversalSignal', signal);
   }
 
   _breadthMetrics(s5, s10, s60, historyAgeMs = Number.POSITIVE_INFINITY) {
@@ -1363,11 +987,6 @@ class OrderFlowTracker extends EventEmitter {
 
     if (this.entryMode === 'RSI_CROSS_15S') {
       this._tryRsiCross15s(state, ev);
-      return;
-    }
-
-    if (this.entryMode === 'TEN_MIN_PULLBACK') {
-      this._tryTenMinutePullback(state, ev);
       return;
     }
 

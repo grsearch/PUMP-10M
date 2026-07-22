@@ -51,34 +51,12 @@ async function main() {
       ? `> ${config.strategy.rsi15sOverboughtExit} or cross below ${config.strategy.rsi15sCrossDownExit}`
       : 'disabled'}`,
   );
-  if (config.activityFlow.entryMode === 'RSI_CROSS_15S') {
-    console.log(
-      `Entry: RSI(${config.activityFlow.rsi15sPeriod},15s) cross above ` +
-        `${config.activityFlow.rsi15sEntryThreshold}, trailing ` +
-        `${config.activityFlow.rsi15sVolumeWindowMs / 1000}s volume>=` +
-        `$${config.activityFlow.rsi15sMinVolume60sUsd}, buy next tradable candle open`,
-    );
-  } else if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
-    console.log(
-      `Entry: ACTIVITY_FLOW (TEN_MIN_PULLBACK: first 10m ` +
-        `$${config.activityFlow.pullbackMinVolumeUsd}-$${config.activityFlow.pullbackMaxVolumeUsd}, ` +
-        `pullback>=${config.activityFlow.pullbackMinDrawdownPct}%, ` +
-        `rebound>=${config.activityFlow.pullbackMinReboundPct}%, ` +
-        `15s buyers>=${config.activityFlow.pullbackMinUniqueBuyers}, ` +
-        `slippage<=${config.activityFlow.pullbackMaxEstimatedSlippagePct}%, ` +
-        `${config.activityFlow.pullbackShadowOnly ? 'SHADOW ONLY' : 'LIVE'})`,
-    );
-  } else {
-    console.log(
-      `Entry: ACTIVITY_FLOW ` +
-        `(${config.activityFlow.entryMode}: 1m volume>=${config.activityFlow.minVolume1mSol.toFixed(2)}SOL ` +
-        `(~$${Math.round(config.activityFlow.minVolume1mUsd)}), ` +
-        `buyers>=${config.activityFlow.breadthMinUniqueBuyers1m}, ` +
-        `newBuyers>=${config.activityFlow.breadthMinNewBuyers1m}, ` +
-        `avgBuy5<=${config.activityFlow.breadthMaxAvgBuyPerWallet5sSol}SOL, ` +
-        `support>=${config.activityFlow.breadthMinConfirmations}/5 + 2x confirmation)`,
-    );
-  }
+  console.log(
+    `Entry: RSI(${config.activityFlow.rsi15sPeriod},15s) cross above ` +
+      `${config.activityFlow.rsi15sEntryThreshold}, trailing ` +
+      `${config.activityFlow.rsi15sVolumeWindowMs / 1000}s volume>=` +
+      `$${config.activityFlow.rsi15sMinVolume60sUsd}, buy next tradable candle open`,
+  );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
       `(2 closed 15s net-flow values, + to -` +
@@ -252,46 +230,14 @@ async function main() {
       `jump<=${swapSanitizer.maxJumpRatio}x market<=${swapSanitizer.marketMaxRatio}x ` +
       `independentSources>=${swapSanitizer.confirmMinIndependentSources}`,
   );
-  if (activityFlowTracker.entryMode === 'RSI_CROSS_15S') {
-    console.log(
-      `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
-        `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi15sPeriod}) ` +
-        `cross>${activityFlowTracker.rsi15sEntryThreshold} ` +
-        `vol${activityFlowTracker.rsi15sVolumeWindowMs / 1000}s>=` +
-        `$${activityFlowTracker.rsi15sMinVolume60sUsd} next-tradable-open ` +
-        `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
-    );
-  } else if (activityFlowTracker.entryMode === 'TEN_MIN_PULLBACK') {
-    console.log(
-      `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
-        `mode=${activityFlowTracker.entryMode} ` +
-        `firstSeen<=${activityFlowTracker.pullbackMaxFirstSeenDelayMs / 1000}s ` +
-        `vol10m=$${activityFlowTracker.pullbackMinVolumeUsd}-$${activityFlowTracker.pullbackMaxVolumeUsd} ` +
-        `wait=${activityFlowTracker.pullbackMaxWaitMs / 1000}s ` +
-        `pullback>=${activityFlowTracker.pullbackMinDrawdownPct}% ` +
-        `rebound>=${activityFlowTracker.pullbackMinReboundPct}% ` +
-        `flow=${activityFlowTracker.pullbackFlowWindowMs / 1000}s ` +
-        `buyers>=${activityFlowTracker.pullbackMinUniqueBuyers} ` +
-        `slippage<=${activityFlowTracker.pullbackMaxEstimatedSlippagePct}% ` +
-        `shadow=${activityFlowTracker.pullbackShadowOnly} ` +
-        `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
-    );
-  } else {
-    console.log(
-      `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
-        `mode=${activityFlowTracker.entryMode} ` +
-        `1m>=${activityFlowTracker.minVolume1mSol.toFixed(2)}SOL(~$${Math.round(activityFlowTracker.minVolume1mUsd)}) ` +
-        `arm=${activityFlowTracker.armWindowMs / 1000}s ` +
-        `buyers>=${activityFlowTracker.breadthMinUniqueBuyers1m} ` +
-        `newBuyers>=${activityFlowTracker.breadthMinNewBuyers1m} ` +
-        `avgBuy5<=${activityFlowTracker.breadthMaxAvgBuyPerWallet5sSol}SOL ` +
-        `price60<=${activityFlowTracker.breadthMaxPriceChange60sPct}% ` +
-        `entry=breadth-score-${activityFlowTracker.breadthMinConfirmations}/5+2x-confirm ` +
-        `warmup=${activityFlowTracker.breadthWarmupMs / 1000}s ` +
-        `cooldown=${activityFlowTracker.breadthCooldownMs / 1000}s ` +
-        `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
-    );
-  }
+  console.log(
+    `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
+      `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi15sPeriod}) ` +
+      `cross>${activityFlowTracker.rsi15sEntryThreshold} ` +
+      `vol${activityFlowTracker.rsi15sVolumeWindowMs / 1000}s>=` +
+      `$${activityFlowTracker.rsi15sMinVolume60sUsd} next-tradable-open ` +
+      `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
+  );
   console.log(
     `[main] StrategyLab ${featureRecorder.enabled ? 'enabled' : 'disabled'}: ` +
       `snapshot=${featureRecorder.snapshotIntervalMs}ms ` +
@@ -313,9 +259,8 @@ async function main() {
         console.warn(`[FlowExit] handleSwap failed: ${err.message}`);
       }
     } else {
-      // The ten-minute gate is based on true traded volume. Price-ineligible
-      // sanitized events still retain valid volume, so count them without
-      // letting their untrusted price enter the pullback/flow calculation.
+      // Price-ineligible sanitized events still retain valid volume, so count
+      // them for the RSI volume gate without accepting the untrusted price.
       try { activityFlowTracker.handleVolumeSwap(swap); } catch (err) {
         console.warn(`[ActivityFlow] handleVolumeSwap failed: ${err.message}`);
       }
@@ -364,27 +309,6 @@ async function main() {
       console.error(`[ActivityFlow] SignalEngine error: ${err.message}`);
     });
   });
-  activityFlowTracker.on('shadowSignal', (signal) => {
-    const entry = signal._flow?.entry10mPullback || {};
-    try {
-      tradeLogger.logSignal({
-        ts: signal.ts,
-        mint: signal.mint,
-        symbol: signal.symbol,
-        kind: 'TEN_MIN_PULLBACK_SHADOW',
-        sellSol: signal.sellSol,
-        priceImpactPct: signal.priceImpactPct,
-        seller: null,
-        sellerTx: signal.signature,
-        notes: JSON.stringify(entry),
-        accepted: false,
-        rejectReason: 'SHADOW_ONLY',
-      });
-    } catch (err) {
-      console.warn(`[ActivityFlow] failed to record shadow signal: ${err.message}`);
-    }
-  });
-
   // ============ 服务器 ============
   const server = new Server({
     tokenRegistry,

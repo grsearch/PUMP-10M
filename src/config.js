@@ -229,36 +229,13 @@ const config = {
       !activityFlowForceDisabled &&
       (process.env.ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL ?? process.env.ORDER_FLOW_REPLACE_DUMP_SIGNAL ?? 'true')
         .toLowerCase() === 'true',
-    entryMode: String(process.env.ACTIVITY_FLOW_ENTRY_MODE || 'RSI_CROSS_15S').toUpperCase(),
+    // The production entry strategy is fixed. Legacy server environment values
+    // are intentionally ignored so stale deployments cannot reactivate removed rules.
+    entryMode: 'RSI_CROSS_15S',
     rsi15sPeriod: parseInt(process.env.RSI_15S_PERIOD || '7', 10),
     rsi15sEntryThreshold: parseFloat(process.env.RSI_15S_ENTRY_THRESHOLD || '30'),
     rsi15sVolumeWindowMs: parseInt(process.env.RSI_15S_VOLUME_WINDOW_MS || '60000', 10),
     rsi15sMinVolume60sUsd: parseFloat(process.env.RSI_15S_MIN_VOLUME_60S_USD || '5000'),
-    // Research entry: observe a complete first 10 minutes after Pump migration,
-    // then wait at most five minutes for a >=10% pullback and >=5% recovery.
-    // Set TEN_MIN_PULLBACK_SHADOW_ONLY=true to record signals without trading.
-    pullbackShadowOnly:
-      (process.env.TEN_MIN_PULLBACK_SHADOW_ONLY ?? 'false').toLowerCase() === 'true',
-    pullbackReferenceAgeMs: parseInt(process.env.TEN_MIN_PULLBACK_REFERENCE_AGE_MS || '600000', 10),
-    pullbackMaxWaitMs: parseInt(process.env.TEN_MIN_PULLBACK_MAX_WAIT_MS || '300000', 10),
-    pullbackMaxFirstSeenDelayMs: parseInt(
-      process.env.TEN_MIN_PULLBACK_MAX_FIRST_SEEN_DELAY_MS || '60000',
-      10,
-    ),
-    pullbackMinVolumeUsd: parseFloat(process.env.TEN_MIN_PULLBACK_MIN_VOLUME_USD || '20000'),
-    pullbackMaxVolumeUsd: parseFloat(process.env.TEN_MIN_PULLBACK_MAX_VOLUME_USD || '50000'),
-    pullbackMinDrawdownPct: parseFloat(process.env.TEN_MIN_PULLBACK_MIN_DRAWDOWN_PCT || '10'),
-    pullbackMinReboundPct: parseFloat(process.env.TEN_MIN_PULLBACK_MIN_REBOUND_PCT || '5'),
-    pullbackMaxPriceVsReferencePct: parseFloat(
-      process.env.TEN_MIN_PULLBACK_MAX_PRICE_VS_REFERENCE_PCT || '0',
-    ),
-    pullbackFlowWindowMs: parseInt(process.env.TEN_MIN_PULLBACK_FLOW_WINDOW_MS || '15000', 10),
-    pullbackMinUniqueBuyers: parseInt(process.env.TEN_MIN_PULLBACK_MIN_UNIQUE_BUYERS || '2', 10),
-    pullbackMaxEstimatedSlippagePct: parseFloat(
-      process.env.TEN_MIN_PULLBACK_MAX_ESTIMATED_SLIPPAGE_PCT ||
-        process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT ||
-        '5',
-    ),
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -613,48 +590,20 @@ function validateConfig() {
   ) {
     errors.push('RSI_15S exit thresholds must satisfy 0 < cross-down < overbought < 100');
   }
-  if (config.activityFlow.entryMode === 'RSI_CROSS_15S') {
-    if (config.activityFlow.rsi15sPeriod < 1) {
-      errors.push('RSI_15S_PERIOD must be >= 1');
-    }
-    if (
-      config.activityFlow.rsi15sEntryThreshold <= 0 ||
-      config.activityFlow.rsi15sEntryThreshold >= 100
-    ) {
-      errors.push('RSI_15S_ENTRY_THRESHOLD must be between 0 and 100');
-    }
-    if (config.activityFlow.rsi15sVolumeWindowMs <= 0) {
-      errors.push('RSI_15S_VOLUME_WINDOW_MS must be > 0');
-    }
-    if (config.activityFlow.rsi15sMinVolume60sUsd <= 0) {
-      errors.push('RSI_15S_MIN_VOLUME_60S_USD must be > 0');
-    }
+  if (config.activityFlow.rsi15sPeriod < 1) {
+    errors.push('RSI_15S_PERIOD must be >= 1');
   }
-  if (config.activityFlow.entryMode === 'TEN_MIN_PULLBACK') {
-    if (config.activityFlow.pullbackReferenceAgeMs <= 0) {
-      errors.push('TEN_MIN_PULLBACK_REFERENCE_AGE_MS must be > 0');
-    }
-    if (config.activityFlow.pullbackMaxWaitMs <= 0) {
-      errors.push('TEN_MIN_PULLBACK_MAX_WAIT_MS must be > 0');
-    }
-    if (
-      config.activityFlow.pullbackMinVolumeUsd <= 0 ||
-      config.activityFlow.pullbackMaxVolumeUsd < config.activityFlow.pullbackMinVolumeUsd
-    ) {
-      errors.push('TEN_MIN_PULLBACK volume range is invalid');
-    }
-    if (config.activityFlow.pullbackMinDrawdownPct <= 0) {
-      errors.push('TEN_MIN_PULLBACK_MIN_DRAWDOWN_PCT must be > 0');
-    }
-    if (config.activityFlow.pullbackMinReboundPct <= 0) {
-      errors.push('TEN_MIN_PULLBACK_MIN_REBOUND_PCT must be > 0');
-    }
-    if (config.activityFlow.pullbackMinUniqueBuyers < 2) {
-      errors.push('TEN_MIN_PULLBACK_MIN_UNIQUE_BUYERS must be >= 2');
-    }
-    if (config.activityFlow.pullbackMaxEstimatedSlippagePct <= 0) {
-      errors.push('TEN_MIN_PULLBACK_MAX_ESTIMATED_SLIPPAGE_PCT must be > 0');
-    }
+  if (
+    config.activityFlow.rsi15sEntryThreshold <= 0 ||
+    config.activityFlow.rsi15sEntryThreshold >= 100
+  ) {
+    errors.push('RSI_15S_ENTRY_THRESHOLD must be between 0 and 100');
+  }
+  if (config.activityFlow.rsi15sVolumeWindowMs <= 0) {
+    errors.push('RSI_15S_VOLUME_WINDOW_MS must be > 0');
+  }
+  if (config.activityFlow.rsi15sMinVolume60sUsd <= 0) {
+    errors.push('RSI_15S_MIN_VOLUME_60S_USD must be > 0');
   }
   return errors;
 }

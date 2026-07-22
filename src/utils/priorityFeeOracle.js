@@ -19,6 +19,7 @@
 const axios = require('axios');
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
+const { resolveComputeUnitLimit } = require('./computeUnitLimit');
 
 const monitor = getMonitor();
 monitor.registerModule('PriorityFeeOracle', { staleMs: 60_000, label: 'Priority Fee Oracle' });
@@ -32,9 +33,7 @@ class PriorityFeeOracle {
   constructor({ cuLimit } = {}) {
     this.rpcUrl = config.helius.rpcUrl;
     // v3.31: CU limit 单一来源 — 由 Executor 注入，保证定价 CU 与 tx 申请 CU 一致。
-    this.cuLimit = (Number.isFinite(cuLimit) && cuLimit > 0)
-      ? cuLimit
-      : parseInt(process.env.COMPUTE_UNIT_LIMIT || '250000', 10);
+    this.cuLimit = resolveComputeUnitLimit(cuLimit);
 
     this._cachedLevels = null; // 最新 levels（内存）
     this._cachedAt = 0;

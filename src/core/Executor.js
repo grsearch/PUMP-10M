@@ -41,6 +41,7 @@ const {
 
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
+const { MIN_COMPUTE_UNIT_LIMIT, resolveComputeUnitLimit } = require('../utils/computeUnitLimit');
 const { estimateBuySlippagePct } = require('./ExecutionMath');
 const {
   calculateBuyPriceGuard,
@@ -180,7 +181,19 @@ class Executor {
     //         配合 BUY_MIN_PRIORITY_FEE 0.04 → 0.067 SOL,μL/CU 仍为 267M
     //   ROI 算法:每笔多花 0.027 SOL priority fee 比每笔白花 0.04 fee 又没买到划算太多
     //   未来优化:不同代币不同 CU(根据历史消耗自动调) — 复杂度高,暂不做
-    this.computeUnitLimit = parseInt(process.env.COMPUTE_UNIT_LIMIT || '250000', 10);
+    const configuredComputeUnitLimit = Number.parseInt(process.env.COMPUTE_UNIT_LIMIT || '', 10);
+    this.computeUnitLimit = resolveComputeUnitLimit(process.env.COMPUTE_UNIT_LIMIT);
+    if (
+      Number.isFinite(configuredComputeUnitLimit) &&
+      configuredComputeUnitLimit > 0 &&
+      configuredComputeUnitLimit < MIN_COMPUTE_UNIT_LIMIT
+    ) {
+      console.warn(
+        `[Executor] COMPUTE_UNIT_LIMIT=${configuredComputeUnitLimit} is below the safe Pump AMM minimum; ` +
+          `clamped to ${this.computeUnitLimit}`,
+      );
+    }
+    console.log(`[Executor] compute unit limit: ${this.computeUnitLimit}`);
 
     // v3.5: 通过 setPoolStateCache 由外部注入（避免循环依赖 TokenRegistry）
     this.poolStateCache = null;
