@@ -26,6 +26,7 @@
     "test:strategy-v6": "node scripts/test-strategy-v5.js",
     "test:ten-minute-pullback": "node scripts/test-ten-minute-pullback.js",
     "test:swap-sanitizer": "node scripts/test-swap-event-sanitizer.js",
+    "test:buy-guard": "node scripts/test-buy-execution-guard.js",
     "test:strategy-lab-schema": "node scripts/test-strategy-lab-schema.js",
     "test:strategy-lab-throughput": "node scripts/test-strategy-lab-throughput.js",
     "test:pump-discovery": "node scripts/test-pump-migration-parser.js",

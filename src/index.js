@@ -85,8 +85,9 @@ async function main() {
   console.log(`No-bounce exit: ${config.strategy.noBounceExitEnabled ? config.strategy.noBounceExitMs / 1000 + 's' : 'disabled'}`);
   console.log(`Max hold: ${config.strategy.maxHoldMs > 0 ? config.strategy.maxHoldMs / 1000 + 's' : 'disabled'}`);
   console.log(
-    `Buy slippage: tolerance=${(config.strategy.buySlippageBps / 100).toFixed(1)}% ` +
-      `estimated<=${config.strategy.buyMaxEstimatedSlippagePct}%`,
+    `Buy guard: chain ceiling=${(config.strategy.buySlippageBps / 100).toFixed(1)}%, ` +
+      `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
+      `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms`,
   );
   console.log('Add-on: disabled');
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
@@ -854,6 +855,7 @@ async function main() {
         symbol: order.symbol,
         sizeSol: order.sizeSol,
         priceAfter: order.priceAfter, // 用于 DRY_RUN 模拟
+        signalPrice: order.priceAfter,
         baseDecimals: order.baseDecimals ?? tokenInfo?.decimals ?? 6,
         poolAddress: tokenInfo?.pool_address, // Pump SDK 需要 pool address
       });
@@ -900,6 +902,7 @@ async function main() {
             reason: order.reason,
             stateLatencyMs: buyResult.stateLatencyMs,
             error: buyResult.error || null,
+            buyDiagnostics: buyResult.buyDiagnostics || null,
           },
         });
       } catch (_) { /* analytics only */ }
@@ -924,6 +927,7 @@ async function main() {
       reason: order.reason,
       latencyMs: buyResult.latencyMs,
       error: buyResult.error,
+      details: buyResult.buyDiagnostics || null,
     });
 
     if (!buyResult.success) {
@@ -933,7 +937,11 @@ async function main() {
       // v3.26: pool dead/low-liquidity/mint-mismatch → 24h 冷却，防止同币反复浪费 fee
       if (buyResult.poolDead || buyResult.poolLowLiquidity || buyResult.poolMintMismatch) {
         const cooldownMs = parseInt(process.env.POOL_FAIL_REBUY_COOLDOWN_MS || '86400000', 10);
-        signalEngine._exitCooldowns.set(order.mint, Date.now() + cooldownMs);
+        signalEngine.setBuyFailureCooldown(
+          order.mint,
+          cooldownMs,
+          buyResult.error || 'POOL_EXECUTION_GUARD',
+        );
         console.log(
           `[main] 🔒 Pool fail cooldown ${order.symbol || order.mint.slice(0, 6)} for ${Math.round(cooldownMs / 3600000)}h (poolDead=${!!buyResult.poolDead} poolLowLiq=${!!buyResult.poolLowLiquidity} mintMismatch=${!!buyResult.poolMintMismatch})`,
         );
@@ -969,6 +977,7 @@ async function main() {
       signature: buyResult.signature,
       buyFeeLamports: buyResult.priorityFeeLamports || 0,  // v3.4: 用于真实 PnL
       buySlot: buyResult.buySlot || 0,  // v3.17.11: BUY 时的链上 slot
+      buyDiagnostics: buyResult.buyDiagnostics || null,
       dumpSlot: order.slot || 0,        // v3.17.19: 砸单的 slot,用于算 BUY 落链领先几个 slot
       entryFdv,                          // v3.17.21: 买入瞬间 FDV
       entryPoolSol,                      // v3.17.21: 买入瞬间池子 SOL

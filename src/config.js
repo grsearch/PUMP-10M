@@ -159,7 +159,11 @@ const config = {
     defenseProfitActivatePct: parseFloat(process.env.DEFENSE_PROFIT_ACTIVATE_PCT || '0'),
 
     // 滑点
-    buySlippageBps: parseInt(process.env.BUY_SLIPPAGE_BPS || '500', 10),  // 5%
+    // BUY_SLIPPAGE_BPS is only the absolute on-chain ceiling. Executor narrows
+    // it per order so the fill can never exceed the signal-price cap below.
+    buySlippageBps: Math.min(5000, parseInt(process.env.BUY_SLIPPAGE_BPS || '5000', 10)), // hard-capped at 50%
+    buyMaxPriceDeviationPct: parseFloat(process.env.BUY_MAX_PRICE_DEVIATION_PCT || '15'),
+    buyMaxPoolStateAgeMs: parseInt(process.env.BUY_MAX_POOL_STATE_AGE_MS || '500', 10),
     buyMaxEstimatedSlippagePct: parseFloat(process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT || '5'),
     sellSlippageBps: parseInt(process.env.SELL_SLIPPAGE_BPS || '2000', 10), // 20%
 
@@ -575,6 +579,21 @@ const config = {
 
 function validateConfig() {
   const errors = [];
+  if (!Number.isFinite(config.strategy.buySlippageBps) || config.strategy.buySlippageBps < 0) {
+    errors.push('BUY_SLIPPAGE_BPS must be >= 0');
+  }
+  if (
+    !Number.isFinite(config.strategy.buyMaxPriceDeviationPct) ||
+    config.strategy.buyMaxPriceDeviationPct < 0
+  ) {
+    errors.push('BUY_MAX_PRICE_DEVIATION_PCT must be >= 0');
+  }
+  if (
+    !Number.isFinite(config.strategy.buyMaxPoolStateAgeMs) ||
+    config.strategy.buyMaxPoolStateAgeMs < 0
+  ) {
+    errors.push('BUY_MAX_POOL_STATE_AGE_MS must be >= 0');
+  }
   if (!config.helius.apiKey) errors.push('HELIUS_API_KEY missing');
   if (!config.helius.rpcUrl) errors.push('HELIUS_RPC_URL missing');
   // v3.17: laserstreamEndpoints 数组非空（旧 _ENDPOINT 也会被收进数组）

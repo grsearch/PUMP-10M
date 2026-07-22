@@ -73,7 +73,8 @@ class TradeLogger {
         dry_run INTEGER NOT NULL DEFAULT 0,
         reason TEXT,
         latency_ms INTEGER,
-        error TEXT
+        error TEXT,
+        details_json TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
       CREATE INDEX IF NOT EXISTS idx_trades_pos ON trades(position_id);
@@ -226,6 +227,9 @@ class TradeLogger {
       ['time_to_peak_ms', 'INTEGER'],
       ['price_tick_count', 'INTEGER'],
       ['pre_vol_5m_pct', 'REAL'],
+    ]);
+    this._ensureColumns('trades', [
+      ['details_json', 'TEXT'],
     ]);
     this._ensureColumns('swap_events', [
       ['source', 'TEXT'],
@@ -517,9 +521,9 @@ ${snapshotColumnsSql},
       insertTrade: this.db.prepare(`
         INSERT INTO trades
           (position_id, ts, mint, symbol, side, sol_amount, token_amount, price, signature,
-           success, dry_run, reason, latency_ms, error)
+           success, dry_run, reason, latency_ms, error, details_json)
         VALUES (@positionId, @ts, @mint, @symbol, @side, @solAmount, @tokenAmount, @price, @signature,
-                @success, @dryRun, @reason, @latencyMs, @error)
+                @success, @dryRun, @reason, @latencyMs, @error, @detailsJson)
       `),
 
       tradesInRange: this.db.prepare(`
@@ -528,6 +532,14 @@ ${snapshotColumnsSql},
 
       recentTrades: this.db.prepare(`
         SELECT * FROM trades ORDER BY ts DESC LIMIT ?
+      `),
+
+      markBuyChainFailed: this.db.prepare(`
+        UPDATE trades
+        SET success = 0,
+            error = @error,
+            details_json = COALESCE(@detailsJson, details_json)
+        WHERE position_id = @positionId AND side = 'BUY'
       `),
 
       // ============ swap_events ============
@@ -863,7 +875,10 @@ ${snapshotColumnsSql},
   // ============================================================
 
   logTrade({ positionId, ts, mint, symbol, side, solAmount, tokenAmount, price, signature,
-             success, dryRun, reason, latencyMs, error }) {
+             success, dryRun, reason, latencyMs, error, details, detailsJson }) {
+    const serializedDetails = detailsJson != null
+      ? detailsJson
+      : (details == null ? null : JSON.stringify(details));
     this.stmts.insertTrade.run({
       positionId: positionId || null,
       ts: ts || Date.now(),
@@ -879,6 +894,16 @@ ${snapshotColumnsSql},
       reason: reason || null,
       latencyMs: latencyMs ?? null,
       error: error || null,
+      detailsJson: serializedDetails,
+    });
+  }
+
+  markBuyChainFailed(positionId, error, details = null) {
+    if (!positionId) return;
+    this.stmts.markBuyChainFailed.run({
+      positionId,
+      error: error || 'BUY_CHAIN_FAILED',
+      detailsJson: details == null ? null : JSON.stringify(details),
     });
   }
 

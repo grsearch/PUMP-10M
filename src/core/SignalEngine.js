@@ -57,6 +57,9 @@ class SignalEngine extends EventEmitter {
     this.triggeredSellerMintPairs = new Map();
     // v3.24: 同币卖出后冷却 — 避免短时间重复买入同一币
     this._exitCooldowns = new Map(); // mint → cooldownExpireAt
+    // Execution-failure protection is independent of the optional post-sale
+    // cooldown. It is always enforced after BUY_CHAIN_FAILED/pool failures.
+    this._buyFailureCooldowns = new Map(); // mint → { expireAt, reason }
 
     // v3.17.15: 同卖家短期累计卖出追踪
     //   同一卖家可能拆分多笔 tx 砸盘，每笔 < MIN_SELL_SOL 但合计 > MIN_SELL_SOL
@@ -127,6 +130,12 @@ class SignalEngine extends EventEmitter {
         cleaned += 1;
       }
     }
+    for (const [mint, protection] of this._buyFailureCooldowns) {
+      if (!protection || protection.expireAt <= now) {
+        this._buyFailureCooldowns.delete(mint);
+        cleaned += 1;
+      }
+    }
     // v3.17.15: 清理过期的卖家累计卖出
     for (const [key, sells] of this.sellerRecentSells) {
       const cutoff = Date.now() - 30_000;
@@ -151,6 +160,27 @@ class SignalEngine extends EventEmitter {
   }
   markBuyDone(mint) {
     this.inflightBuys.delete(mint);
+  }
+
+  setBuyFailureCooldown(mint, durationMs, reason = 'BUY_FAILED') {
+    const duration = Number(durationMs);
+    if (!mint || !Number.isFinite(duration) || duration <= 0) return null;
+    const protection = {
+      expireAt: Date.now() + duration,
+      reason,
+    };
+    this._buyFailureCooldowns.set(mint, protection);
+    return protection;
+  }
+
+  getActiveBuyFailureCooldown(mint, now = Date.now()) {
+    const protection = this._buyFailureCooldowns.get(mint);
+    if (!protection) return null;
+    if (protection.expireAt <= now) {
+      this._buyFailureCooldowns.delete(mint);
+      return null;
+    }
+    return protection;
   }
 
   registerOurSignature(sig) {
@@ -425,8 +455,19 @@ class SignalEngine extends EventEmitter {
       return;
     }
 
-    // 7. Same-mint controls: post-sale cooldown and in-flight/open-position lock.
+    // 7. Same-mint controls: execution-failure protection, optional post-sale
+    // cooldown, and in-flight/open-position lock.
     {
+      const failureProtection = this.getActiveBuyFailureCooldown(mint);
+      if (failureProtection) {
+        monitor.inc('SignalEngine.rejectedBuyFailureCooldown', 1, 'SignalEngine');
+        this._logReject(
+          signal,
+          `BUY_FAILURE_COOLDOWN: ${failureProtection.reason}, ` +
+            `${Math.ceil((failureProtection.expireAt - Date.now()) / 1000)}s remaining`,
+        );
+        return;
+      }
       const rebuyCooldownMs = config.strategy.rebuyCooldownMs;
       const exitCooldown = rebuyCooldownMs > 0 ? this._exitCooldowns.get(mint) : 0;
       if (exitCooldown && Date.now() < exitCooldown) {
@@ -762,6 +803,17 @@ class SignalEngine extends EventEmitter {
   //   无止损、无其他过滤
   async _handleEmaStrategy(signal, _signalReceivedAt) {
     const { mint, symbol, sellSol, priceImpactPct, seller, signature, ts, slot } = signal;
+
+    const failureProtection = this.getActiveBuyFailureCooldown(mint);
+    if (failureProtection) {
+      monitor.inc('SignalEngine.rejectedBuyFailureCooldown', 1, 'SignalEngine');
+      this._logReject(
+        signal,
+        `BUY_FAILURE_COOLDOWN: ${failureProtection.reason}, ` +
+          `${Math.ceil((failureProtection.expireAt - Date.now()) / 1000)}s remaining`,
+      );
+      return;
+    }
 
     // v3.30: 在最开头标记 inflight — 防止两个 async 信号同时通过后续检查
     if (this.inflightBuys.has(mint)) {
