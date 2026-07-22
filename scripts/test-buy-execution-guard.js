@@ -55,7 +55,7 @@ async function run() {
   });
   assert.strictEqual(narrowed.allowed, true);
   approx(narrowed.effectiveSlippagePct, (1.05 / 1.03 - 1) * 100);
-  approx(narrowed.maxQuoteSol, 1.05 / 1.03);
+  assert.strictEqual(narrowed.maxQuoteSol, 1);
 
   // 3. A configured ceiling below the remaining price room wins.
   const configuredWins = calculateBuyPriceGuard({
@@ -66,7 +66,7 @@ async function run() {
     inputSol: 2,
   });
   assert.strictEqual(configuredWins.effectiveSlippagePct, 1);
-  assert.strictEqual(configuredWins.maxQuoteSol, 2.02);
+  assert.strictEqual(configuredWins.maxQuoteSol, 2);
 
   // 4. A favorable expected price may use more room, but its worst on-chain
   // price still cannot exceed signal +5%.
@@ -106,6 +106,22 @@ async function run() {
   assert.strictEqual(fresh.state.id, 'fresh');
   assert.strictEqual(fresh.stateSource, 'rpc');
   assert.strictEqual(fresh.cacheAgeBeforeMs, 1_200);
+
+  // 6. Production BUY mode forces an RPC refresh even when the cache is well
+  // inside the configured age window.
+  ageMs = 10;
+  state = { id: 'cached-but-not-used' };
+  refreshCalls = 0;
+  const forced = await loadFreshBuyPoolState({
+    poolAddress: 'pool',
+    maxAgeMs: 500,
+    poolStateCache,
+    forceRefresh: true,
+    loadFromRpc: async () => assert.fail('cache refresh should provide the RPC state'),
+  });
+  assert.strictEqual(refreshCalls, 1);
+  assert.strictEqual(forced.state.id, 'fresh');
+  assert.strictEqual(forced.stateSource, 'rpc_forced');
 
   // Supplement: BUY failure protection is read independently of the optional
   // post-sale rebuy cooldown.

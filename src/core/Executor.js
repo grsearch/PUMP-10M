@@ -13,7 +13,7 @@
  *
  * SDK 调用流程：
  *   Buy:  OnlinePumpAmmSdk.swapSolanaState(poolKey, user) → state
- *         PumpAmmSdk.buyQuoteInput(state, quoteIn, slippagePct) → ix[]
+ *         PumpAmmSdk.buyInstructions(...) + buy_exact_quote_in data → ix[]
  *   Sell: OnlinePumpAmmSdk.swapSolanaState(poolKey, user) → state
  *         PumpAmmSdk.sellBaseInput(state, baseIn, slippagePct) → ix[]
  */
@@ -46,6 +46,12 @@ const {
   calculateBuyPriceGuard,
   loadFreshBuyPoolState,
 } = require('../utils/buyExecutionGuard');
+const {
+  calculateMinBaseAmountOut,
+  replaceBuyWithExactQuoteInstruction,
+} = require('../utils/pumpExactQuoteBuy');
+
+const REQUIRED_PUMP_SWAP_SDK_VERSION = '1.19.0';
 
 // AllenHark Slipstream SDK (lazy load)
 let SlipstreamClient = null;
@@ -103,25 +109,55 @@ class Executor {
 
     // SDK 在 LIVE 模式才需要
     this.pumpSdk = null;       // PumpAmmSdk（指令构造）
-    this.buyQuoteCalculator = null; // pure quote result (base + maxQuote), no instructions
+    this.buyQuoteCalculator = null; // pure virtual-reserve-aware quote result, no instructions
+    this.pumpAmmInstructionCoder = null;
+    this.pumpAmmProgramId = null;
     this.onlineSdk = null;     // OnlinePumpAmmSdk（state 拉取） — 走普通 RPC
     this.cacheSdk = null;      // v3.15 给 PoolStateCache 用，走普通 RPC（与 onlineSdk 实例分开避免共享 socket pool 限流）
     if (!this.dryRun) {
       try {
         const pumpModule = require('@pump-fun/pump-swap-sdk');
-        const { PumpAmmSdk, OnlinePumpAmmSdk, buyQuoteInput } = pumpModule;
-        if (!PumpAmmSdk || !OnlinePumpAmmSdk || !buyQuoteInput) {
-          throw new Error('SDK exports missing PumpAmmSdk / OnlinePumpAmmSdk / buyQuoteInput');
+        const {
+          PumpAmmSdk,
+          OnlinePumpAmmSdk,
+          buyQuoteInput,
+          OFFLINE_PUMP_AMM_PROGRAM,
+          PUMP_AMM_PROGRAM_ID,
+        } = pumpModule;
+        const sdkPackagePath = require('path').join(
+          require('path').dirname(require.resolve('@pump-fun/pump-swap-sdk')),
+          '..',
+          'package.json',
+        );
+        const sdkVersion = JSON.parse(require('fs').readFileSync(sdkPackagePath, 'utf8')).version;
+        if (sdkVersion !== REQUIRED_PUMP_SWAP_SDK_VERSION) {
+          throw new Error(
+            `PumpSwap SDK ${REQUIRED_PUMP_SWAP_SDK_VERSION} required, found ${sdkVersion || 'unknown'}`,
+          );
+        }
+        if (
+          !PumpAmmSdk ||
+          !OnlinePumpAmmSdk ||
+          !buyQuoteInput ||
+          !OFFLINE_PUMP_AMM_PROGRAM?.coder?.instruction ||
+          !PUMP_AMM_PROGRAM_ID
+        ) {
+          throw new Error('SDK 1.19 exact-quote exports are incomplete');
         }
         this.pumpSdk = new PumpAmmSdk();
         this.buyQuoteCalculator = buyQuoteInput;
+        this.pumpAmmInstructionCoder = OFFLINE_PUMP_AMM_PROGRAM.coder.instruction;
+        this.pumpAmmProgramId = PUMP_AMM_PROGRAM_ID;
         // v3.15: onlineSdk 改用 this.rpc（普通节点），不再走 stakedRpc
         // 原因：stakedRpc（你的 donetta 专属端点）限流严格，70 token 刷新会打爆
         this.onlineSdk = new OnlinePumpAmmSdk(this.rpc);
         // v3.15: cacheSdk 独立实例，专给 PoolStateCache 用
         // 即使 onlineSdk 因 BUY 短时占用也不影响后台刷新
         this.cacheSdk = new OnlinePumpAmmSdk(this.rpc);
-        console.log('[Executor] Pump AMM SDK loaded (onlineSdk + cacheSdk 都走普通 RPC，stakedRpc 仅用于 sendTx)');
+        console.log(
+          `[Executor] Pump AMM SDK ${sdkVersion} loaded ` +
+            '(virtual_quote_reserves + buy_exact_quote_in; fixed quote input; fresh RPC before BUY)',
+        );
       } catch (err) {
         console.error(`[Executor] failed to load @pump-fun/pump-swap-sdk: ${err.message}`);
       }
@@ -905,10 +941,14 @@ class Executor {
     const buyDiagnostics = {
       configuredSlippagePct,
       effectiveSlippagePct: null,
+      quoteMode: 'buy_exact_quote_in',
       signalPrice: Number.isFinite(rawSignalPrice) && rawSignalPrice > 0 ? rawSignalPrice : null,
       expectedPrice: null,
       maxPrice: null,
       maxQuoteSol: null,
+      spendableQuoteSol: sizeSol,
+      minBaseAmountOutRaw: null,
+      virtualQuoteReservesRaw: null,
       cacheAgeBeforeMs: null,
       cacheAgeAtBuildMs: null,
       stateSource: null,
@@ -1024,6 +1064,7 @@ class Executor {
         maxAgeMs: config.strategy.buyMaxPoolStateAgeMs,
         poolStateCache: this.poolStateCache,
         loadFromRpc: () => this.onlineSdk.swapSolanaState(poolKey, this.keypair.publicKey),
+        forceRefresh: true,
       });
       const swapState = freshPool.state;
       const stateSource = freshPool.stateSource;
@@ -1132,6 +1173,11 @@ class Executor {
         : Date.now() - freshPool.stateFetchedAtMs;
       const zeroSlippageQuote = this._calculateBuyQuote(swapState, sizeLamportsBN, 0);
       const baseRaw = zeroSlippageQuote.base;
+      const virtualQuoteReserves = swapState?.pool?.virtualQuoteReserves;
+      if (virtualQuoteReserves == null) {
+        throw new Error('PumpSwap pool state missing virtual_quote_reserves (SDK 1.19 required)');
+      }
+      buyDiagnostics.virtualQuoteReservesRaw = virtualQuoteReserves.toString();
       const tokenAmount = Number(baseRaw.toString()) / Math.pow(10, baseDecimals);
       const realPrice = tokenAmount > 0 ? sizeSol / tokenAmount : 0;
       const priceGuard = calculateBuyPriceGuard({
@@ -1162,18 +1208,15 @@ class Executor {
       }
 
       const effectiveSlippagePct = priceGuard.effectiveSlippagePct;
-      const effectiveQuote = this._calculateBuyQuote(
-        swapState,
-        sizeLamportsBN,
-        effectiveSlippagePct,
-      );
-      buyDiagnostics.maxQuoteSol = Number(effectiveQuote.maxQuote.toString()) / 1e9;
+      const minBaseAmountOut = calculateMinBaseAmountOut(baseRaw, effectiveSlippagePct);
+      buyDiagnostics.maxQuoteSol = sizeSol;
+      buyDiagnostics.minBaseAmountOutRaw = minBaseAmountOut.toString();
 
       const tB0 = Date.now();
-      const buyResult = await this.pumpSdk.buyQuoteInput(
+      const buyResult = await this._buildExactQuoteBuyInstructions(
         swapState,
         sizeLamportsBN,
-        effectiveSlippagePct,
+        minBaseAmountOut,
       );
       const buildLatencyMs = Date.now() - tB0;
       buyDiagnostics.cacheAgeAtBuildMs = this.poolStateCache && freshPool.cacheBacked
@@ -1182,7 +1225,7 @@ class Executor {
 
       const swapIxs = this._extractInstructions(buyResult);
       if (!swapIxs || swapIxs.length === 0) {
-        throw new Error('SDK buyQuoteInput returned no instructions');
+        throw new Error('SDK buy_exact_quote_in returned no instructions');
       }
 
       const estimatedSlippagePct = this._estimateBuySlippagePct(
@@ -1199,7 +1242,9 @@ class Executor {
           `expected=${fmtPrice(buyDiagnostics.expectedPrice)} ` +
           `deviation=${priceGuard.priceDeviationPct.toFixed(2)}% ` +
           `slippage=${configuredSlippagePct.toFixed(2)}%->${effectiveSlippagePct.toFixed(2)}% ` +
-          `maxQuote=${buyDiagnostics.maxQuoteSol.toFixed(9)}SOL ` +
+          `exactQuote=${buyDiagnostics.spendableQuoteSol.toFixed(9)}SOL ` +
+          `minBase=${buyDiagnostics.minBaseAmountOutRaw} ` +
+          `virtualQuote=${buyDiagnostics.virtualQuoteReservesRaw} ` +
           `cache=${fmtAge(buyDiagnostics.cacheAgeBeforeMs)}->${fmtAge(buyDiagnostics.cacheAgeAtBuildMs)}[${stateSource}]`,
       );
 
@@ -1517,6 +1562,27 @@ class Executor {
     });
   }
 
+  async _buildExactQuoteBuyInstructions(state, spendableQuoteIn, minBaseAmountOut) {
+    if (!this.pumpSdk || typeof this.pumpSdk.buyInstructions !== 'function') {
+      throw new Error('PumpSwap SDK buyInstructions is unavailable');
+    }
+    // Build the complete SDK account bundle with exactly the quote amount that
+    // will be wrapped/funded, then switch only the AMM instruction data to
+    // buy_exact_quote_in. This mirrors the SDK 1.19 simulation test.
+    const instructions = await this.pumpSdk.buyInstructions(
+      state,
+      minBaseAmountOut,
+      spendableQuoteIn,
+    );
+    return replaceBuyWithExactQuoteInstruction({
+      instructions,
+      programId: this.pumpAmmProgramId,
+      instructionCoder: this.pumpAmmInstructionCoder,
+      spendableQuoteIn,
+      minBaseAmountOut,
+    });
+  }
+
   /**
    * SDK 不同版本返回结构不同。统一处理：
    *   - 数组 → 直接是 instructions
@@ -1542,7 +1608,8 @@ class Executor {
     // fallback：用 constant product 公式估算（不精确，仅用于显示）
     try {
       const baseReserve = BigInt(state.poolBaseAmount.toString());
-      const quoteReserve = BigInt(state.poolQuoteAmount.toString());
+      const quoteReserve = BigInt(state.poolQuoteAmount.toString()) +
+        BigInt(state.pool?.virtualQuoteReserves?.toString() || '0');
       const quoteIn = BigInt(fallbackQuoteIn.toString());
       const k = baseReserve * quoteReserve;
       const newQuote = quoteReserve + quoteIn;
@@ -1563,7 +1630,8 @@ class Executor {
     // fallback
     try {
       const baseReserve = BigInt(state.poolBaseAmount.toString());
-      const quoteReserve = BigInt(state.poolQuoteAmount.toString());
+      const quoteReserve = BigInt(state.poolQuoteAmount.toString()) +
+        BigInt(state.pool?.virtualQuoteReserves?.toString() || '0');
       const baseIn = BigInt(fallbackBaseIn.toString());
       const k = baseReserve * quoteReserve;
       const newBase = baseReserve + baseIn;

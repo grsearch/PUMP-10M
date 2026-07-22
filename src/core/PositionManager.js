@@ -30,6 +30,7 @@ const crypto = require('crypto');
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
 const { evaluateFlowTurnExit } = require('./FlowCandleStrategy');
+const { priceDetailsFromRawState } = require('../utils/pumpSwapPricing');
 
 const monitor = getMonitor();
 monitor.registerModule('PositionManager', { staleMs: 10_000, label: 'Position Manager' });
@@ -89,7 +90,13 @@ class PositionManager extends EventEmitter {
     this._priceSampleLastTs = new Map(); // mint → lastSampleTs
     this._priceSampleIntervalMs = parseInt(process.env.PRICE_SAMPLE_INTERVAL_MS || '10000', 10);
 
-    this.priceTracker.on('update', ({ mint, price }) => {
+    this.priceTracker.on('update', ({
+      mint,
+      price,
+      rawPrice,
+      virtualQuoteReserveSol,
+      effectiveQuoteReserveSol,
+    }) => {
       const pids = this.byMint.get(mint);
 
       // 价格采样：持仓币才采样，按间隔写入DB
@@ -106,7 +113,12 @@ class PositionManager extends EventEmitter {
 
       if (!pids || pids.size === 0) return;
       for (const pid of pids) {
-        this._checkExit(pid, price);
+        this._checkExit(pid, price, {
+          source: 'price_tracker',
+          rawPrice,
+          virtualQuoteReserveSol,
+          effectiveQuoteReserveSol,
+        });
       }
     });
   }
@@ -382,19 +394,8 @@ class PositionManager extends EventEmitter {
       // PoolStateCache 在 Executor 上
       const cache = this.executor?.poolStateCache;
       if (!cache) return null;
-      const cached = cache.get(token.pool_address);
-      if (!cached?.state) return null;
-      const state = cached.state;
-      // poolQuoteAmount / poolBaseAmount = price per token in SOL
-      const quoteLamports = typeof state.poolQuoteAmount === 'object' && state.poolQuoteAmount.toNumber
-        ? state.poolQuoteAmount.toNumber() : Number(state.poolQuoteAmount);
-      const baseRaw = typeof state.poolBaseAmount === 'object' && state.poolBaseAmount.toNumber
-        ? state.poolBaseAmount.toNumber() : Number(state.poolBaseAmount);
-      if (!quoteLamports || !baseRaw) return null;
-      const quoteSol = quoteLamports / 1e9;
-      const baseTokens = baseRaw / Math.pow(10, token.decimals || 6);
-      if (baseTokens <= 0) return null;
-      return quoteSol / baseTokens;
+      const state = cache.get(token.pool_address);
+      return this._priceFromState(state, token.decimals || 6);
     } catch (_) {
       return null;
     }
@@ -1193,18 +1194,20 @@ class PositionManager extends EventEmitter {
 
         // 优先用 PoolStateCache 的实时价格
         let price = 0;
+        let rawPrice = null;
+        let virtualQuoteReserveSol = 0;
+        let effectiveQuoteReserveSol = 0;
         if (this.executor?.poolStateCache && this.tokenRegistry) {
           const tokenInfo = this.tokenRegistry.getToken(pos.mint);
           if (tokenInfo?.pool_address) {
             const poolState = this.executor.poolStateCache.get(tokenInfo.pool_address);
             if (poolState) {
-              const baseAmt = Number(poolState.poolBaseAmount?.toString() || 0);
-              const quoteAmt = Number(poolState.poolQuoteAmount?.toString() || 0);
-              if (baseAmt > 0 && quoteAmt > 0) {
-                // PoolStateCache 的 baseAmt/quoteAmt 是链上原始单位(lamports)
-                // 需要转换: price = (quoteAmt/1e9) / (baseAmt/10^decimals) SOL/token
-                const decimals = tokenInfo.decimals ?? 6; // Pump.fun = 6
-                price = (quoteAmt / 1e9) / (baseAmt / Math.pow(10, decimals));
+              const pricing = priceDetailsFromRawState(poolState, tokenInfo.decimals ?? 6);
+              if (pricing) {
+                price = pricing.effectivePrice;
+                rawPrice = pricing.rawPrice;
+                virtualQuoteReserveSol = pricing.virtualQuoteUi;
+                effectiveQuoteReserveSol = pricing.effectiveQuoteUi;
               }
             }
           }
@@ -1212,17 +1215,30 @@ class PositionManager extends EventEmitter {
 
         // fallback: 用 priceTracker 的当前价格
         if (!price || !Number.isFinite(price) || price <= 0) {
-          price = this.priceTracker?.getPrice(pos.mint) || 0;
+          const tracked = this.priceTracker?.get(pos.mint);
+          price = tracked?.price || 0;
+          rawPrice = Number(tracked?.rawPrice) || null;
+          virtualQuoteReserveSol = Number(tracked?.virtualQuoteReserveSol) || 0;
+          effectiveQuoteReserveSol = Number(tracked?.effectiveQuoteReserveSol) || 0;
         }
 
         if (price > 0 && Number.isFinite(price)) {
           // 同步 priceTracker（让 dashboard 显示正确价格）
           const trackerPrice = this.priceTracker?.getPrice(pos.mint) || 0;
           if (Math.abs(price - trackerPrice) / (trackerPrice || price) > 0.005) {
-            this.priceTracker?.forceSet(pos.mint, price);
+            this.priceTracker?.forceSet(pos.mint, price, Date.now(), null, {
+              rawPrice,
+              virtualQuoteReserveSol,
+              effectiveQuoteReserveSol,
+            });
           }
           // 主动检查退出条件
-          this._checkExit(pos.positionId, price);
+          this._checkExit(pos.positionId, price, {
+            source: 'position_tick',
+            rawPrice,
+            virtualQuoteReserveSol,
+            effectiveQuoteReserveSol,
+          });
         }
       }
     }
@@ -1486,7 +1502,7 @@ class PositionManager extends EventEmitter {
     }
   }
 
-  _checkExit(positionId, price) {
+  _checkExit(positionId, price, context = {}) {
     const pos = this.positions.get(positionId);
     if (!pos || pos.exiting) return;
 
@@ -1542,9 +1558,17 @@ class PositionManager extends EventEmitter {
     // Absolute loss cap: no stabilization or legacy emergency-stop grace delay.
     const fixedStopPct = config.strategy.fixedStopLossPct;
     if (fixedStopPct < 0 && pnlPct <= fixedStopPct) {
+      const rawPrice = Number(context?.rawPrice) || null;
+      const virtualQuoteReserveSol = Number(context?.virtualQuoteReserveSol) || 0;
+      const priceFormulaGapPct = rawPrice && rawPrice > 0
+        ? ((price - rawPrice) / rawPrice) * 100
+        : null;
       console.warn(
         `[PositionManager] FIXED_STOP_LOSS ${pos.symbol || pos.mint.slice(0, 6)} ` +
-          `pnl=${pnlPct.toFixed(2)}% threshold=${fixedStopPct}%`,
+          `pnl=${pnlPct.toFixed(2)}% threshold=${fixedStopPct}% ` +
+          `price=${price.toExponential(6)} raw=${rawPrice ? rawPrice.toExponential(6) : 'n/a'} ` +
+          `virtual=${virtualQuoteReserveSol.toFixed(6)}SOL ` +
+          `formula_gap=${priceFormulaGapPct == null ? 'n/a' : `${priceFormulaGapPct.toFixed(2)}%`}`,
       );
       this._exitForCondition(pos, price, 'FIXED_STOP_LOSS');
       return;
@@ -2697,28 +2721,48 @@ class PositionManager extends EventEmitter {
             //   保护1: cache miss → fallback 到现查 RPC（保住对未进 hotMints 持仓的兜底）
             //   保护2: 缓存太旧(>1s) → fallback 到现查 RPC（避免过期数据影响 trailing）
             let price = null;
+            let rawPrice = null;
+            let virtualQuoteReserveSol = 0;
+            let effectiveQuoteReserveSol = 0;
             const cache = this.executor?.poolStateCache;
             if (cache) {
               const cachedState = cache.get(q.poolAddress);
               const cacheAge = cache.getAge(q.poolAddress);
               if (cachedState && cacheAge !== null && cacheAge <= MAX_CACHE_AGE_MS) {
-                price = this._priceFromState(cachedState, q.decimals);
+                const pricing = priceDetailsFromRawState(cachedState, q.decimals);
+                price = pricing?.effectivePrice || null;
+                rawPrice = pricing?.rawPrice || null;
+                virtualQuoteReserveSol = pricing?.virtualQuoteUi || 0;
+                effectiveQuoteReserveSol = pricing?.effectiveQuoteUi || 0;
                 monitor.inc('PositionManager.poolPollCacheHit', 1, 'PositionManager');
               }
             }
             // fallback: cache miss 或缓存太旧 → 走 RPC
             if (!price) {
-              price = await this._fetchPoolMidPrice(q.poolAddress, q.decimals);
+              const pricing = await this._fetchPoolPricing(q.poolAddress, q.decimals);
+              price = pricing?.effectivePrice || null;
+              rawPrice = pricing?.rawPrice || null;
+              virtualQuoteReserveSol = pricing?.virtualQuoteUi || 0;
+              effectiveQuoteReserveSol = pricing?.effectiveQuoteUi || 0;
               monitor.inc('PositionManager.poolPollRpcFallback', 1, 'PositionManager');
             }
             if (price && price > 0) {
-              this.priceTracker.update(q.mint, price, Date.now(), q.poolAddress);
+              this.priceTracker.update(q.mint, price, Date.now(), q.poolAddress, {
+                rawPrice,
+                virtualQuoteReserveSol,
+                effectiveQuoteReserveSol,
+              });
               monitor.inc('PositionManager.poolPollOk', 1, 'PositionManager');
               // 直接检查退出，不等 priceTracker 事件 — 减少延迟
               const pids = this.byMint.get(q.mint);
               if (pids) {
                 for (const pid of pids) {
-                  this._checkExit(pid, price);
+                  this._checkExit(pid, price, {
+                    source: 'pool_poll',
+                    rawPrice,
+                    virtualQuoteReserveSol,
+                    effectiveQuoteReserveSol,
+                  });
                 }
               }
             }
@@ -2736,13 +2780,7 @@ class PositionManager extends EventEmitter {
    * v3.17.27: 从 PoolStateCache 的 state 算价格（纯内存，零 RPC）
    */
   _priceFromState(state, baseDecimals) {
-    if (!state?.poolBaseAmount || !state?.poolQuoteAmount) return null;
-    const baseRaw = typeof state.poolBaseAmount === 'object' && state.poolBaseAmount.toString
-      ? Number(state.poolBaseAmount.toString()) : Number(state.poolBaseAmount);
-    const quoteRaw = typeof state.poolQuoteAmount === 'object' && state.poolQuoteAmount.toString
-      ? Number(state.poolQuoteAmount.toString()) : Number(state.poolQuoteAmount);
-    if (baseRaw <= 0 || quoteRaw <= 0) return null;
-    return (quoteRaw / 1e9) / (baseRaw / Math.pow(10, baseDecimals));
+    return priceDetailsFromRawState(state, baseDecimals)?.effectivePrice || null;
   }
 
   /**
@@ -2750,21 +2788,15 @@ class PositionManager extends EventEmitter {
    * 用 Executor 已加载的 onlineSdk（fallback: 仅 cache miss 时调用）
    */
   async _fetchPoolMidPrice(poolAddress, baseDecimals) {
+    return (await this._fetchPoolPricing(poolAddress, baseDecimals))?.effectivePrice || null;
+  }
+
+  async _fetchPoolPricing(poolAddress, baseDecimals) {
     if (!this.executor.onlineSdk || !this.executor.keypair) return null;
     const { PublicKey } = require('@solana/web3.js');
     const poolKey = new PublicKey(poolAddress);
     const state = await this.executor.onlineSdk.swapSolanaState(poolKey, this.executor.keypair.publicKey);
-    if (!state || !state.poolBaseAmount || !state.poolQuoteAmount) return null;
-
-    // Number 精度对小价格够用（small floats），不用 BigInt 除
-    const baseRaw = Number(state.poolBaseAmount.toString());
-    const quoteRaw = Number(state.poolQuoteAmount.toString());
-    if (baseRaw <= 0 || quoteRaw <= 0) return null;
-
-    // mid_price = (quote / 1e9) / (base / 10^baseDecimals)
-    //          = quote * 10^baseDecimals / (base * 1e9)
-    const price = (quoteRaw / 1e9) / (baseRaw / Math.pow(10, baseDecimals));
-    return price;
+    return priceDetailsFromRawState(state, baseDecimals);
   }
 
   async _reconcileRetries() {
