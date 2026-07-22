@@ -162,7 +162,9 @@ function runDashboardContractTest() {
     assert(html.includes('近 60s 真实成交量'));
     assert(html.includes('下一可成交 K 开盘'));
     assert(html.includes('移动止盈未激活时'));
-    assert(html.includes('已停止展示旧策略指标'));
+    assert(!html.includes('TEN_MIN_PULLBACK'));
+    assert(!html.includes('已停止展示旧策略指标'));
+    assert(!html.includes('配置错误：后端模式为'));
     assert(!html.includes('Strategy V6'));
     assert(!html.includes('V5 信号'));
     assert(!html.includes('10m回踩恢复'));
