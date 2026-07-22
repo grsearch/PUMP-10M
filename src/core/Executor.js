@@ -42,6 +42,10 @@ const {
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
 const { estimateBuySlippagePct } = require('./ExecutionMath');
+const {
+  calculateBuyPriceGuard,
+  loadFreshBuyPoolState,
+} = require('../utils/buyExecutionGuard');
 
 // AllenHark Slipstream SDK (lazy load)
 let SlipstreamClient = null;
@@ -99,16 +103,18 @@ class Executor {
 
     // SDK 在 LIVE 模式才需要
     this.pumpSdk = null;       // PumpAmmSdk（指令构造）
+    this.buyQuoteCalculator = null; // pure quote result (base + maxQuote), no instructions
     this.onlineSdk = null;     // OnlinePumpAmmSdk（state 拉取） — 走普通 RPC
     this.cacheSdk = null;      // v3.15 给 PoolStateCache 用，走普通 RPC（与 onlineSdk 实例分开避免共享 socket pool 限流）
     if (!this.dryRun) {
       try {
         const pumpModule = require('@pump-fun/pump-swap-sdk');
-        const { PumpAmmSdk, OnlinePumpAmmSdk } = pumpModule;
-        if (!PumpAmmSdk || !OnlinePumpAmmSdk) {
-          throw new Error('SDK exports missing PumpAmmSdk / OnlinePumpAmmSdk');
+        const { PumpAmmSdk, OnlinePumpAmmSdk, buyQuoteInput } = pumpModule;
+        if (!PumpAmmSdk || !OnlinePumpAmmSdk || !buyQuoteInput) {
+          throw new Error('SDK exports missing PumpAmmSdk / OnlinePumpAmmSdk / buyQuoteInput');
         }
         this.pumpSdk = new PumpAmmSdk();
+        this.buyQuoteCalculator = buyQuoteInput;
         // v3.15: onlineSdk 改用 this.rpc（普通节点），不再走 stakedRpc
         // 原因：stakedRpc（你的 donetta 专属端点）限流严格，70 token 刷新会打爆
         this.onlineSdk = new OnlinePumpAmmSdk(this.rpc);
@@ -894,25 +900,50 @@ class Executor {
 
     const sizeSol = order.sizeSol || config.strategy.positionSizeSol;
     const baseDecimals = order.baseDecimals ?? 6;
+    const configuredSlippagePct = config.strategy.buySlippageBps / 100;
+    const rawSignalPrice = Number(order.signalPrice ?? order.priceAfter);
+    const buyDiagnostics = {
+      configuredSlippagePct,
+      effectiveSlippagePct: null,
+      signalPrice: Number.isFinite(rawSignalPrice) && rawSignalPrice > 0 ? rawSignalPrice : null,
+      expectedPrice: null,
+      maxPrice: null,
+      maxQuoteSol: null,
+      cacheAgeBeforeMs: null,
+      cacheAgeAtBuildMs: null,
+      stateSource: null,
+    };
+    const finishBuy = (result) => ({
+      ...result,
+      ...buyDiagnostics,
+      buyDiagnostics: { ...buyDiagnostics },
+    });
 
     // ============ DRY_RUN ============
     if (this.dryRun) {
       const fillPrice = (order.priceAfter || 0) * 1.005;
       if (fillPrice <= 0) {
         monitor.inc('Executor.buyFail', 1, 'Executor');
-        return {
+        return finishBuy({
           success: false,
           error: 'invalid priceAfter for DRY_RUN',
           latencyMs: Date.now() - t0,
-        };
+        });
       }
       const tokenAmount = sizeSol / fillPrice;
+      buyDiagnostics.expectedPrice = fillPrice;
+      buyDiagnostics.maxPrice = buyDiagnostics.signalPrice
+        ? buyDiagnostics.signalPrice * (1 + config.strategy.buyMaxPriceDeviationPct / 100)
+        : null;
+      buyDiagnostics.effectiveSlippagePct = 0.5;
+      buyDiagnostics.maxQuoteSol = sizeSol * 1.005;
+      buyDiagnostics.stateSource = 'dry_run';
       console.log(
         `[Executor:DRY_RUN] BUY ${order.symbol || order.mint.slice(0, 6)}: ` +
           `${sizeSol} SOL → ${tokenAmount.toFixed(2)} tokens @ ${fillPrice.toExponential(4)}`,
       );
       monitor.inc('Executor.buySuccess', 1, 'Executor');
-      return {
+      return finishBuy({
         success: true,
         signature: `DRYRUN_BUY_${Date.now()}`,
         tokenAmount,
@@ -921,7 +952,7 @@ class Executor {
         estimatedSlippagePct: 0.5,
         latencyMs: Date.now() - t0,
         dryRun: true,
-      };
+      });
     }
 
     // ============ LIVE ============
@@ -931,89 +962,82 @@ class Executor {
         side: 'BUY',
         mint: order.mint,
       });
-      return { success: false, error: 'wallet not loaded', latencyMs: Date.now() - t0 };
+      return finishBuy({ success: false, error: 'wallet not loaded', latencyMs: Date.now() - t0 });
     }
-    if (!this.pumpSdk || !this.onlineSdk) {
+    if (!this.pumpSdk || !this.onlineSdk || !this.buyQuoteCalculator) {
       monitor.inc('Executor.buyFail', 1, 'Executor');
-      return {
+      return finishBuy({
         success: false,
         error: '@pump-fun/pump-swap-sdk not loaded',
         latencyMs: Date.now() - t0,
-      };
+      });
     }
     if (!order.poolAddress) {
       monitor.inc('Executor.buyFail', 1, 'Executor');
-      return {
+      return finishBuy({
         success: false,
         error: 'poolAddress missing — run fill-pools',
         latencyMs: Date.now() - t0,
-      };
+      });
     }
 
     try {
       const poolKey = new PublicKey(order.poolAddress);
       const sizeLamportsBN = new BN(Math.floor(sizeSol * 1e9));
-      // SDK 接受 slippage 作为 percent 数（1% 写 1，不是 0.01）
-      const slippagePct = config.strategy.buySlippageBps / 100;
 
-      // 1. 拉 pool state — v3.5 优先读缓存（PoolStateCache 后台预热）
+      // 1. BUY must never quote against a stale pool state. A stale/missing
+      // cache entry is synchronously refreshed before any amount is computed.
       const tS0 = Date.now();
-      let swapState = null;
-      let stateSource = 'rpc';
-      if (this.poolStateCache) {
-        swapState = this.poolStateCache.get(order.poolAddress);
-        if (swapState) {
-          // v3.32: cache hit 时验证 pool 还在 Pump AMM（防迁移到 Raydium 后白烧 fee）
-          if (this.poolStateCache.isDead(order.poolAddress)) {
+      if (this.poolStateCache?.isDead(order.poolAddress)) {
+        monitor.inc('Executor.buyPoolDead', 1, 'Executor');
+        return finishBuy({
+          success: false,
+          error: 'pool_dead: migrated to Raydium (cached dead)',
+          poolDead: true,
+          latencyMs: Date.now() - t0,
+        });
+      }
+
+      // Verify pool ownership before the freshness clock starts so a slow
+      // owner RPC cannot age the state used by the quote.
+      if (this.poolStateCache && !this.poolStateCache._ownerVerified?.has(order.poolAddress)) {
+        try {
+          const poolAcc = await this.rpc.getAccountInfo(poolKey);
+          const PUMP_AMM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+          if (poolAcc && poolAcc.owner.toBase58() !== PUMP_AMM) {
+            this.poolStateCache.markDead(order.poolAddress);
             monitor.inc('Executor.buyPoolDead', 1, 'Executor');
-            console.error(
-              `[Executor:LIVE] 🚫 BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: pool marked dead (migrated)`,
-            );
-            return {
+            return finishBuy({
               success: false,
-              error: 'pool_dead: migrated to Raydium (cached dead)',
+              error: 'pool_dead: migrated to Raydium',
               poolDead: true,
               latencyMs: Date.now() - t0,
-            };
+            });
           }
-          // 首次遇到：强制验一次 pool owner（仅 cache hit 才需要，cache miss 已走 RPC）
-          if (!this.poolStateCache._ownerVerified?.has(order.poolAddress)) {
-            try {
-              const poolAcc = await this.rpc.getAccountInfo(new PublicKey(order.poolAddress));
-              const PUMP_AMM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
-              if (poolAcc && poolAcc.owner.toBase58() !== PUMP_AMM) {
-                this.poolStateCache.markDead(order.poolAddress);
-                monitor.inc('Executor.buyPoolDead', 1, 'Executor');
-                console.error(
-                  `[Executor:LIVE] 🚫 BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: pool migrated (owner=${poolAcc.owner.toBase58().slice(0,8)}.. ≠ pAMMBay)`,
-                );
-                return {
-                  success: false,
-                  error: 'pool_dead: migrated to Raydium',
-                  poolDead: true,
-                  latencyMs: Date.now() - t0,
-                };
-              }
-              // owner OK，标记已验证，后续不再重复查
-              if (!this.poolStateCache._ownerVerified) this.poolStateCache._ownerVerified = new Set();
-              this.poolStateCache._ownerVerified.add(order.poolAddress);
-            } catch (_) { /* RPC 失败不阻塞 BUY */ }
-          }
-          stateSource = 'cache';
-          const age = this.poolStateCache.getAge(order.poolAddress);
-          monitor.set('Executor.lastCacheAgeMs', age || 0, 'Executor');
-        }
+          if (!this.poolStateCache._ownerVerified) this.poolStateCache._ownerVerified = new Set();
+          this.poolStateCache._ownerVerified.add(order.poolAddress);
+        } catch (_) { /* owner check failure does not bypass the fresh quote */ }
       }
-      if (!swapState) {
-        // cache miss：第一次抓取或 cache 失效；走同步 RPC
-        swapState = await this.onlineSdk.swapSolanaState(poolKey, this.keypair.publicKey);
-        monitor.inc('Executor.cacheMiss', 1, 'Executor');
-      } else {
+
+      const freshPool = await loadFreshBuyPoolState({
+        poolAddress: order.poolAddress,
+        maxAgeMs: config.strategy.buyMaxPoolStateAgeMs,
+        poolStateCache: this.poolStateCache,
+        loadFromRpc: () => this.onlineSdk.swapSolanaState(poolKey, this.keypair.publicKey),
+      });
+      const swapState = freshPool.state;
+      const stateSource = freshPool.stateSource;
+      buyDiagnostics.cacheAgeBeforeMs = freshPool.cacheAgeBeforeMs;
+      buyDiagnostics.stateSource = stateSource;
+      if (stateSource === 'cache') {
         monitor.inc('Executor.cacheHit', 1, 'Executor');
+      } else {
+        monitor.inc('Executor.cacheMiss', 1, 'Executor');
       }
       const stateLatencyMs = Date.now() - tS0;
       monitor.inc('Executor.stateOk', 1, 'Executor');
       monitor.set('Executor.lastStateLatencyMs', stateLatencyMs, 'Executor');
+      monitor.set('Executor.lastCacheAgeMs', buyDiagnostics.cacheAgeBeforeMs || 0, 'Executor');
 
       // ============ v3.17.20: BUY 前验证 pool 归属（防签名串） ============
       //   根因(图8)：DB 里不同代币共享了同一个 pool_address。
@@ -1035,12 +1059,12 @@ class Executor {
             `pool ${order.poolAddress.slice(0, 8)}.. base_mint=${poolBaseMint.slice(0, 8)}.. ` +
             `≠ order.mint=${order.mint.slice(0, 8)}.. (shared/stale pool_address — refusing to buy wrong token)`,
         );
-        return {
+        return finishBuy({
           success: false,
           error: `pool base_mint mismatch: pool=${poolBaseMint.slice(0, 8)} order=${order.mint.slice(0, 8)}`,
           poolMintMismatch: true,
           latencyMs: Date.now() - t0,
-        };
+        });
       }
       // ============ v3.32: Dead pool 检查 — IncorrectProgramId 导致的已迁移pool ============
       if (this.poolStateCache && this.poolStateCache.isDead(order.poolAddress)) {
@@ -1049,12 +1073,12 @@ class Executor {
           `[Executor:LIVE] 🚫 BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
           `pool marked dead (IncorrectProgramId) — migrated to Raydium, skipping`,
         );
-        return {
+        return finishBuy({
           success: false,
           error: 'pool_dead: marked dead (IncorrectProgramId / migrated)',
           poolDead: true,
           latencyMs: Date.now() - t0,
-        };
+        });
       }
 
       // ============ v3.26: Pool health check — 跳过已死亡/迁移的 pool ============
@@ -1077,12 +1101,12 @@ class Executor {
             `[Executor:LIVE] 🚫 BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
             `pool dead (baseAmt=0, quoteAmt=0) — likely migrated to Raydium, skipping to save fee`,
           );
-          return {
+          return finishBuy({
             success: false,
             error: 'pool_dead: baseAmt=0 quoteAmt=0 (likely migrated to Raydium)',
             poolDead: true,
             latencyMs: Date.now() - t0,
-          };
+          });
         }
         // pool quote 余额极低（<0.01 SOL）也跳过 — 流动性不够，大概率 3012
         if (quoteAmt > 0 && quoteAmt < 1e7) { // < 0.01 SOL (lamports)
@@ -1091,56 +1115,93 @@ class Executor {
             `[Executor:LIVE] 🚫 BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
             `pool low liquidity (quoteAmt=${(quoteAmt / 1e9).toFixed(4)} SOL) — will likely fail, skipping`,
           );
-          return {
+          return finishBuy({
             success: false,
             error: `pool_low_liquidity: quoteAmt=${(quoteAmt / 1e9).toFixed(4)} SOL`,
             poolLowLiquidity: true,
             latencyMs: Date.now() - t0,
-          };
+          });
         }
       }
 
+      // 2. Quote with zero slippage first. The expected token amount is fixed;
+      // only then can we determine how much on-chain slippage remains below the
+      // signal-price cap.
+      buyDiagnostics.cacheAgeAtBuildMs = this.poolStateCache && freshPool.cacheBacked
+        ? this.poolStateCache.getAge(order.poolAddress)
+        : Date.now() - freshPool.stateFetchedAtMs;
+      const zeroSlippageQuote = this._calculateBuyQuote(swapState, sizeLamportsBN, 0);
+      const baseRaw = zeroSlippageQuote.base;
+      const tokenAmount = Number(baseRaw.toString()) / Math.pow(10, baseDecimals);
+      const realPrice = tokenAmount > 0 ? sizeSol / tokenAmount : 0;
+      const priceGuard = calculateBuyPriceGuard({
+        signalPrice: buyDiagnostics.signalPrice,
+        expectedPrice: realPrice,
+        configuredSlippagePct,
+        maxPriceDeviationPct: config.strategy.buyMaxPriceDeviationPct,
+        inputSol: sizeSol,
+      });
+      buyDiagnostics.expectedPrice = priceGuard.expectedPrice ?? (realPrice || null);
+      buyDiagnostics.maxPrice = priceGuard.maxPrice ?? null;
+      buyDiagnostics.effectiveSlippagePct = priceGuard.effectiveSlippagePct ?? null;
+      buyDiagnostics.maxQuoteSol = priceGuard.maxQuoteSol ?? null;
+
+      if (!priceGuard.allowed) {
+        monitor.inc('Executor.buyPriceGuardRejected', 1, 'Executor');
+        console.warn(
+          `[Executor:LIVE] BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
+            `${priceGuard.error} signal=${buyDiagnostics.signalPrice ?? 'n/a'} ` +
+            `expected=${realPrice || 'n/a'} max=${priceGuard.maxPrice ?? 'n/a'}`,
+        );
+        return finishBuy({
+          success: false,
+          error: priceGuard.error,
+          priceGuardRejected: true,
+          latencyMs: Date.now() - t0,
+        });
+      }
+
+      const effectiveSlippagePct = priceGuard.effectiveSlippagePct;
+      const effectiveQuote = this._calculateBuyQuote(
+        swapState,
+        sizeLamportsBN,
+        effectiveSlippagePct,
+      );
+      buyDiagnostics.maxQuoteSol = Number(effectiveQuote.maxQuote.toString()) / 1e9;
+
       const tB0 = Date.now();
-      const buyResult = await this.pumpSdk.buyQuoteInput(swapState, sizeLamportsBN, slippagePct);
+      const buyResult = await this.pumpSdk.buyQuoteInput(
+        swapState,
+        sizeLamportsBN,
+        effectiveSlippagePct,
+      );
       const buildLatencyMs = Date.now() - tB0;
+      buyDiagnostics.cacheAgeAtBuildMs = this.poolStateCache && freshPool.cacheBacked
+        ? this.poolStateCache.getAge(order.poolAddress)
+        : Date.now() - freshPool.stateFetchedAtMs;
 
       const swapIxs = this._extractInstructions(buyResult);
       if (!swapIxs || swapIxs.length === 0) {
         throw new Error('SDK buyQuoteInput returned no instructions');
       }
 
-      // 估算 token 数量（用 SDK 的内部算法）
-      const baseRaw = this._extractBaseAmount(buyResult, swapState, sizeLamportsBN, 'buy');
-      const tokenAmount = Number(baseRaw) / Math.pow(10, baseDecimals);
-      const realPrice = tokenAmount > 0 ? sizeSol / tokenAmount : 0;
       const estimatedSlippagePct = this._estimateBuySlippagePct(
         swapState,
         sizeSol,
         tokenAmount,
         baseDecimals,
       );
-      const maxEstimatedSlippagePct = config.strategy.buyMaxEstimatedSlippagePct;
-      if (!Number.isFinite(estimatedSlippagePct)) {
-        monitor.inc('Executor.buySlippageEstimateUnavailable', 1, 'Executor');
-        return {
-          success: false,
-          error: 'estimated_buy_slippage_unavailable',
-          latencyMs: Date.now() - t0,
-        };
-      }
-      if (maxEstimatedSlippagePct > 0 && estimatedSlippagePct > maxEstimatedSlippagePct) {
-        monitor.inc('Executor.buyEstimatedSlippageRejected', 1, 'Executor');
-        console.warn(
-          `[Executor:LIVE] BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
-            `estimated slippage ${estimatedSlippagePct.toFixed(2)}%>${maxEstimatedSlippagePct}%`,
-        );
-        return {
-          success: false,
-          error: `estimated_buy_slippage:${estimatedSlippagePct.toFixed(2)}%>${maxEstimatedSlippagePct}%`,
-          estimatedSlippagePct,
-          latencyMs: Date.now() - t0,
-        };
-      }
+
+      const fmtPrice = (value) => Number.isFinite(value) ? value.toExponential(6) : 'n/a';
+      const fmtAge = (value) => Number.isFinite(value) ? `${Math.round(value)}ms` : 'miss';
+      console.log(
+        `[Executor:LIVE] BUY quote: signal=${fmtPrice(buyDiagnostics.signalPrice)} ` +
+          `expected=${fmtPrice(buyDiagnostics.expectedPrice)} ` +
+          `deviation=${priceGuard.priceDeviationPct.toFixed(2)}% ` +
+          `slippage=${configuredSlippagePct.toFixed(2)}%->${effectiveSlippagePct.toFixed(2)}% ` +
+          `maxQuote=${buyDiagnostics.maxQuoteSol.toFixed(9)}SOL ` +
+          `cache=${fmtAge(buyDiagnostics.cacheAgeBeforeMs)}->${fmtAge(buyDiagnostics.cacheAgeAtBuildMs)}[${stateSource}]`,
+      );
 
       // 3. 构造、签名、提交
       // v3.32: 传入 baseTokenProgram 支持 Token-2022 币
@@ -1166,7 +1227,7 @@ class Executor {
           }ms, fee=${feeInfo.totalLamports}L ${feeInfo.source})`,
       );
 
-      return {
+      return finishBuy({
         success: true,
         signature: sig,
         tokenAmount,
@@ -1180,7 +1241,7 @@ class Executor {
         priorityFeeSource: feeInfo.source,
         sendLatencyMs,
         buySlot: this._latestBuySlot || null,  // 提交时的链上 slot
-      };
+      });
     } catch (err) {
       monitor.inc('Executor.buyFail', 1, 'Executor');
       monitor.recordError('Executor', err, {
@@ -1188,9 +1249,10 @@ class Executor {
         mint: order.mint,
         symbol: order.symbol,
         sizeSol,
+        ...buyDiagnostics,
       });
       console.error(`[Executor:LIVE] BUY failed: ${err.message}`);
-      return { success: false, error: err.message, latencyMs: Date.now() - t0 };
+      return finishBuy({ success: false, error: err.message, latencyMs: Date.now() - t0 });
     }
   }
 
@@ -1426,6 +1488,33 @@ class Executor {
 
   _estimateBuySlippagePct(state, sizeSol, tokenAmount, baseDecimals = 6) {
     return estimateBuySlippagePct(state, sizeSol, tokenAmount, baseDecimals);
+  }
+
+  _calculateBuyQuote(state, quote, slippagePct) {
+    if (!this.buyQuoteCalculator) throw new Error('Pump buy quote calculator is unavailable');
+    const {
+      baseMint,
+      baseMintAccount,
+      feeConfig,
+      globalConfig,
+      pool,
+      poolBaseAmount,
+      poolQuoteAmount,
+    } = state || {};
+    if (!pool) throw new Error('Pump pool state is missing pool metadata');
+    return this.buyQuoteCalculator({
+      quote,
+      slippage: slippagePct,
+      baseReserve: poolBaseAmount,
+      quoteReserve: poolQuoteAmount,
+      virtualQuoteReserves: pool.virtualQuoteReserves,
+      globalConfig,
+      baseMintAccount,
+      baseMint,
+      coinCreator: pool.coinCreator,
+      creator: pool.creator,
+      feeConfig,
+    });
   }
 
   /**

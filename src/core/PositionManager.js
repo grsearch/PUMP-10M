@@ -545,7 +545,7 @@ class PositionManager extends EventEmitter {
    * @param {string} p.signature
    * @param {number} [p.buyFeeLamports] - BUY tx 的 priority fee + base fee (lamports)
    */
-  registerOpen({ positionId, mint, symbol, entrySol, entryPrice, tokenAmount, dryRun, signature, buyFeeLamports, buySlot, dumpSlot, entryFdv, entryPoolSol, entryLiquidity, sellCount10s, totalSellSol10s, mintAgeAtBuySec, rsiPreDump, rsi1sPreDump, rsi30sPreDump, isEmaStrategy = false, isAddOn = false }) {
+  registerOpen({ positionId, mint, symbol, entrySol, entryPrice, tokenAmount, dryRun, signature, buyFeeLamports, buySlot, dumpSlot, entryFdv, entryPoolSol, entryLiquidity, sellCount10s, totalSellSol10s, mintAgeAtBuySec, rsiPreDump, rsi1sPreDump, rsi30sPreDump, buyDiagnostics = null, isEmaStrategy = false, isAddOn = false }) {
     const pid = positionId || crypto.randomUUID();
     const pos = {
       positionId: pid,
@@ -560,6 +560,7 @@ class PositionManager extends EventEmitter {
       buyFeeLamports: buyFeeLamports || 0,  // v3.4: 真实成本
       sellFeeLamports: 0,                    // 卖出时累加（包括所有重试的 fee）
       buySlot: buySlot || 0,                // v3.17.11: BUY 时的链上 slot
+      buyDiagnostics: buyDiagnostics ? { ...buyDiagnostics } : null,
       dumpSlot: dumpSlot || 0,              // v3.17.19: 砸单的链上 slot (用于计算 BUY 落链领先几个 slot)
       exiting: false,
       sellAttempts: 0,
@@ -715,6 +716,9 @@ class PositionManager extends EventEmitter {
           monitor.inc('PositionManager.reconcileWatchdog', 1, 'PositionManager');
           const feeSol = ((p.buyFeeLamports || 0) + 5000) / 1e9;
           try {
+            if (this.tradeLogger?.markBuyChainFailed) {
+              this.tradeLogger.markBuyChainFailed(pid, 'BUY_RECONCILE_TIMEOUT', p.buyDiagnostics);
+            }
             this.tradeLogger.closePosition(pid, {
               closedAt: Date.now(),
               exitPrice: p.entryPrice,
@@ -731,6 +735,10 @@ class PositionManager extends EventEmitter {
           this._removeByMint(mint, pid);
           // v3.17.21: BUY reconcile 超时 → 从 hotMints 移除
           if (this.executor?.poolStateCache) this.executor.poolStateCache.removeHot(mint);
+          if (this.signalEngine?.setBuyFailureCooldown) {
+            const cooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
+            this.signalEngine.setBuyFailureCooldown(mint, cooldownMs, 'BUY_RECONCILE_TIMEOUT');
+          }
           monitor.set('PositionManager.openCount', this.positions.size, 'PositionManager');
         }
       }, 60_000);
@@ -785,6 +793,23 @@ class PositionManager extends EventEmitter {
       // 没买到 token，所以 exitSol = 0, tokenAmount 应该是 0
       const feeSol = ((pos.buyFeeLamports || 0) + 5000) / 1e9;
 
+      // Arm protection before any DB/event work so a logging failure cannot
+      // reopen the fee-burning retry window.
+      if (this.signalEngine?.setBuyFailureCooldown) {
+        const buyFailedCooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
+        this.signalEngine.setBuyFailureCooldown(mint, buyFailedCooldownMs, 'BUY_CHAIN_FAILED');
+        console.log(
+          `[PositionManager] 🔒 BUY_CHAIN_FAILED cooldown ${pos.symbol || mint.slice(0, 6)} for ${Math.round(buyFailedCooldownMs / 3600000)}h (no rebuy)`,
+        );
+      }
+
+      // The BUY row was initially recorded when the transaction was submitted.
+      // Correct it once confirmation proves the chain execution failed, while
+      // preserving the quote/cache diagnostics needed to diagnose 6004 errors.
+      if (this.tradeLogger?.markBuyChainFailed) {
+        this.tradeLogger.markBuyChainFailed(positionId, errMsg, pos.buyDiagnostics);
+      }
+
       this.tradeLogger.closePosition(positionId, {
         closedAt: Date.now(),
         exitPrice: pos.entryPrice,
@@ -819,19 +844,11 @@ class PositionManager extends EventEmitter {
         if (this.executor?.poolStateCache && pos.poolAddress) {
           this.executor.poolStateCache.markDead(pos.poolAddress);
           console.warn(
-            `[PositionManager] 🪦 Pool marked dead (IncorrectProgramId): ${pos.poolAddress.slice(0, 8)}.. for ${symbol || mint.slice(0, 6)} — likely migrated to Raydium`,
+            `[PositionManager] 🪦 Pool marked dead (IncorrectProgramId): ${pos.poolAddress.slice(0, 8)}.. for ${pos.symbol || mint.slice(0, 6)} — likely migrated to Raydium`,
           );
         }
       }
 
-      // v3.26: BUY_CHAIN_FAILED → 24h 冷却，防止同币反复买入失败
-      if (this.signalEngine && this.signalEngine._exitCooldowns) {
-        const buyFailedCooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
-        this.signalEngine._exitCooldowns.set(mint, Date.now() + buyFailedCooldownMs);
-        console.log(
-          `[PositionManager] 🔒 BUY_CHAIN_FAILED cooldown ${symbol || mint.slice(0, 6)} for ${Math.round(buyFailedCooldownMs / 3600000)}h (no rebuy)`,
-        );
-      }
       // v3.17.42: 广播关闭事件给前端，否则前端不知道仓位已关闭
       this.emit('closed', {
         positionId,
@@ -876,6 +893,13 @@ class PositionManager extends EventEmitter {
       );
       // 同样按链上失败处理（保险起见）
       const feeSol = ((pos.buyFeeLamports || 0) + 5000) / 1e9;
+      if (this.signalEngine?.setBuyFailureCooldown) {
+        const cooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
+        this.signalEngine.setBuyFailureCooldown(mint, cooldownMs, 'BUY_PARSE_FAILED');
+      }
+      if (this.tradeLogger?.markBuyChainFailed) {
+        this.tradeLogger.markBuyChainFailed(positionId, 'BUY_PARSE_FAILED', pos.buyDiagnostics);
+      }
       this.tradeLogger.closePosition(positionId, {
         closedAt: Date.now(),
         exitPrice: pos.entryPrice,

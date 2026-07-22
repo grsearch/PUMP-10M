@@ -235,10 +235,10 @@ class PoolStateCache {
    * 单点刷新（dumpSignal 触发 / addHot 时使用）
    * 不阻塞调用方；后台异步刷新。如果该 pool 0.5s 内已经刷过则跳过。
    */
-  async refreshOne(poolAddress) {
+  async refreshOne(poolAddress, { maxAgeMs = 500, force = false } = {}) {
     if (!this.onlineSdk || !this.user || !poolAddress) return null;
     const cached = this.cache.get(poolAddress);
-    if (cached && Date.now() - cached.fetchedAt < 500) return cached.state;
+    if (!force && cached && Date.now() - cached.fetchedAt <= maxAgeMs) return cached.state;
     try {
       const state = await this._fetchPoolState(poolAddress);
       if (state) {
