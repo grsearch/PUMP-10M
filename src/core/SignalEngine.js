@@ -162,6 +162,40 @@ class SignalEngine extends EventEmitter {
     this.inflightBuys.delete(mint);
   }
 
+  _getMintBuyAllowance(mint, currentPrice) {
+    const openCount = this.positionManager.openPositionCountByMint
+      ? this.positionManager.openPositionCountByMint(mint)
+      : (this.positionManager.hasOpenPosition(mint) ? 1 : 0);
+    const successfulBuyCount =
+      typeof this.tradeLogger.countSuccessfulBuysByMint === 'function'
+        ? this.tradeLogger.countSuccessfulBuysByMint(mint)
+        : openCount;
+
+    if (
+      openCount >= config.strategy.maxBuysPerMint ||
+      successfulBuyCount >= config.strategy.maxBuysPerMint
+    ) {
+      return {
+        allowed: false,
+        reason: `same mint reached ${config.strategy.maxBuysPerMint} buys`,
+      };
+    }
+    if (openCount === 0 && successfulBuyCount > 0) {
+      return {
+        allowed: false,
+        reason: 'initial leg already closed; second buy is only allowed as an add-on',
+      };
+    }
+    if (openCount === 1) {
+      const addOn = this.positionManager.canAddOn(mint, currentPrice);
+      if (!addOn.allowed) {
+        return { allowed: false, reason: `add-on blocked: ${addOn.reason}` };
+      }
+      return { allowed: true, isAddOn: true, addOn };
+    }
+    return { allowed: true, isAddOn: false, addOn: null };
+  }
+
   setBuyFailureCooldown(mint, durationMs, reason = 'BUY_FAILED') {
     const duration = Number(durationMs);
     if (!mint || !Number.isFinite(duration) || duration <= 0) return null;
@@ -194,6 +228,7 @@ class SignalEngine extends EventEmitter {
     // v3.17.16: 记录信号到达 SignalEngine 的时间,用于事后分析 emit→BUY 延迟
     const _signalReceivedAt = Date.now();
     const { mint, symbol, sellSol, priceImpactPct, seller, signature, ts, slot } = signal;
+    const isRsi15sSignal = Boolean(signal._activityFlow && signal._flow?.entryRsi15s);
 
 
     // 1. 自触发过滤
@@ -349,7 +384,7 @@ class SignalEngine extends EventEmitter {
     signal._rsi30sPreDump = rsi30sPreDump;
 
     // v3.17.39: 距近期高点跌幅过滤
-    const minDropFromHighPct = config.strategy.minDropFromRecentHighPct;
+    const minDropFromHighPct = isRsi15sSignal ? 0 : config.strategy.minDropFromRecentHighPct;
     const lookbackSec = config.strategy.minDropLookbackSec || 1200;
     if (minDropFromHighPct > 0 && this.rsiCalculator) {
       const prices = this.rsiCalculator.getRecentPriceHistory(mint, lookbackSec, '5s');
@@ -368,7 +403,7 @@ class SignalEngine extends EventEmitter {
     //   实战案例: Backrooms 30s内从1.4e-6拉到2.0e-6(+42%), 砸单信号在拉盘顶部触发
     //   长窗口(30min)采样粒度太粗,根本看不到秒级脉冲
     //   用 RsiCalculator 的 1s 桶价格历史检测短窗口涨幅
-    const recentPumpShortSec = config.strategy.recentPumpShortSec;
+    const recentPumpShortSec = isRsi15sSignal ? 0 : config.strategy.recentPumpShortSec;
     const recentPumpShortMaxPct = config.strategy.recentPumpShortMaxPct;
     if (recentPumpShortSec > 0 && recentPumpShortMaxPct > 0 && this.rsiCalculator) {
       const prices = this.rsiCalculator.getRecentPriceHistory(mint, recentPumpShortSec, '1s');
@@ -387,7 +422,7 @@ class SignalEngine extends EventEmitter {
     }
 
     // v3.17.40: 长窗口涨幅过滤
-    const recentPumpLongSec = config.strategy.recentPumpLongSec;
+    const recentPumpLongSec = isRsi15sSignal ? 0 : config.strategy.recentPumpLongSec;
     const recentPumpLongMaxPct = config.strategy.recentPumpLongMaxPct;
     if (recentPumpLongSec > 0 && recentPumpLongMaxPct > 0) {
       const pumpPct = this._getLongPumpPct(mint, recentPumpLongSec * 1000);
@@ -429,15 +464,34 @@ class SignalEngine extends EventEmitter {
       }
     }
 
-    // Hot-path age guard uses the same Pump migration AGE as TokenWatchdog.
-    const maxAgeH = config.strategy.maxMintAgeHours;
+    // Do not open a leg that the position policy would immediately force out.
     if (this.tokenRegistry) {
       const tokenInfo = this.tokenRegistry.getToken(mint);
       const migrationTime = normalizeUnixMs(tokenInfo?.migration_time);
-      // Unknown migration time is allowed; never substitute mint creation time.
-      if (migrationTime && (Date.now() - migrationTime) > maxAgeH * 3600 * 1000) {
+      const mintAgeMs = migrationTime ? Date.now() - migrationTime : null;
+      if (
+        migrationTime &&
+        config.strategy.ageExitMs > 0 &&
+        mintAgeMs >= config.strategy.ageExitMs
+      ) {
         monitor.inc('SignalEngine.rejectedOldMint', 1, 'SignalEngine');
-        this._logReject(signal, `mint age > ${maxAgeH}h`);
+        this._logReject(
+          signal,
+          `mint AGE ${(mintAgeMs / 60_000).toFixed(2)}m >= ${config.strategy.ageExitMs / 60_000}m`,
+        );
+        return;
+      }
+      const registryFdv = tokenInfo?.fdv == null ? NaN : Number(tokenInfo.fdv);
+      if (
+        Number.isFinite(registryFdv) &&
+        registryFdv >= 0 &&
+        registryFdv < config.strategy.fdvExitThresholdUsd
+      ) {
+        monitor.inc('SignalEngine.rejectedExitFdv', 1, 'SignalEngine');
+        this._logReject(
+          signal,
+          `FDV $${Math.round(registryFdv)} < $${config.strategy.fdvExitThresholdUsd}`,
+        );
         return;
       }
     }
@@ -479,14 +533,18 @@ class SignalEngine extends EventEmitter {
 
     if (this.inflightBuys.has(mint)) {
       monitor.inc('SignalEngine.rejectedInflightBuy', 1, 'SignalEngine');
-      this._logReject(signal, 'buy in-flight (no add-on)');
+      this._logReject(signal, 'buy already in-flight for this mint');
       return;
     }
-    const mintOpenCount = this.positionManager.openPositionCountByMint ? this.positionManager.openPositionCountByMint(mint) : (this.positionManager.hasOpenPosition(mint) ? 1 : 0);
-    if (mintOpenCount >= 1) {
+    const mintAllowance = this._getMintBuyAllowance(mint, signal.priceAfter);
+    if (!mintAllowance.allowed) {
       monitor.inc('SignalEngine.rejectedSameMintOpen', 1, 'SignalEngine');
-      this._logReject(signal, `same mint already has open position (${mintOpenCount})`);
+      this._logReject(signal, mintAllowance.reason);
       return;
+    }
+    if (mintAllowance.isAddOn) {
+      signal._isAddOn = true;
+      signal._addOn = mintAllowance.addOn;
     }
 
     // 8. 短窗口累计跌幅检查 — 防止买入 RUG
@@ -529,8 +587,12 @@ class SignalEngine extends EventEmitter {
     // 砸盘深度 = (砸单前5min均价 - 买入价) / 均价 * 100
     // 数据支撑(7天回测): >50%深度 avgPnL -10%, 17笔深亏; 10-25%深度 WR 60-68%
     {
-      const maxDumpDepthPct = parseFloat(process.env.MAX_DUMP_DEPTH_PCT || '0');
-      const minDumpDepthPct = parseFloat(process.env.MIN_DUMP_DEPTH_PCT || '0');
+      const maxDumpDepthPct = isRsi15sSignal
+        ? 0
+        : parseFloat(process.env.MAX_DUMP_DEPTH_PCT || '0');
+      const minDumpDepthPct = isRsi15sSignal
+        ? 0
+        : parseFloat(process.env.MIN_DUMP_DEPTH_PCT || '0');
       if (maxDumpDepthPct > 0 || minDumpDepthPct > 0) {
         const samples = this._longPriceSamples.get(mint);
         if (samples && samples.length >= 3) {
@@ -571,7 +633,9 @@ class SignalEngine extends EventEmitter {
     //   过滤后总PnL: -71.89→-35.70 SOL (+36.19 SOL改善)
     //   新币PnL: -35.84→-9.07 SOL (+26.77 SOL改善)
     {
-      const maxPreVol5m = parseFloat(process.env.MAX_PRE_VOL_5M_PCT || '0');
+      const maxPreVol5m = isRsi15sSignal
+        ? 0
+        : parseFloat(process.env.MAX_PRE_VOL_5M_PCT || '0');
       if (maxPreVol5m > 0) {
         const samples = this._longPriceSamples.get(mint);
         if (samples && samples.length >= 3) {
@@ -613,7 +677,7 @@ class SignalEngine extends EventEmitter {
     // ============ v3.24: 趋势过滤 — 5分钟跌+1分钟跌时跳过买入 ============
     // 数据支撑(7天): 5m跌+1m跌 WR=45%, PF=0.07, 深亏35%; 跳过后PF从0.44→0.69
     {
-      const trendFilterEnabled = process.env.TREND_FILTER_ENABLED === '1';
+      const trendFilterEnabled = !isRsi15sSignal && process.env.TREND_FILTER_ENABLED === '1';
       if (trendFilterEnabled) {
         const samples = this._longPriceSamples.get(mint);
         if (samples && samples.length >= 5) {
@@ -650,7 +714,9 @@ class SignalEngine extends EventEmitter {
     // 竞对数据: 老币 pool>=100 + impact>=5% PF=7.93, 是最优策略
     // 我们的池子太小(30 SOL)的老币亏损严重, peak才3-4%涨不动
     {
-      const oldCoinMinPoolSol = parseFloat(process.env.OLD_COIN_MIN_POOL_SOL || '0');
+      const oldCoinMinPoolSol = isRsi15sSignal
+        ? 0
+        : parseFloat(process.env.OLD_COIN_MIN_POOL_SOL || '0');
       if (oldCoinMinPoolSol > 0 && this.tokenRegistry) {
         const tokenInfo = this.tokenRegistry.getToken(mint);
         if (tokenInfo && tokenInfo.added_at) {
@@ -698,7 +764,8 @@ class SignalEngine extends EventEmitter {
       activityReason =
         `rsi_15s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
         `${entry.currentRsi.toFixed(2)} cross>${entry.threshold} ` +
-        `vol60=$${entry.volume60sUsd.toFixed(0)} next_candle_open=${entry.entryOpenPrice}`;
+        `vol60=$${entry.volume60sUsd.toFixed(0)} execution=${entry.executionPrice}` +
+        `${signal._isAddOn ? ` add_on_drop=${signal._addOn.dropPct.toFixed(2)}%` : ''}`;
     } else if (signal._activityFlow && flow?.entryV6) {
       activityReason =
         `breadth_burst_v6: 1m=${flow.s60.buyCount}buys/${flow.s60.volumeSol.toFixed(2)}SOL ` +

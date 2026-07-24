@@ -63,16 +63,11 @@ class OrderFlowTracker extends EventEmitter {
     ).toUpperCase();
     // Existing production .env files still name V5. Remap them so deployment cannot silently keep old entry rules.
     this.entryMode = requestedEntryMode === 'ACTIVITY_BURST_V5' ? 'BREADTH_BURST_V6' : requestedEntryMode;
-    this.rsi15sPeriod =
-      opts.rsi15sPeriod ?? flowConfig.rsi15sPeriod ?? numEnv('RSI_15S_PERIOD', 7);
-    this.rsi15sEntryThreshold =
-      opts.rsi15sEntryThreshold ?? flowConfig.rsi15sEntryThreshold ?? numEnv('RSI_15S_ENTRY_THRESHOLD', 30);
-    this.rsi15sVolumeWindowMs =
-      opts.rsi15sVolumeWindowMs ?? flowConfig.rsi15sVolumeWindowMs ?? numEnv('RSI_15S_VOLUME_WINDOW_MS', 60_000);
+    this.rsi15sPeriod = opts.rsi15sPeriod ?? flowConfig.rsi15sPeriod ?? 7;
+    this.rsi15sEntryThreshold = opts.rsi15sEntryThreshold ?? flowConfig.rsi15sEntryThreshold ?? 30;
+    this.rsi15sVolumeWindowMs = opts.rsi15sVolumeWindowMs ?? flowConfig.rsi15sVolumeWindowMs ?? 60_000;
     this.rsi15sMinVolume60sUsd =
-      opts.rsi15sMinVolume60sUsd ??
-      flowConfig.rsi15sMinVolume60sUsd ??
-      numEnv('RSI_15S_MIN_VOLUME_60S_USD', 5_000);
+      opts.rsi15sMinVolume60sUsd ?? flowConfig.rsi15sMinVolume60sUsd ?? 5_000;
     this.minVolume1mUsd =
       opts.minVolume1mUsd ?? flowConfig.minVolume1mUsd ?? numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
     this.minVolume1mSol =
@@ -625,7 +620,6 @@ class OrderFlowTracker extends EventEmitter {
         closedBars: snapshot.rsi15sClosedBars || 0,
         volume60sUsd: round(liveVolume60sUsd, 2),
         signalCandleTs: state.rsi15sSignalCandleTs || null,
-        entryCandleTs: state.rsi15sEntryCandleTs || null,
         waitReason: state.rsi15sWaitReason || null,
       });
     }
@@ -644,11 +638,12 @@ class OrderFlowTracker extends EventEmitter {
         entryCross: this.rsi15sEntryThreshold,
         volumeWindowMs: this.rsi15sVolumeWindowMs,
         minVolume60sUsd: this.rsi15sMinVolume60sUsd,
-        exitOverbought: config.strategy.rsi15sOverboughtExit,
-        exitCrossDown: config.strategy.rsi15sCrossDownExit,
         trailingActivatePct: config.strategy.trailingActivatePct,
         trailingDrawdownPct: config.strategy.trailingDrawdownPct,
-        maxHoldMs: config.strategy.maxHoldMs,
+        fdvExitThresholdUsd: config.strategy.fdvExitThresholdUsd,
+        ageExitMs: config.strategy.ageExitMs,
+        addonDropPct: config.strategy.addonDropPct,
+        maxBuysPerMint: config.strategy.maxBuysPerMint,
       },
       summary,
       candidates: candidates.slice(0, safeLimit),
@@ -686,7 +681,6 @@ class OrderFlowTracker extends EventEmitter {
         rsi15sClosed: null,
         rsi15sVolume60sUsd: 0,
         rsi15sSignalCandleTs: null,
-        rsi15sEntryCandleTs: null,
         rsi15sSignalTs: null,
         rsi15sWaitReason: null,
       };
@@ -864,7 +858,7 @@ class OrderFlowTracker extends EventEmitter {
     const snapshot = state.rsi15sSnapshot;
     if (!snapshot) return;
 
-    const entryBucketTs = snapshot.rsi15sCurrentBucketTs == null
+    const currentBucketTs = snapshot.rsi15sCurrentBucketTs == null
       ? NaN
       : Number(snapshot.rsi15sCurrentBucketTs);
     const signalBucketTs = snapshot.rsi15sClosedBucketTs == null
@@ -872,14 +866,15 @@ class OrderFlowTracker extends EventEmitter {
       : Number(snapshot.rsi15sClosedBucketTs);
     const eventBucketTs = Math.floor(ev.ts / 15_000) * 15_000;
     if (
-      !Number.isFinite(entryBucketTs) ||
+      !Number.isFinite(currentBucketTs) ||
       !Number.isFinite(signalBucketTs) ||
-      entryBucketTs !== eventBucketTs ||
-      state.rsi15sLastEvaluatedOpenBucketTs === entryBucketTs
+      currentBucketTs !== eventBucketTs ||
+      state.rsi15sLastEvaluatedOpenBucketTs === currentBucketTs
     ) return;
 
-    // Only the first trusted trade in this bucket is its executable open.
-    state.rsi15sLastEvaluatedOpenBucketTs = entryBucketTs;
+    // Evaluate a closed 15-second candle once, on the first trusted event that
+    // proves the next bucket has started, then emit the order immediately.
+    state.rsi15sLastEvaluatedOpenBucketTs = currentBucketTs;
     const previousRsi = snapshot.rsi15sPreviousClosed == null
       ? NaN
       : Number(snapshot.rsi15sPreviousClosed);
@@ -891,7 +886,7 @@ class OrderFlowTracker extends EventEmitter {
 
     if (!Number.isFinite(previousRsi) || !Number.isFinite(currentRsi)) {
       state.rsi15sStage = 'warming';
-      state.rsi15sWaitReason = `need ${this.rsi15sPeriod + 2} tradable 15s candles`;
+      state.rsi15sWaitReason = `need ${this.rsi15sPeriod + 2} closed 15s candles`;
       return;
     }
 
@@ -913,7 +908,6 @@ class OrderFlowTracker extends EventEmitter {
     const volume60sUsd = volume60sSol * this.solPriceUsd;
     state.rsi15sVolume60sUsd = volume60sUsd;
     state.rsi15sSignalCandleTs = signalBucketTs;
-    state.rsi15sEntryCandleTs = entryBucketTs;
 
     if (volume60sUsd < this.rsi15sMinVolume60sUsd) {
       state.rsi15sStage = 'volume-blocked';
@@ -922,7 +916,7 @@ class OrderFlowTracker extends EventEmitter {
       return;
     }
 
-    const s60 = this._stats(state, entryBucketTs - 1, this.rsi15sVolumeWindowMs);
+    const s60 = this._stats(state, signalCloseTs - 1, this.rsi15sVolumeWindowMs);
     const entry = {
       period: this.rsi15sPeriod,
       previousRsi: round(previousRsi, 4),
@@ -932,8 +926,7 @@ class OrderFlowTracker extends EventEmitter {
       volume60sUsd: round(volume60sUsd, 2),
       signalCandleTs: signalBucketTs,
       signalCloseTs,
-      entryCandleTs: entryBucketTs,
-      entryOpenPrice: ev.price,
+      executionPrice: ev.price,
     };
     const signal = {
       mint: ev.mint,
@@ -970,7 +963,7 @@ class OrderFlowTracker extends EventEmitter {
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_15S ` +
         `RSI(${this.rsi15sPeriod})=${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} ` +
-        `vol60=$${volume60sUsd.toFixed(0)} entryOpen=${ev.price}`,
+        `vol60=$${volume60sUsd.toFixed(0)} execution=${ev.price}`,
     );
     this.emit('flowReversalSignal', signal);
   }

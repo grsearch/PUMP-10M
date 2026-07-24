@@ -257,8 +257,7 @@ function runExitTests() {
   timeout._exitCalls = [];
   timeout._exitForCondition = manager._exitForCondition;
   timeout._tick();
-  assert.strictEqual(timeout._exitCalls.length, 1);
-  assert.strictEqual(timeout._exitCalls[0].reason, 'TIMEOUT_5M');
+  assert.strictEqual(timeout._exitCalls.length, 0, 'the retired max-hold exit must stay disabled');
 }
 
 function runSlippageTests() {
@@ -285,7 +284,7 @@ function runSlippageTests() {
   assert.strictEqual(config.strategy.buyMaxPoolStateAgeMs, 500);
   assert.strictEqual(config.strategy.buyMaxEstimatedSlippagePct, 5);
   assert.strictEqual(config.strategy.noBounceExitMs, 90_000);
-  assert.strictEqual(config.strategy.maxHoldMs, 300_000);
+  assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
   assert.strictEqual(config.activityFlow.minPoolQuoteSol, undefined);
   assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_15S');
   assert.strictEqual(config.activityFlow.breadthMinUniqueBuyers1m, 100);

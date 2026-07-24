@@ -58,37 +58,47 @@ function feed(calc, tracker, ev) {
   tracker.handleSwap(ev);
 }
 
-function runNextTradableOpenTest() {
+function runClosedCandleSignalTest() {
   const calc = new RsiCalculator({ period15: 7 });
   const tracker = makeTracker();
   const signals = [];
   tracker.on('flowReversalSignal', (signal) => signals.push(signal));
 
   CLOSES.slice(0, 9).forEach((price, index) => feed(calc, tracker, event(index, price)));
-  assert.strictEqual(signals.length, 0, 'the crossover candle must not buy at its own close');
+  assert.strictEqual(signals.length, 0, 'an open 15s candle must not confirm itself');
 
-  const open = event(9, CLOSES[9]);
-  feed(calc, tracker, open);
-  assert.strictEqual(signals.length, 1, 'the next tradable candle open must execute the confirmed signal');
+  const confirmation = event(9, CLOSES[9]);
+  feed(calc, tracker, confirmation);
+  assert.strictEqual(signals.length, 1, 'the first trusted event after close must emit immediately');
   const entry = signals[0]._flow.entryRsi15s;
   assert(entry.previousRsi <= 30);
   assert(entry.currentRsi > 30);
   assert.strictEqual(entry.signalCandleTs, BASE + 8 * FRAME_MS);
-  assert.strictEqual(entry.entryCandleTs, BASE + 9 * FRAME_MS);
-  assert.strictEqual(entry.entryOpenPrice, CLOSES[9]);
-  assert.strictEqual(signals[0].priceAfter, CLOSES[9]);
+  assert.strictEqual(entry.signalCloseTs, BASE + 9 * FRAME_MS);
+  assert.strictEqual(entry.executionPrice, CLOSES[9]);
+  assert.strictEqual(Object.hasOwn(entry, 'entryCandleTs'), false);
+  assert.strictEqual(Object.hasOwn(entry, 'entryOpenPrice'), false);
   assert(entry.volume60sUsd >= 5_000);
 
-  feed(calc, tracker, { ...open, ts: open.ts + 2_000, signature: 'same-candle-second-trade' });
-  assert.strictEqual(signals.length, 1, 'only the first trade of the entry candle may execute');
-  const view = tracker.getStrategyCandidates(10, open.ts);
+  feed(calc, tracker, {
+    ...confirmation,
+    ts: confirmation.ts + 2_000,
+    signature: 'same-bucket-second-trade',
+  });
+  assert.strictEqual(signals.length, 1, 'a closed candle may signal only once');
+
+  const view = tracker.getStrategyCandidates(10, confirmation.ts);
   assert.strictEqual(view.mode, 'RSI_CROSS_15S');
   assert.strictEqual(view.candidates[0].stage, 'signaled');
-  assert.strictEqual(view.thresholds.exitOverbought, 80);
-  assert.strictEqual(view.thresholds.exitCrossDown, 70);
-  assert.strictEqual(view.thresholds.trailingActivatePct, 30);
-  assert.strictEqual(view.thresholds.trailingDrawdownPct, 8);
-  assert.strictEqual(view.thresholds.maxHoldMs, 300_000);
+  assert.strictEqual(view.thresholds.trailingActivatePct, 50);
+  assert.strictEqual(view.thresholds.trailingDrawdownPct, 10);
+  assert.strictEqual(view.thresholds.fdvExitThresholdUsd, 20_000);
+  assert.strictEqual(view.thresholds.ageExitMs, 15 * 60_000);
+  assert.strictEqual(view.thresholds.addonDropPct, 15);
+  assert.strictEqual(view.thresholds.maxBuysPerMint, 2);
+  assert.strictEqual(Object.hasOwn(view.thresholds, 'exitOverbought'), false);
+  assert.strictEqual(Object.hasOwn(view.thresholds, 'exitCrossDown'), false);
+  assert.strictEqual(Object.hasOwn(view.thresholds, 'maxHoldMs'), false);
 }
 
 function runVolumeGateTests() {
@@ -96,10 +106,10 @@ function runVolumeGateTests() {
   const blocked = makeTracker();
   const blockedSignals = [];
   blocked.on('flowReversalSignal', (signal) => blockedSignals.push(signal));
-  CLOSES.forEach((price, index) => feed(blockedCalc, blocked, event(index, price, 10, 'blocked')));
+  CLOSES.forEach((price, index) => feed(blockedCalc, blocked, event(index, price, 5, 'blocked')));
   assert.strictEqual(blockedSignals.length, 0);
   assert.strictEqual(blocked.states.get(MINT).rsi15sStage, 'volume-blocked');
-  assert.strictEqual(blocked.states.get(MINT).rsi15sVolume60sUsd, 4_000);
+  assert.strictEqual(blocked.states.get(MINT).rsi15sVolume60sUsd, 2_000);
 
   const exactCalc = new RsiCalculator({ period15: 7 });
   const exact = makeTracker();
@@ -111,29 +121,11 @@ function runVolumeGateTests() {
     symbol: 'RSI15',
     side: 'BUY',
     solVolume: 10,
-    ts: BASE + 8 * FRAME_MS + 5_000,
+    ts: BASE + 8 * FRAME_MS + 2_000,
   });
   feed(exactCalc, exact, event(9, CLOSES[9], 10, 'exact'));
-  assert.strictEqual(exactSignals.length, 1, 'true volume without a trusted price must count at the $5k boundary');
+  assert.strictEqual(exactSignals.length, 1, 'true volume must pass at the exact $5k boundary');
   assert.strictEqual(exactSignals[0]._flow.entryRsi15s.volume60sUsd, 5_000);
-}
-
-function runNextTradableAfterGapTest() {
-  const calc = new RsiCalculator({ period15: 7 });
-  const tracker = makeTracker();
-  const signals = [];
-  tracker.on('flowReversalSignal', (signal) => signals.push(signal));
-  CLOSES.slice(0, 9).forEach((price, index) => feed(calc, tracker, event(index, price)));
-
-  // Buckets 9 and 10 have no trusted trade. Bucket 11 is therefore the next
-  // tradable candle, while the volume gate remains anchored to bucket 8 close.
-  feed(calc, tracker, event(11, CLOSES[9]));
-  assert.strictEqual(signals.length, 1);
-  const entry = signals[0]._flow.entryRsi15s;
-  assert.strictEqual(entry.signalCandleTs, BASE + 8 * FRAME_MS);
-  assert.strictEqual(entry.entryCandleTs, BASE + 11 * FRAME_MS);
-  assert.strictEqual(entry.signalCloseTs, BASE + 9 * FRAME_MS);
-  assert.strictEqual(entry.volume60sUsd, 8_000);
 }
 
 function runDefaultsTest() {
@@ -141,34 +133,30 @@ function runDefaultsTest() {
   assert.strictEqual(config.activityFlow.rsi15sPeriod, 7);
   assert.strictEqual(config.activityFlow.rsi15sEntryThreshold, 30);
   assert.strictEqual(config.activityFlow.rsi15sMinVolume60sUsd, 5_000);
-  assert.strictEqual(config.strategy.rsi15sExitEnabled, true);
-  assert.strictEqual(config.strategy.rsi15sOverboughtExit, 80);
-  assert.strictEqual(config.strategy.rsi15sCrossDownExit, 70);
-  assert.strictEqual(config.strategy.trailingActivatePct, 30);
-  assert.strictEqual(config.strategy.trailingDrawdownPct, 8);
-  assert.strictEqual(config.strategy.maxHoldMs, 300_000);
-  assert.strictEqual(config.strategy.takeProfitPct, 0);
-  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
-  assert.strictEqual(config.strategy.noBounceExitEnabled, false);
-  assert.strictEqual(config.strategy.flowReversalExitEnabled, false);
+  assert.strictEqual(config.strategy.trailingActivatePct, 50);
+  assert.strictEqual(config.strategy.trailingDrawdownPct, 10);
+  assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
+  assert.strictEqual(config.strategy.fdvExitThresholdUsd, 20_000);
+  assert.strictEqual(config.strategy.ageExitMs, 15 * 60_000);
+  assert.strictEqual(config.strategy.addonDropPct, 15);
+  assert.strictEqual(config.strategy.maxBuysPerMint, 2);
+  assert.strictEqual(Object.hasOwn(config.strategy, 'rsi15sExitEnabled'), false);
 }
 
 function runDashboardContractTest() {
   for (const filename of ['dashboard.html', 'index.html']) {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'public', filename), 'utf8');
     assert(html.includes('15s RSI Strategy'));
-    assert(html.includes('上一收盘 RSI(7)'));
-    assert(html.includes('当前收盘 RSI(7)'));
+    assert(html.includes('已收盘 15s K'));
     assert(html.includes('近 60s 真实成交量'));
-    assert(html.includes('下一可成交 K 开盘'));
-    assert(html.includes('移动止盈未激活时'));
-    assert(!html.includes('TEN_MIN_PULLBACK'));
-    assert(!html.includes('已停止展示旧策略指标'));
-    assert(!html.includes('配置错误：后端模式为'));
-    assert(!html.includes('Strategy V6'));
-    assert(!html.includes('V5 信号'));
-    assert(!html.includes('10m回踩恢复'));
-    assert(!html.includes('10M 成交量'));
+    assert(html.includes('FDV &lt;'));
+    assert(html.includes('AGE ≥'));
+    assert(html.includes('最多 ${thresholds.maxBuysPerMint'));
+    assert(!html.includes('下一可成交 K 开盘'));
+    assert(!html.includes('移动止盈未激活时'));
+    assert(!html.includes('最长持仓'));
+    assert(!html.includes('最大持仓'));
+    assert(!html.includes('stat-hold'));
     const inlineScripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
       .map((match) => match[1].trim())
       .filter(Boolean);
@@ -176,9 +164,8 @@ function runDashboardContractTest() {
   }
 }
 
-runNextTradableOpenTest();
+runClosedCandleSignalTest();
 runVolumeGateTests();
-runNextTradableAfterGapTest();
 runDefaultsTest();
 runDashboardContractTest();
 console.log('15s RSI entry strategy tests: PASS');

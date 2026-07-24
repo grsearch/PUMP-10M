@@ -12,14 +12,14 @@
  * 数据用于(回测查询):
  * - 计算 "post-exit max pump %" 和 "post-exit max dump %"
  * - 评估每个 exitReason 平均"卖早了多少"
- * - 校准 TAKE_PROFIT / TRAILING / EMERGENCY / TIMEOUT 阈值
+ * - 校准 TAKE_PROFIT / TRAILING / EMERGENCY 阈值
  *
  * 不影响:
  * - BUY/SELL 决策延迟(纯被动监听 EventEmitter)
  * - 新 RPC 调用(数据源是现有 priceTracker update 流)
  * - 主数据流(只读 priceTracker.on('update'))
  *
- * 窗口选择:5 分钟匹配策略时间尺度(持仓 73% 30s 到峰值, 2min 超时窗口)
+ * 窗口选择:5 分钟匹配策略时间尺度(持仓 73% 在 30s 内到峰值)
  * 超过 5 分钟的价格信息对策略决策无可操作意义
  */
 class PostExitTracker {
@@ -34,7 +34,7 @@ class PostExitTracker {
     this.priceTracker = priceTracker;
     this.tradeLogger = tradeLogger;
     this.windowMs = options.windowMs || 5 * 60 * 1000; // 5 min
-    // snapshot 时间点:10s/30s 对齐"73% 30s 到峰值"统计;1min/2min 对齐 MAX_HOLD 窗口;5min 终点
+    // snapshot 时间点:10s/30s 对齐"73% 30s 到峰值"统计;1min/2min/5min 记录后续路径
     this.snapshotOffsetsMs = options.snapshotOffsetsMs || [
       10_000, // 10s
       30_000, // 30s

@@ -30,10 +30,18 @@ class TokenWatchdog {
     this.maxWatchDurationMs = process.env.MAX_WATCH_DURATION_MS != null
       ? parseInt(process.env.MAX_WATCH_DURATION_MS, 10)
       : config.strategy.maxWatchDurationMs;
-    this.maxTokenAgeMs = config.strategy.maxTokenAgeMs;
-    this.minFdVUsd = process.env.MIN_FDV_USD != null
+    const configuredMaxTokenAgeMs = Number(config.strategy.maxTokenAgeMs) || 0;
+    const forcedAgeExitMs = Number(config.strategy.ageExitMs) || 0;
+    this.maxTokenAgeMs = configuredMaxTokenAgeMs > 0 && forcedAgeExitMs > 0
+      ? Math.min(configuredMaxTokenAgeMs, forcedAgeExitMs)
+      : Math.max(configuredMaxTokenAgeMs, forcedAgeExitMs);
+    const configuredMinFdVUsd = process.env.MIN_FDV_USD != null
       ? parseFloat(process.env.MIN_FDV_USD)
       : config.strategy.minFdVUsd;
+    this.minFdVUsd = Math.max(
+      Number.isFinite(configuredMinFdVUsd) ? configuredMinFdVUsd : 0,
+      Number(config.strategy.fdvExitThresholdUsd) || 0,
+    );
     this.maxFdVUsd = process.env.MAX_FDV_USD != null
       ? parseFloat(process.env.MAX_FDV_USD)
       : (config.strategy.maxFdVUsd || 0);
@@ -143,7 +151,7 @@ class TokenWatchdog {
 
   _isTokenTooOld(token, now = Date.now()) {
     const ageMs = this._getMigrationAgeMs(token, now);
-    return ageMs != null && this.maxTokenAgeMs > 0 && ageMs > this.maxTokenAgeMs;
+    return ageMs != null && this.maxTokenAgeMs > 0 && ageMs >= this.maxTokenAgeMs;
   }
 
   _backfillMigrationTime(token, market) {
@@ -281,9 +289,9 @@ class TokenWatchdog {
       const reasons = [];
 
       const tokenAgeMs = this._getMigrationAgeMs(token, now);
-      if (tokenAgeMs != null && this.maxTokenAgeMs > 0 && tokenAgeMs > this.maxTokenAgeMs) {
+      if (tokenAgeMs != null && this.maxTokenAgeMs > 0 && tokenAgeMs >= this.maxTokenAgeMs) {
         reasons.push(
-          `migration_age(${Math.ceil(tokenAgeMs / 60000)}min > ` +
+          `migration_age(${Math.ceil(tokenAgeMs / 60000)}min >= ` +
           `${this.maxTokenAgeMs / 60000}min)`,
         );
       }

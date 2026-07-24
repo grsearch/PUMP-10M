@@ -1358,6 +1358,17 @@ ${snapshotColumnsSql},
     } catch (_) { return -1; }
   }
 
+  countSuccessfulBuysByMint(mint) {
+    try {
+      const row = this.db.prepare(
+        'SELECT count(*) as cnt FROM positions WHERE mint = ?'
+      ).get(mint);
+      return row ? Number(row.cnt) || 0 : 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   /**
    * Delete price samples older than cutoffMs
    */

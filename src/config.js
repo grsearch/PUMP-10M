@@ -16,8 +16,9 @@ function numberEnv(name, fallback) {
 const solPriceUsdForConfig = numberEnv('SOL_PRICE_USD', 72);
 const activityFlow1mMinVolumeUsdDefault = numberEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
 const activityFlow1mMinVolumeSolDefault = activityFlow1mMinVolumeUsdDefault / Math.max(solPriceUsdForConfig, 0.001);
-// Keep the production AGE limit fixed even when an older .env still says 0 or 0.5.
-const maxMintAgeHours = 1;
+// Keep admission aligned with the forced AGE exit. Older server .env values
+// must not admit a token that the position policy would immediately sell.
+const maxMintAgeHours = 15 / 60;
 
 const config = {
   // ============ Mode ============
@@ -50,8 +51,9 @@ const config = {
     // 仓位
     positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.1'),
 
-    // RSI strategy exit model: live 15s RSI, +30%/8% trailing, and 300s timeout.
-    // Fixed TP remains configurable but is disabled by default.
+    // Fixed TP remains configurable but is disabled by default. Core exit
+    // thresholds below are fixed so stale server .env values cannot revive
+    // retired RSI or timeout exits.
     takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '0'),
     tpConfirmCount: parseInt(process.env.TP_CONFIRM_COUNT || '2', 10),
     tpConfirmMinGapMs: parseInt(process.env.TP_CONFIRM_MIN_GAP_MS || '300', 10),
@@ -61,18 +63,15 @@ const config = {
     //   trailingDrawdownPct: armed 后，价格从 HWM 回撤此 % 立即 SELL
     //   trailingMinHwmAgeMs: HWM 必须稳定至少此毫秒数（防单 tick 污染）
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
-    trailingActivatePct: parseFloat(process.env.TRAILING_ACTIVATE_PCT || '30'),
-    trailingDrawdownPct: parseFloat(process.env.TRAILING_DRAWDOWN_PCT || '8'),
+    trailingActivatePct: 50,
+    trailingDrawdownPct: 10,
     trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '2000', 10),
 
-    // 移动止盈未激活时，使用当前未收盘的 15 秒 RSI：
-    // >80 或从 >=70 跌到 <70 时立即退出；移动止盈激活后由 trailing 接管。
-    rsi15sExitEnabled:
-      (process.env.RSI_15S_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
-    rsi15sOverboughtExit: parseFloat(process.env.RSI_15S_OVERBOUGHT_EXIT || '80'),
-    rsi15sCrossDownExit: parseFloat(process.env.RSI_15S_CROSS_DOWN_EXIT || '70'),
-    rsi1mExitEnabled: false,
-    rsi1mExitThreshold: parseFloat(process.env.RSI_1M_EXIT_THRESHOLD || '80'),
+    // Token-wide forced exits and the single independent add-on policy.
+    fdvExitThresholdUsd: 20_000,
+    ageExitMs: 15 * 60 * 1000,
+    addonDropPct: 15,
+    maxBuysPerMint: 2,
 
     // v3.17.6: Stabilization 期 —— reconcile 完成后等价格稳定，再开始 trailing 追踪
     //   原理：砸盘后 + 我们自买入 → 池子价格剧烈波动 + 虚高 5-10%
@@ -100,8 +99,9 @@ const config = {
       process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '0',
     ),
 
-    // Optional stop-loss paths; both are disabled by default for this policy.
-    fixedStopLossPct: parseFloat(process.env.FIXED_STOP_LOSS_PCT || '0'),
+    // A fixed loss exit would make the -15% qualifying add-on unreachable.
+    // Keep it retired even when an older deployment .env still contains -10.
+    fixedStopLossPct: 0,
     emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '0'),
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
@@ -113,9 +113,6 @@ const config = {
     volHighEmergencyStopPct: parseFloat(process.env.VOL_HIGH_EMERGENCY_STOP_PCT || '0'),
     // 智能止损最小持仓时间(ms) — 避免刚买入就被止损
     smartStopGraceMs: parseInt(process.env.SMART_STOP_GRACE_MS || '300000', 10),  // 默认5min
-
-    // Hard timeout: close every remaining position after 300 seconds.
-    maxHoldMs: parseInt(process.env.MAX_HOLD_MS || '300000', 10),
 
     // Legacy optional exits remain available but are disabled by default.
     noBounceExitEnabled: (process.env.NO_BOUNCE_EXIT_ENABLED ?? 'false').toLowerCase() === 'true',
@@ -184,7 +181,7 @@ const config = {
     //   实战案例：ikG8tz5e 18 秒内对 POSITIONS 砸了 2 次（seller_tx 不同），
     //             2 次都被买入 2 次都亏 — 这表明该卖家在持续出货，不是恐慌抛售
     //   设 0 禁用此检查（恢复旧行为）
-    //   推荐 5-10 分钟，跟你的持仓最大时间 MAX_HOLD_MS 匹配
+    //   推荐 5-10 分钟，覆盖不同区域重复推送的延迟窗口
     sellerMintDedupMs: parseInt(process.env.SELLER_MINT_DEDUP_MS || '600000', 10),
 
     // v3.17.7: 信号过期检查（slot gap 阈值）
@@ -212,7 +209,7 @@ const config = {
     maxMintAgeHours,
     maxTokenAgeMs: maxMintAgeHours * 60 * 60 * 1000,
     // v3.17.20: FDV lower bound in USD; refreshed once per minute by TokenWatchdog.
-    minFdVUsd: parseFloat(process.env.MIN_FDV_USD || '15000'),
+    minFdVUsd: parseFloat(process.env.MIN_FDV_USD || '20000'),
     // Birdeye liquidity in USD. Shared by discovery admission and watchdog removal.
     minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '3000'),
     // v3.17.20: FDV 上限（USD），设 0 禁用（不因 FDV 过大移除监控）
@@ -232,10 +229,10 @@ const config = {
     // The production entry strategy is fixed. Legacy server environment values
     // are intentionally ignored so stale deployments cannot reactivate removed rules.
     entryMode: 'RSI_CROSS_15S',
-    rsi15sPeriod: parseInt(process.env.RSI_15S_PERIOD || '7', 10),
-    rsi15sEntryThreshold: parseFloat(process.env.RSI_15S_ENTRY_THRESHOLD || '30'),
-    rsi15sVolumeWindowMs: parseInt(process.env.RSI_15S_VOLUME_WINDOW_MS || '60000', 10),
-    rsi15sMinVolume60sUsd: parseFloat(process.env.RSI_15S_MIN_VOLUME_60S_USD || '5000'),
+    rsi15sPeriod: 7,
+    rsi15sEntryThreshold: 30,
+    rsi15sVolumeWindowMs: 60_000,
+    rsi15sMinVolume60sUsd: 5_000,
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -331,7 +328,9 @@ const config = {
     maxPriceChange5sPct: parseFloat(process.env.ACTIVITY_FLOW_MAX_PRICE_CHANGE_5S_PCT || '5'),
     maxPriceChange30sPct: parseFloat(process.env.ACTIVITY_FLOW_MAX_PRICE_CHANGE_30S_PCT || '10'),
     maxPriceChange60sPct: parseFloat(process.env.ACTIVITY_FLOW_MAX_PRICE_CHANGE_60S_PCT || '10'),
-    cooldownMs: parseInt(process.env.ACTIVITY_FLOW_COOLDOWN_MS || '0', 10),
+    // The second qualifying signal is reserved for the one add-on; stale
+    // deployment cooldown values must not suppress it.
+    cooldownMs: 0,
     maxSignalAgeMs: parseInt(process.env.ACTIVITY_FLOW_MAX_SIGNAL_AGE_MS || process.env.MAX_PUSH_LAG_MS || '5000', 10),
     maxEventsPerMint: parseInt(process.env.ACTIVITY_FLOW_MAX_EVENTS_PER_MINT || '600', 10),
     debug: (process.env.ACTIVITY_FLOW_DEBUG ?? 'false').toLowerCase() === 'true',
@@ -507,7 +506,7 @@ const config = {
     marketRetries: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRIES || '8', 10),
     marketRetryMs: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRY_MS || '3000', 10),
     maxConcurrentChecks: parseInt(process.env.PUMP_DISCOVERY_MAX_CONCURRENT_CHECKS || '3', 10),
-    minFdvUsd: parseFloat(process.env.MIN_FDV_USD || '15000'),
+    minFdvUsd: parseFloat(process.env.MIN_FDV_USD || '20000'),
     maxFdvUsd: parseFloat(process.env.MAX_FDV_USD || '1000000'),
     minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '3000'),
   },
@@ -582,13 +581,6 @@ function validateConfig() {
   if (!config.birdeye.apiKey) errors.push('BIRDEYE_API_KEY missing');
   if (!config.DRY_RUN && !config.wallet.privateKeyBs58) {
     errors.push('WALLET_PRIVATE_KEY_BS58 required for LIVE mode');
-  }
-  if (
-    config.strategy.rsi15sCrossDownExit <= 0 ||
-    config.strategy.rsi15sOverboughtExit <= config.strategy.rsi15sCrossDownExit ||
-    config.strategy.rsi15sOverboughtExit >= 100
-  ) {
-    errors.push('RSI_15S exit thresholds must satisfy 0 < cross-down < overbought < 100');
   }
   if (config.activityFlow.rsi15sPeriod < 1) {
     errors.push('RSI_15S_PERIOD must be >= 1');

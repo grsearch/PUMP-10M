@@ -7,7 +7,7 @@ The service discovers successful Pump.fun graduations without a webhook:
 - Helius WebSocket logs provide the low-latency path; the migration wallet is polled every 5 seconds to fill gaps.
 - A transaction is accepted only when it contains the official Pump `migrate` discriminator and targets the official PumpSwap program.
 - Mint, pool, vaults, chain `blockTime`, slot, and signature are read from the confirmed transaction and saved in `tokens`.
-- All token sources use the same market thresholds: FDV `$15,000-$1,000,000` and liquidity at least `$3,000`.
+- All token sources use the same market thresholds: FDV `$20,000-$1,000,000` and liquidity at least `$3,000`.
 - Pump graduation admission checks only FDV and liquidity. It records the confirmed migration time and does not request or filter on mint creation age.
 - Passing discovery only adds the token to monitoring. The Activity Flow buy strategy remains unchanged.
 
@@ -22,44 +22,43 @@ used to backfill its migration AGE even when that pair does not yet expose compl
 FDV/LP data. Legacy `WATCHDOG_CHECK_INTERVAL_MS` values above one minute are clamped
 to `60000`.
 
-Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **15 秒 RSI(7) 上穿 30，并在下一根可成交 K 线开盘买入**。
+Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 15 秒 RSI(7) 从 ≤30 上穿 >30，且前 60 秒真实成交量至少 $5,000**。
 
 ## 当前买入策略
 
 程序用真实成交的收盘价计算 15 秒 RSI，并按以下顺序判断：
 
-- RSI 周期为 `7`，只用已经收盘的可成交 15 秒 K 线确认信号。
+- RSI 周期为 `7`，只用已经收盘的 15 秒 K 线确认信号。
 - 上一根已收盘 RSI `<=30`、最新已收盘 RSI `>30`，构成从下向上突破 30。
-- 信号确认时，之前 `60 秒`真实买卖总成交量必须 `>= $5,000`；美元金额按 `SOL_PRICE_USD` 换算。
-- 不在信号 K 线收盘价追单。等下一根有可信成交的 15 秒 K 线出现，以其第一笔成交作为可执行开盘并进入现有实盘下单链路。
-- 无成交的时间桶不会伪造开盘；下一根实际有成交的 K 线才是“下一根可成交 K 线”。
+- 信号收盘前 `60 秒`真实买卖总成交量必须 `>= $5,000`；美元金额按 `SOL_PRICE_USD` 换算。
+- 收盘信号得到确认后立即进入现有实盘下单链路，不增加额外等待。
 
 默认入口日志应显示：
 
 ```text
-Entry: RSI(7,15s) cross above 30, trailing 60s volume >= $5000, buy next tradable candle open
+Entry: closed RSI(7,15s) cross above 30, trailing 60s real volume >= $5000, execute immediately after confirmation
 Legacy dumpSignal: suppressed
-[main] ActivityFlow enabled: mode=RSI_CROSS_15S ... next-tradable-open ...
+[main] ActivityFlow enabled: mode=RSI_CROSS_15S ... immediate-confirmation ...
 ```
 
 ## 当前卖出策略
 
-- 移动止盈尚未激活时，实时 15 秒 RSI(7) `>80` 立即卖出。
-- 移动止盈尚未激活时，实时 15 秒 RSI(7) 从 `>=70` 下穿到 `<70` 立即卖出。
-- 移动止盈：上涨 `30%` 激活，从最高点回撤 `8%` 卖出；一旦激活，便接管退出并屏蔽上述两条 RSI 卖出规则。
-- 最长持仓：`300 秒`，到时强制退出。
-- 固定止盈、固定止损、无反弹退出和资金流反转退出默认关闭，避免加入未列出的卖出条件。
-- 加仓：关闭。
+- 移动止盈：每个仓位独立计算；上涨 `50%` 激活，从各自最高点回撤 `10%` 卖出。
+- FDV 跌破 `$20,000`：全部未平仓仓位逐笔立即卖出，全部确认成交后移出监控。
+- 代币迁移 AGE 达到 `15 分钟`：全部未平仓仓位逐笔立即卖出，全部确认成交后移出监控。
+- 不使用 RSI `>80`、RSI 下穿 `70` 或最长持仓时间卖出。
+- 固定止损已固定关闭，避免在 `-10%` 提前卖出而使 `-15%` 加仓永远无法触发；固定止盈、无反弹退出和资金流反转退出默认关闭。
+- 首仓价格下跌至少 `15%` 且再次出现完整买入信号时，允许加仓一次；首仓与加仓仓位独立管理，同币最多两次买入和两次对应卖出。
 - 卖出冷静期：实际平仓完成后，同币 `5 分钟` 内禁止再次买入；多仓分批卖出时从最后一笔完成卖出重新计时。
 
 ## 监控列表过滤
 
 TokenWatchdog 默认每 1 分钟巡检一次 FDV 和 LP：
 
-- FDV 必须在 `$15,000 ~ $1,000,000`
+- FDV 必须在 `$20,000 ~ $1,000,000`
 - Birdeye LP 必须 `>= $3,000`
 - 24h 交易量必须 `>= $5,000`
-- AGE 继续从 Pump 迁移时间开始计算并保存到特征库，但不参与监控列表过滤或移除
+- AGE 从 Pump 迁移时间开始计算；达到 `15 分钟`时，无持仓代币直接移除，有持仓代币确认卖出后移除
 - 迁移时间未知时 AGE 显示未知，不使用 mint 创建时间或添加时间猜测
 - 监控列表上限默认 `500` 个；只有新增代币后超过该上限才会触发驱逐
 
@@ -106,37 +105,21 @@ npm run backtest:flow-candles
 ```env
 ACTIVITY_FLOW_ENABLED=true
 ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL=true
-RSI_15S_PERIOD=7
-RSI_15S_ENTRY_THRESHOLD=30
-RSI_15S_VOLUME_WINDOW_MS=60000
-RSI_15S_MIN_VOLUME_60S_USD=5000
 ACTIVITY_FLOW_COOLDOWN_MS=0
 ACTIVITY_FLOW_MAX_SIGNAL_AGE_MS=5000
 
-RSI_15S_EXIT_ENABLED=true
-RSI_15S_OVERBOUGHT_EXIT=80
-RSI_15S_CROSS_DOWN_EXIT=70
 FLOW_REVERSAL_EXIT_ENABLED=false
-TRAILING_ACTIVATE_PCT=30
-TRAILING_DRAWDOWN_PCT=8
 TAKE_PROFIT_PCT=0
-FIXED_STOP_LOSS_PCT=0
 EMERGENCY_STOP_LOSS_PCT=0
 NO_BOUNCE_EXIT_ENABLED=false
 STABILIZATION_EMERGENCY_DRAWDOWN_PCT=0
-MAX_HOLD_MS=300000
-
-ADDON_ENABLED=0
-ADDON_DROP_PCT=20
 
 REBUY_COOLDOWN_MS=300000
-MIN_FDV_USD=15000
+MIN_FDV_USD=20000
 MAX_FDV_USD=1000000
 MIN_LIQUIDITY_USD=3000
 WATCHDOG_CHECK_INTERVAL_MS=60000
 WATCHDOG_MARKET_STALE_MS=180000
-MAX_MINT_AGE_HOURS=0
-NEW_COIN_AGE_THRESHOLD_MS=0
 MAX_WATCHED_TOKENS=500
 
 BUY_MIN_PRIORITY_FEE_LAMPORTS=500000

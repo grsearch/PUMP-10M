@@ -30,6 +30,22 @@ function referenceRsi(closes, period) {
 }
 
 function run() {
+  const rsi5 = new RsiCalculator({ period5: 7 });
+  const frame5 = 5_000;
+  const closes5 = [100, 90, 80, 70, 60, 50, 40, 35, 80, 75];
+  closes5.forEach((price, index) => {
+    rsi5.feedTrade('rsi-5s', price, 1, 'buy', index * frame5 + 1_000, 50);
+  });
+  const snapshot5 = rsi5.snapshot('rsi-5s');
+  approx(snapshot5.rsi5sPreviousClosed, referenceRsi(closes5.slice(0, 8), 7));
+  approx(snapshot5.rsi5sClosed, referenceRsi(closes5.slice(0, 9), 7));
+  approx(snapshot5.rsi5s, referenceRsi(closes5, 7));
+  assert(snapshot5.rsi5sPreviousClosed <= 30);
+  assert(snapshot5.rsi5sClosed > 30);
+  assert.strictEqual(snapshot5.rsi5sClosedBars, 9);
+  assert.strictEqual(snapshot5.rsi5sClosedBucketTs, 8 * frame5);
+  assert.strictEqual(snapshot5.rsi5sCurrentBucketTs, 9 * frame5);
+
   const rsi15 = new RsiCalculator({ period15: 7 });
   const frame15 = 15_000;
   const closes15 = [100, 90, 80, 70, 60, 50, 40, 35, 80, 75];
@@ -126,7 +142,7 @@ function run() {
     'price changes below the configured ratio must not reset RSI history',
   );
 
-  console.log('RsiCalculator TradingView 15s/1m RSI self-test: PASS');
+  console.log('RsiCalculator TradingView 5s/15s/1m RSI self-test: PASS');
 }
 
 run();

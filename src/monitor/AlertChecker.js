@@ -42,7 +42,6 @@ class AlertChecker {
     try {
       this._checkTickStream();
       this._checkExecutorFailures();
-      this._checkStuckPositions();
       this._checkParseErrorRate();
       // v3.17.9: BUY 链上失败 / CU 接近上限 / reconcile watchdog 触发
       this._checkBuyChainFailures();
@@ -200,39 +199,6 @@ class AlertChecker {
       } else {
         this.monitor.clearAlert('executor.sell_failures');
       }
-    }
-  }
-
-  /**
-   * 持仓 > maxHoldMs + 5s 还没退出 → 应当报警
-   */
-  _checkStuckPositions() {
-    const open = this.positionManager.listOpen();
-    const now = Date.now();
-    const stuck = [];
-    for (const p of open) {
-      const age = now - p.openedAt;
-      const timeoutMs = this.config.strategy.maxHoldMs || 0;
-      if (timeoutMs > 0 && age > timeoutMs + 30000) { // 超时后30s grace
-        stuck.push(p);
-      }
-    }
-    if (stuck.length > 0) {
-      this.monitor.fireAlert(
-        'positions.stuck',
-        'critical',
-        `${stuck.length} 个持仓超过波动率超时+30s 未退出（可能 SELL 一直失败）`,
-        {
-          mints: stuck.map((p) => ({
-            symbol: p.symbol,
-            mint: p.mint,
-            age_s: Math.round((now - p.openedAt) / 1000),
-            sell_attempts: p.sellAttempts || 0,
-          })),
-        },
-      );
-    } else {
-      this.monitor.clearAlert('positions.stuck');
     }
   }
 

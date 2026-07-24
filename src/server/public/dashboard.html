@@ -291,8 +291,8 @@
         <div class="status-item"><div class="label">60s 成交量门槛</div><div class="value" id="stat-volume1m">-</div></div>
         <div class="status-item"><div class="label">入场模式</div><div class="value" id="stat-trades1m">-</div></div>
         <div class="status-item"><div class="label">每笔仓位</div><div class="value" id="stat-size">-</div></div>
-        <div class="status-item"><div class="label">止盈</div><div class="value" id="stat-tp">-</div></div>
-        <div class="status-item"><div class="label">最大持仓</div><div class="value" id="stat-hold">-</div></div>
+        <div class="status-item"><div class="label">移动止盈</div><div class="value" id="stat-trailing">-</div></div>
+        <div class="status-item"><div class="label">强制退出</div><div class="value" id="stat-forced">-</div></div>
       </div>
     </div>
   </div>
@@ -389,8 +389,8 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一收盘 RSI(7)</th><th>当前收盘 RSI(7)</th><th>实时 RSI(7)</th><th>已收盘 15s K</th><th>近 60s 真实成交量</th><th>信号 K 收盘</th><th>下一可成交 K 开盘</th><th>状态说明</th><th>阶段</th></tr></thead>
-            <tbody id="signalsTbody"><tr><td colspan="12" class="empty">暂无活跃成交</td></tr></tbody>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一收盘 RSI(7)</th><th>当前收盘 RSI(7)</th><th>实时 RSI(7)</th><th>已收盘 15s K</th><th>近 60s 真实成交量</th><th>信号 K 收盘</th><th>状态说明</th><th>阶段</th></tr></thead>
+            <tbody id="signalsTbody"><tr><td colspan="11" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -490,8 +490,8 @@ async function refreshStatus() {
   $('stat-volume1m').textContent = `>= ${fmtMoney(r.config.rsi15sMinVolume60sUsd)}`;
   $('stat-trades1m').textContent = `RSI(${r.config.rsi15sPeriod}) ↑ ${r.config.rsi15sEntryThreshold}`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
-  $('stat-tp').textContent = r.config.takeProfitPct > 0 ? '+' + r.config.takeProfitPct + '%' : '关闭';
-  $('stat-hold').textContent = r.config.maxHoldMs / 1000 + 's';
+  $('stat-trailing').textContent = `+${r.config.trailingActivatePct}% / ${r.config.trailingDrawdownPct}%`;
+  $('stat-forced').textContent = `FDV<${fmtMoney(r.config.fdvExitThresholdUsd)} / AGE ${Math.round(r.config.ageExitMs / 60000)}m`;
   $('statusMeta').textContent = new Date().toLocaleTimeString();
 }
 
@@ -743,36 +743,33 @@ async function refreshSignals() {
   const tbody = $('signalsTbody');
   if (!r.ok) {
     meta.innerHTML = `<span class="neg">${escapeHtml(r.error || '15s RSI 实时数据不可用')}</span>`;
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">等待 15s RSI 数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">等待 15s RSI 数据</td></tr>';
     return;
   }
 
   const summary = r.summary || {};
   const thresholds = r.thresholds || {};
   const rows = r.candidates || [];
-  const exitOverbought = thresholds.exitOverbought ?? 80;
-  const exitCrossDown = thresholds.exitCrossDown ?? 70;
-  const trailingActivate = thresholds.trailingActivatePct ?? 30;
-  const trailingDrawdown = thresholds.trailingDrawdownPct ?? 8;
-  const maxHoldSec = Math.round((thresholds.maxHoldMs ?? 300000) / 1000);
+  const trailingActivate = thresholds.trailingActivatePct ?? 50;
+  const trailingDrawdown = thresholds.trailingDrawdownPct ?? 10;
   meta.innerHTML = [
-    `<span>买入 <b>15s RSI(${thresholds.rsiPeriod || 7}) 上穿 ${thresholds.entryCross ?? 30}</b></span>`,
-    `<span>近60s成交量 <b>≥ ${fmtMoney(thresholds.minVolume60sUsd ?? 5000)}</b></span>`,
-    `<span>卖出 <b>移动止盈未激活时：RSI &gt; ${exitOverbought} / 下穿 ${exitCrossDown}</b></span>`,
-    `<span>移动止盈 <b>+${trailingActivate}% / 回撤 ${trailingDrawdown}%</b></span>`,
-    `<span>最长持仓 <b>${maxHoldSec}s</b></span>`,
+    `<span>买入 <b>已收盘 15s RSI(${thresholds.rsiPeriod || 7}) 从 ≤${thresholds.entryCross ?? 30} 上穿</b></span>`,
+    `<span>近60s真实成交量 <b>≥ ${fmtMoney(thresholds.minVolume60sUsd ?? 5000)}</b></span>`,
+    `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
+    `<span>强制卖出 <b>FDV &lt; ${fmtMoney(thresholds.fdvExitThresholdUsd ?? 20000)} / AGE ≥ ${Math.round((thresholds.ageExitMs ?? 900000) / 60000)}m</b></span>`,
+    `<span>加仓 <b>初始买入价下跌 ${thresholds.addonDropPct ?? 15}% 后出现新信号；最多 ${thresholds.maxBuysPerMint ?? 2} 次买卖</b></span>`,
     `<span>活跃 <b>${summary.active || 0}</b></span>`,
     `<span>预热 <b>${summary.warming || 0}</b></span>`,
     `<span>量不足 <b>${summary.volumeBlocked || 0}</b></span>`,
     `<span>实盘信号 <b>${summary.signaled || 0}</b></span>`,
   ].join('');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">暂无活跃成交</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无活跃成交</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(candidate => {
     const detail = candidate.waitReason ||
-      (candidate.stage === 'signaled' ? '已在下一根可成交 K 线开盘触发' : '等待 RSI 上穿与成交量确认');
+      (candidate.stage === 'signaled' ? '信号确认后已立即触发' : '等待 RSI 上穿与成交量确认');
     return `
       <tr>
         <td class="mono">${fmtTime(candidate.updatedAt)}</td>
@@ -784,7 +781,6 @@ async function refreshSignals() {
         <td>${candidate.closedBars || 0}</td>
         <td>${fmtMoney(candidate.volume60sUsd)} / ${fmtMoney(thresholds.minVolume60sUsd ?? 5000)}</td>
         <td class="mono">${candidate.signalCandleTs ? fmtTime(candidate.signalCandleTs) : '-'}</td>
-        <td class="mono">${candidate.entryCandleTs ? fmtTime(candidate.entryCandleTs) : '-'}</td>
         <td style="max-width:260px">${escapeHtml(detail)}</td>
         <td>${_strategyStage(candidate, r.now || Date.now())}</td>
       </tr>`;
