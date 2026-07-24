@@ -380,7 +380,12 @@ class Server {
           rsi15sMinVolume60sUsd: config.activityFlow.rsi15sMinVolume60sUsd,
           positionSizeSol: config.strategy.positionSizeSol,
           takeProfitPct: config.strategy.takeProfitPct,
-          maxHoldMs: config.strategy.maxHoldMs,
+          trailingActivatePct: config.strategy.trailingActivatePct,
+          trailingDrawdownPct: config.strategy.trailingDrawdownPct,
+          fdvExitThresholdUsd: config.strategy.fdvExitThresholdUsd,
+          ageExitMs: config.strategy.ageExitMs,
+          addonDropPct: config.strategy.addonDropPct,
+          maxBuysPerMint: config.strategy.maxBuysPerMint,
         },
       });
     });

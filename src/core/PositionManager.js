@@ -31,6 +31,7 @@ const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
 const { evaluateFlowTurnExit } = require('./FlowCandleStrategy');
 const { priceDetailsFromRawState } = require('../utils/pumpSwapPricing');
+const { normalizeUnixMs } = require('../utils/migrationTime');
 
 const monitor = getMonitor();
 monitor.registerModule('PositionManager', { staleMs: 10_000, label: 'Position Manager' });
@@ -56,8 +57,6 @@ class PositionManager extends EventEmitter {
     this._sellInProgress = new Set(); // 正在卖出的 mint
     this._tickCount = 0;  // v3.26: tick counter for PoolStateCache price check
     this._flowExitEvents = new Map(); // mint -> recent BUY/SELL swaps while holding
-    this._rsiExitSkipLogAt = new Map(); // mint -> { ts, reason }; throttle diagnostic logs
-    this._rsi15sLastByMint = new Map(); // mint -> latest live RSI(7,15s)
 
     this.positions = new Map(); // positionId → position obj
     this.byMint = new Map();    // mint → Set<positionId> (v3.17.13: 同币多仓)
@@ -224,12 +223,47 @@ class PositionManager extends EventEmitter {
     this._exitForCondition(pos, price, 'FLOW_REVERSAL_EXIT');
   }
 
-  // v3.17.40b: 加仓策略 — 自最近一笔买入价跌15%以上才允许加仓
-  //   首仓后：当前价 < 首仓entryPrice * 0.85 → 允许第1次加仓
-  //   第1次加仓后：当前价 < 加仓entryPrice * 0.85 → 允许第2次加仓
-  //   最多加仓2次（同币3仓）
-  canAddOn(mint) {
-    return { allowed: false, reason: 'addon_removed' };
+  // A second qualifying signal may add one independent leg only after price
+  // has fallen at least 15% from the still-open initial entry.
+  canAddOn(mint, currentPrice) {
+    const pids = this.byMint.get(mint);
+    if (!pids || pids.size === 0) return { allowed: false, reason: 'no_initial_position' };
+    if (pids.size >= config.strategy.maxBuysPerMint) {
+      return { allowed: false, reason: 'max_two_buys_reached' };
+    }
+
+    const active = [...pids]
+      .map((pid) => this.positions.get(pid))
+      .filter((pos) => pos && !pos.exiting);
+    const initial = active.find((pos) => !pos.isAddOn);
+    if (!initial) return { allowed: false, reason: 'initial_position_not_active' };
+    if (active.some((pos) => pos.isAddOn)) {
+      return { allowed: false, reason: 'add_on_already_open' };
+    }
+
+    const price = Number(currentPrice);
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(initial.entryPrice)) {
+      return { allowed: false, reason: 'invalid_add_on_price' };
+    }
+    const maxPrice = initial.entryPrice * (1 - config.strategy.addonDropPct / 100);
+    const dropPct = ((initial.entryPrice - price) / initial.entryPrice) * 100;
+    if (price > maxPrice) {
+      return {
+        allowed: false,
+        reason: `add_on_drop_${dropPct.toFixed(2)}pct_below_${config.strategy.addonDropPct}pct`,
+        initialEntryPrice: initial.entryPrice,
+        maxPrice,
+        dropPct,
+      };
+    }
+
+    return {
+      allowed: true,
+      initialPositionId: initial.positionId,
+      initialEntryPrice: initial.entryPrice,
+      maxPrice,
+      dropPct,
+    };
   }
 
   /**
@@ -262,121 +296,14 @@ class PositionManager extends EventEmitter {
     if (pids.size === 0) {
       this.byMint.delete(mint);
       this._flowExitEvents.delete(mint);
-      this._rsiExitSkipLogAt.delete(mint);
-      this._rsi15sLastByMint.delete(mint);
     }
   }
 
-  /**
-   * v3.17.15: 卖出同币所有持仓（RSI 超买等场景）
-   * 所有仓位排队卖出（_exit 内部有 sellQueue 机制防并发）
-   */
-  _exitAllByMint(mint, price, reason) {
-    const pids = this.byMint.get(mint);
-    if (!pids || pids.size === 0) return;
-    let count = 0;
-    for (const pid of pids) {
-      const pos = this.positions.get(pid);
-      if (pos && !pos.exiting) {
-        count++;
-        this._exit(pos, price, reason);
-      }
-    }
-    console.log(
-      `[PositionManager] _exitAllByMint ${mint.slice(0, 8)}: triggered ${count} exits (${reason})`,
-    );
-  }
-
-  /**
-   * 自动退出条件统一入口。同币存在加仓时，任一仓位触发都会让全部仓位
-   * 进入现有的同币串行卖出队列；单仓行为保持不变。
-   */
+  // Every position owns its exit state. The per-mint sell queue serializes
+  // chain submissions only and never turns one leg's trigger into a group exit.
   _exitForCondition(pos, price, reason) {
     if (!pos || pos.exiting) return;
-    const pids = this.byMint.get(pos.mint);
-    if (pids && pids.size > 1) {
-      this._exitAllByMint(pos.mint, price, reason);
-      return;
-    }
     this._exit(pos, price, reason);
-  }
-
-  /**
-   * 每笔 swap 更新 RSI 后调用。RSI 使用当前 15 秒实时值；移动止盈一旦
-   * 在同币任一仓位上先激活，便接管整组仓位，后续不再走两类 RSI 退出。
-   */
-  _logRsiExitSkip(mint, active, snapshot, reason, details = '') {
-    const now = Date.now();
-    const last = this._rsiExitSkipLogAt.get(mint);
-    const throttleMs = 5000;
-    if (last && last.reason === reason && now - last.ts < throttleMs) return;
-    this._rsiExitSkipLogAt.set(mint, { ts: now, reason });
-
-    const liveRsi = snapshot?.rsi15sLive == null ? NaN : Number(snapshot.rsi15sLive);
-    const closedRsi = snapshot?.rsi15sClosed == null ? NaN : Number(snapshot.rsi15sClosed);
-    const bars = Number(snapshot?.rsi15sClosedBars || 0);
-    const symbol = active?.[0]?.symbol || mint.slice(0, 6);
-    console.log(
-      `[PositionManager] RSI_EXIT_SKIPPED ${symbol} ` +
-        `live=${Number.isFinite(liveRsi) ? liveRsi.toFixed(1) : 'n/a'} ` +
-        `closed=${Number.isFinite(closedRsi) ? closedRsi.toFixed(1) : 'n/a'} ` +
-        `bars=${bars} positions=${active?.length || 0} reason=${reason}` +
-        `${details ? ` ${details}` : ''}`,
-    );
-    monitor.inc(`PositionManager.rsi15sExitSkipped.${reason}`, 1, 'PositionManager');
-  }
-
-  handleRsiForExit(mint, price, snapshot) {
-    const liveRsi = snapshot?.rsi15sLive == null ? NaN : Number(snapshot.rsi15sLive);
-    if (!Number.isFinite(liveRsi)) return false;
-
-    const previousRsi = this._rsi15sLastByMint.get(mint);
-    this._rsi15sLastByMint.set(mint, liveRsi);
-    if (!config.strategy.rsi15sExitEnabled) return false;
-
-    const pids = this.byMint.get(mint);
-    if (!pids || pids.size === 0) return false;
-    const active = [...pids]
-      .map((pid) => this.positions.get(pid))
-      .filter((pos) => pos && !pos.exiting && pos.status !== 'stuck');
-    if (active.length === 0) return false;
-
-    let reason = null;
-    if (liveRsi > config.strategy.rsi15sOverboughtExit) {
-      reason = 'RSI_15S_OVERBOUGHT';
-    } else if (
-      Number.isFinite(previousRsi) &&
-      previousRsi >= config.strategy.rsi15sCrossDownExit &&
-      liveRsi < config.strategy.rsi15sCrossDownExit
-    ) {
-      reason = 'RSI_15S_CROSS_DOWN';
-    }
-    if (!reason) return false;
-
-    // Once the +30% trailing stop is armed, it owns the exit for the whole
-    // same-mint position group. RSI >80 and the downward cross below 70 must
-    // not pre-empt the configured trailing drawdown.
-    const trailingOwners = active.filter((pos) => pos.trailingArmed);
-    if (trailingOwners.length > 0) {
-      this._logRsiExitSkip(
-        mint,
-        active,
-        snapshot,
-        'trailingArmed',
-        `blocked=${reason} armed=${trailingOwners.length}`,
-      );
-      return false;
-    }
-
-    const symbol = active[0].symbol || mint.slice(0, 6);
-    console.log(
-      `[PositionManager] ${reason} ${symbol} ` +
-        `RSI15=${Number.isFinite(previousRsi) ? previousRsi.toFixed(2) : 'n/a'}->${liveRsi.toFixed(2)} ` +
-        `price=${price}`,
-    );
-    monitor.inc(`PositionManager.${reason}`, 1, 'PositionManager');
-    this._exitAllByMint(mint, price, reason);
-    return true;
   }
 
   openPositionCount() {
@@ -439,9 +366,7 @@ class PositionManager extends EventEmitter {
 
   /**
    * 启动时从 DB 恢复未平仓的持仓。
-   * 对每个恢复的持仓：
-   *   - 如果 openedAt + maxHoldMs 已过：立即触发 SELL（exitReason=TIMEOUT_RESTORED）
-   *   - 否则：正常进入 _tick 循环
+   * 恢复后继续按每个仓位自己的移动止盈以及 FDV/AGE 强制规则运行。
    */
   restoreFromDb() {
     const open = this.tradeLogger.getOpenPositions();
@@ -1063,9 +988,43 @@ class PositionManager extends EventEmitter {
 
       this._fillPreVolFallback(pos);
       const age = now - pos.openedAt;
-      // Strategy V5 uses peak only for the 90-second no-bounce rule;
-      // maxHoldMs remains an unconditional hard timeout.
-      const peakPnlForTimeout = (pos.highWaterMark && pos.entryPrice > 0)
+      const tokenInfo = this.tokenRegistry?.getToken?.(pos.mint) || null;
+      const fdv = tokenInfo?.fdv == null ? NaN : Number(tokenInfo.fdv);
+      const migrationTime = normalizeUnixMs(tokenInfo?.migration_time);
+      let forcedExitReason = null;
+      if (
+        Number.isFinite(fdv) &&
+        fdv >= 0 &&
+        fdv < config.strategy.fdvExitThresholdUsd
+      ) {
+        forcedExitReason = 'FDV_BELOW_20000';
+      } else if (
+        migrationTime &&
+        config.strategy.ageExitMs > 0 &&
+        now - migrationTime >= config.strategy.ageExitMs
+      ) {
+        forcedExitReason = 'AGE_15M';
+      }
+      if (forcedExitReason) {
+        pos.pendingForcedExitReason = pos.pendingForcedExitReason || forcedExitReason;
+        pos.removeFromMonitoringAfterClose = true;
+      }
+      forcedExitReason = pos.pendingForcedExitReason || forcedExitReason;
+      if (forcedExitReason && (pos.reconciled || pos.dryRun)) {
+        const lastPrice = this.priceTracker.getPrice(pos.mint) || pos.entryPrice;
+        console.log(
+          `[PositionManager] ${forcedExitReason} ${pos.symbol || pos.mint.slice(0, 6)} ` +
+            `fdv=${Number.isFinite(fdv) ? `$${Math.round(fdv)}` : 'unknown'} ` +
+            `migrationAge=${migrationTime ? `${((now - migrationTime) / 60_000).toFixed(2)}m` : 'unknown'} ` +
+            `position=${pos.positionId.slice(0, 8)}`,
+        );
+        monitor.inc(`PositionManager.${forcedExitReason}`, 1, 'PositionManager');
+        this._exitForCondition(pos, lastPrice, forcedExitReason);
+        continue;
+      }
+
+      // Peak is retained for optional legacy exits and trailing diagnostics.
+      const peakPnlForNoBounce = (pos.highWaterMark && pos.entryPrice > 0)
         ? ((pos.highWaterMark - pos.entryPrice) / pos.entryPrice) * 100
         : 0;
       const noBounceEnabled = config.strategy.noBounceExitEnabled;
@@ -1074,14 +1033,14 @@ class PositionManager extends EventEmitter {
         (pos.reconciled || pos.dryRun) &&
         config.strategy.noBounceExitMs > 0 &&
         age >= config.strategy.noBounceExitMs &&
-        peakPnlForTimeout < config.strategy.noBounceMaxPeakPnlPct
+        peakPnlForNoBounce < config.strategy.noBounceMaxPeakPnlPct
       ) {
         const netFlow = this._recentNetFlow(pos.mint, now, config.strategy.noBounceFlowWindowMs);
         if (netFlow <= 0) {
           const lastPrice = this.priceTracker.getPrice(pos.mint) || pos.entryPrice;
           console.log(
             `[PositionManager] NO_BOUNCE_EXIT ${pos.symbol || pos.mint.slice(0, 6)} ` +
-              `peak=${peakPnlForTimeout.toFixed(2)}% net${config.strategy.noBounceFlowWindowMs / 1000}s=` +
+              `peak=${peakPnlForNoBounce.toFixed(2)}% net${config.strategy.noBounceFlowWindowMs / 1000}s=` +
               `${netFlow.toFixed(2)}SOL age=${(age / 1000).toFixed(0)}s`,
           );
           monitor.inc('PositionManager.noBounceExit', 1, 'PositionManager');
@@ -1089,18 +1048,6 @@ class PositionManager extends EventEmitter {
           continue;
         }
       }
-      const timeoutMs = config.strategy.maxHoldMs;
-      if (timeoutMs > 0 && age >= timeoutMs) {
-        const lastPrice = this.priceTracker.getPrice(pos.mint) || pos.entryPrice;
-        console.log(
-          `[PositionManager] TIMEOUT ${pos.symbol || pos.mint.slice(0, 6)} ` +
-          `peak=${peakPnlForTimeout.toFixed(1)}% timeout=${(timeoutMs/1000).toFixed(0)}s age=${(age/1000).toFixed(0)}s`,
-        );
-        const timeoutMin = Math.round(timeoutMs / 60000);
-        this._exitForCondition(pos, lastPrice, `TIMEOUT_${timeoutMin}M`);
-        continue;
-      }
-
       // v3.18: EARLY_LOW_PEAK_CUT — 死币早砍,连续时间覆盖
       // v3.32b: 可通过 EARLY_LOW_PEAK_CUT_ENABLED=0 禁用
       if (process.env.EARLY_LOW_PEAK_CUT_ENABLED === '1') {
@@ -1290,44 +1237,6 @@ class PositionManager extends EventEmitter {
     }
     // 完全无数据时，默认用老币TP(25%) — 宁可多拿也不少拿
     return oldCoinTakeProfit;
-  }
-
-  // v3.20: 波动率感知超时 — 替代纯peak感知梯度
-  // 低波动币(pre_vol<10%): 不设TIMEOUT — 竞对数据证明低波币死扛84%能弹回
-  // 高波动币(pre_vol>=15%): 60min — 给高波币更多时间弹回
-  // 默认(10-15%): 保留peak感知梯度超时
-  getPeakAwareTimeoutMs(peakPnlPct, preVol5m, mint) {
-    // v3.27: 老币关闭超时(竞对avg hold 398min, 我们TIMEOUT是最大亏损源)
-    // 新币保持波动率感知超时
-    const newCoinThresholdMs = parseFloat(process.env.NEW_COIN_AGE_THRESHOLD_MS || '0');
-    const oldCoinTimeoutMs = parseInt(process.env.OLD_COIN_TIMEOUT_MS || '0'); // 0=不超时
-    if (newCoinThresholdMs <= 0) return config.strategy.maxHoldMs;
-
-    if (mint) {
-      const tokenInfo = this.tokenRegistry?.getToken(mint);
-      if (newCoinThresholdMs > 0 && tokenInfo && tokenInfo.added_at) {
-        const tokenAgeMs = Date.now() - tokenInfo.added_at;
-        if (tokenAgeMs >= newCoinThresholdMs) {
-          // 老币: 用 OLD_COIN_TIMEOUT_MS
-          return oldCoinTimeoutMs;
-        }
-      }
-    }
-
-    // 新币: 波动率感知超时
-    const lowThreshold = parseFloat(process.env.VOL_LOW_THRESHOLD || '10');
-    const highThreshold = parseFloat(process.env.VOL_HIGH_THRESHOLD || '15');
-    if (preVol5m != null && preVol5m >= 0) {
-      if (preVol5m < lowThreshold) {
-        return parseInt(process.env.VOL_LOW_TIMEOUT_MS || '0'); // 0=不超时(死扛)
-      }
-      if (preVol5m >= highThreshold) {
-        return parseInt(process.env.VOL_HIGH_TIMEOUT_MS || '0');
-      }
-      return parseInt(process.env.VOL_MID_TIMEOUT_MS || '0');
-    }
-    // preVol5m为null → 中波处理
-    return parseInt(process.env.VOL_MID_TIMEOUT_MS || '0');
   }
 
   // v3.17.42: 同步版本 — 直接查 DB，避免异步竞态导致波动率写丢失
@@ -1545,8 +1454,7 @@ class PositionManager extends EventEmitter {
       }
     }
 
-    // v3.12: reconcile 完成前完全跳过（entryPrice 是估算值，所有 exit 检查都不可靠）
-    //        例外：MAX_HOLD_MS 超时由 _tick 那条路径触发
+    // v3.12: reconcile 完成前完全跳过（entryPrice 是估算值，所有价格型 exit 检查都不可靠）
     if (!pos.reconciled && !pos.dryRun) {
       return;
     }
@@ -1554,6 +1462,29 @@ class PositionManager extends EventEmitter {
     // v3.17.42: 记录最新tick价格，供前端API使用(priceTracker可能没追踪该mint)
     pos._lastTickPrice = price;
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+
+    // Pump migration tokens have a fixed 1B-token supply. Derive FDV from the
+    // latest trusted effective-reserve price so the $20k forced exit runs on
+    // the sub-second position path instead of waiting for the 1-minute market
+    // metadata refresh.
+    const solPriceUsd = config.priceFilter.swapSanitizer.solPriceUsd;
+    const liveFdvUsd = price * 1_000_000_000 * solPriceUsd;
+    if (
+      Number.isFinite(liveFdvUsd) &&
+      liveFdvUsd >= 0 &&
+      liveFdvUsd < config.strategy.fdvExitThresholdUsd
+    ) {
+      pos.pendingForcedExitReason = pos.pendingForcedExitReason || 'FDV_BELOW_20000';
+      pos.removeFromMonitoringAfterClose = true;
+      console.log(
+        `[PositionManager] FDV_BELOW_20000 ${pos.symbol || pos.mint.slice(0, 6)} ` +
+          `liveFdv=$${Math.round(liveFdvUsd)} price=${price.toExponential(6)} ` +
+          `source=${context?.source || 'price_update'} position=${pos.positionId.slice(0, 8)}`,
+      );
+      monitor.inc('PositionManager.FDV_BELOW_20000', 1, 'PositionManager');
+      this._exitForCondition(pos, price, 'FDV_BELOW_20000');
+      return;
+    }
 
     // Absolute loss cap: no stabilization or legacy emergency-stop grace delay.
     const fixedStopPct = config.strategy.fixedStopLossPct;
@@ -1975,7 +1906,7 @@ class PositionManager extends EventEmitter {
     //      - trailing 激活后从高点回撤 TRAILING_DRAWDOWN_PCT → trailing 卖出
     //    所以先检查 TP，再检查 trailing，两者不冲突。
 
-    // 各仓独立计算条件；任一仓触发后，同币全部仓位进入串行卖出队列。
+    // Each leg evaluates its own trailing state and enqueues only itself.
 
     // 3a. 固定止盈：到 TAKE_PROFIT_PCT 立即卖
     //   v3.17.40: 加价格确认 — 如果 pnlPct 单 tick 暴涨超过 TP 阈值 15% 以上，
@@ -2032,7 +1963,7 @@ class PositionManager extends EventEmitter {
     //   DEFENSE_STOP_LOSS 已禁用 (defenseStopLossPct=0)
     //   激活后从高点回撤 defenseTrailingDrawdownPct(3%) 卖出
     //
-    //   优先级: TP > 原trailing > 防御trailing > MAX_HOLD
+    //   优先级: TP > 主 trailing > 防御 trailing
     //
     const defenseProfitActivatePct = config.strategy.defenseProfitActivatePct || 0;
     const defenseStopLossPct = config.strategy.defenseStopLossPct;
@@ -2575,7 +2506,7 @@ class PositionManager extends EventEmitter {
       feeSol,
     });
 
-    // 同币加仓仓位在触发阶段已经统一进入串行卖出队列，这里只完成当前仓位结算。
+    // Other legs remain open until their own exit condition is met.
   }
 
   _scheduleRetryOrStuck(pos, triggerPrice, errMsg) {

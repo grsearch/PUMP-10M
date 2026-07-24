@@ -26,9 +26,17 @@ const monitor = getMonitor();
 
 async function main() {
   const watchdogCheckIntervalMs = parseInt(process.env.WATCHDOG_CHECK_INTERVAL_MS || '60000', 10);
+  const watchdogMinFdvUsd = Math.max(
+    Number(config.strategy.minFdVUsd) || 0,
+    Number(config.strategy.fdvExitThresholdUsd) || 0,
+  );
+  const watchdogMaxAgeMs = Math.min(
+    Number(config.strategy.maxTokenAgeMs) || Number.POSITIVE_INFINITY,
+    Number(config.strategy.ageExitMs) || Number.POSITIVE_INFINITY,
+  );
   const watchdogFdvRange = config.strategy.maxFdVUsd > 0
-    ? `$${config.strategy.minFdVUsd}-$${config.strategy.maxFdVUsd}`
-    : `>=$${config.strategy.minFdVUsd}`;
+    ? `$${watchdogMinFdvUsd}-$${config.strategy.maxFdVUsd}`
+    : `>=$${watchdogMinFdvUsd}`;
   console.log('================================================');
   console.log('🎯 Dump Sniper V3.17.20 starting...');
   console.log(`Mode: ${config.DRY_RUN ? 'DRY_RUN' : '⚠️  LIVE TRADING ⚠️'}`);
@@ -44,18 +52,23 @@ async function main() {
         'minimum token output now enforces the signal-price cap.',
     );
   }
+  if (process.env.FIXED_STOP_LOSS_PCT != null) {
+    console.warn(
+      'FIXED_STOP_LOSS_PCT is retired and ignored; a fixed loss exit would ' +
+        'prevent the qualifying -15% add-on.',
+    );
+  }
   console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
   console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}%`);
   console.log(
-    `RSI(15s) exit: ${config.strategy.rsi15sExitEnabled
-      ? `> ${config.strategy.rsi15sOverboughtExit} or cross below ${config.strategy.rsi15sCrossDownExit}`
-      : 'disabled'}`,
+    `Forced exits: FDV < $${config.strategy.fdvExitThresholdUsd} / ` +
+      `migration AGE >= ${config.strategy.ageExitMs / 60_000}min`,
   );
   console.log(
-    `Entry: RSI(${config.activityFlow.rsi15sPeriod},15s) cross above ` +
+    `Entry: closed RSI(${config.activityFlow.rsi15sPeriod},15s) cross above ` +
       `${config.activityFlow.rsi15sEntryThreshold}, trailing ` +
-      `${config.activityFlow.rsi15sVolumeWindowMs / 1000}s volume>=` +
-      `$${config.activityFlow.rsi15sMinVolume60sUsd}, buy next tradable candle open`,
+      `${config.activityFlow.rsi15sVolumeWindowMs / 1000}s real volume>=` +
+      `$${config.activityFlow.rsi15sMinVolume60sUsd}, execute immediately after confirmation`,
   );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
@@ -66,19 +79,21 @@ async function main() {
   console.log(`Rebuy cooldown: ${config.strategy.rebuyCooldownMs > 0 ? config.strategy.rebuyCooldownMs / 60_000 + 'min after close' : 'disabled'}`);
   console.log(
     `Watchdog: FDV=${watchdogFdvRange}, liquidity>=$${config.strategy.minLiquidityUsd}, ` +
-      `migrationAge<=${config.strategy.maxMintAgeHours}h ` +
+      `migrationAge<=${watchdogMaxAgeMs / 60_000}min ` +
       `(check every ${watchdogCheckIntervalMs / 60_000}min)`,
   );
   console.log(`Fixed stop loss: ${config.strategy.fixedStopLossPct < 0 ? config.strategy.fixedStopLossPct + '%' : 'disabled'}`);
   console.log(`Emergency stop: ${config.strategy.emergencyStopLossPct < 0 ? config.strategy.emergencyStopLossPct + '%' : 'disabled'}`);
   console.log(`No-bounce exit: ${config.strategy.noBounceExitEnabled ? config.strategy.noBounceExitMs / 1000 + 's' : 'disabled'}`);
-  console.log(`Max hold: ${config.strategy.maxHoldMs > 0 ? config.strategy.maxHoldMs / 1000 + 's' : 'disabled'}`);
   console.log(
     `Buy guard: chain ceiling=${(config.strategy.buySlippageBps / 100).toFixed(1)}%, ` +
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
       `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms`,
   );
-  console.log('Add-on: disabled');
+  console.log(
+    `Add-on: one qualifying add-on at -${config.strategy.addonDropPct}% from initial entry; ` +
+      `max ${config.strategy.maxBuysPerMint} independent legs per mint`,
+  );
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
   console.log(`Pump graduation discovery: ${config.pumpDiscovery.enabled ? 'enabled' : 'disabled'}`);
   console.log('================================================');
@@ -147,15 +162,16 @@ async function main() {
   // v3.17.17: SS pre-warm 需要 tokenRegistry 做 base_vault → mint 反查
   tickStream.setTokenRegistry(tokenRegistry);
 
-  // RsiCalculator remains for price-history helpers; RSI buy/sell filters are disabled.
+  // RsiCalculator supplies the closed 15-second entry signal and price history.
   const RsiCalculator = require('./core/RsiCalculator');
   const rsiCalculator = new RsiCalculator({
+    period5: 7,
     period15: config.activityFlow.rsi15sPeriod,
     period60: config.activityFlow.rsi1mPeriod,
     priceScaleResetRatio: config.activityFlow.rsiPriceScaleResetRatio,
   });
   if (rsiCalculator) {
-    console.log('[main] RSI calculator enabled for 15s entry/exit and price-history helpers');
+    console.log('[main] RSI calculator enabled for closed 5s entry and price-history helpers');
     setInterval(() => rsiCalculator.cleanup(), 60_000);
 
     // Rebuild RSI from captured swaps. The lookback is a maximum, not a token-age
@@ -235,7 +251,7 @@ async function main() {
       `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi15sPeriod}) ` +
       `cross>${activityFlowTracker.rsi15sEntryThreshold} ` +
       `vol${activityFlowTracker.rsi15sVolumeWindowMs / 1000}s>=` +
-      `$${activityFlowTracker.rsi15sMinVolume60sUsd} next-tradable-open ` +
+      `$${activityFlowTracker.rsi15sMinVolume60sUsd} immediate-confirmation ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(
@@ -422,7 +438,7 @@ async function main() {
   }, 3600_000);
 
   console.log(
-    `[main] token AGE filter enabled: remove after ${config.strategy.maxMintAgeHours}h ` +
+    `[main] token AGE filter enabled: remove after ${watchdogMaxAgeMs / 60_000}min ` +
     '(open positions are retained until exit)',
   );
 
@@ -710,7 +726,6 @@ async function main() {
       const rsiSnapshot = rsiCalculator.snapshot(mint);
       if (rsiSnapshot) {
         activityFlowTracker.updateRsiSnapshot(mint, rsiSnapshot);
-        positionManager.handleRsiForExit(mint, price, rsiSnapshot);
       }
     }
   });
@@ -977,6 +992,18 @@ async function main() {
     signalEngine.lastTriggerTs.set(pos.mint, Date.now());
     if (config.strategy.rebuyCooldownMs > 0) {
       signalEngine._exitCooldowns.set(pos.mint, Date.now() + config.strategy.rebuyCooldownMs);
+    }
+    if (
+      pos.removeFromMonitoringAfterClose &&
+      !positionManager.hasOpenPosition(pos.mint)
+    ) {
+      tokenRegistry.removeToken(pos.mint);
+      const mints = tokenRegistry.listActive().map((token) => token.mint);
+      tickStream.updateSubscription(mints);
+      console.log(
+        `[main] removed ${pos.symbol || pos.mint.slice(0, 8)} from monitoring ` +
+          `after confirmed ${pos.exitReason} exit`,
+      );
     }
     server.broadcast({ type: 'positionClosed', position: pos });
   });

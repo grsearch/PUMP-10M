@@ -24,7 +24,7 @@
  *      人工或半自动跟进（先观察、再决定是否自动跟单）。本类已 emit 'competitorTrade' 事件。
  *   2. 领先关系分析：记录竞争对手 BUY 的 slot vs 砸单 slot、vs 我们 BUY 的 slot，
  *      看他是不是总比我们早 1-2 个 slot（已记录 slot 字段，可在 reports 里做）。
- *   3. 持仓时长分布：他是「秒级反弹就跑」还是「拿几分钟」，直接影响我们 MAX_HOLD_MS / trailing 调参。
+ *   3. 持仓时长分布：他是「秒级反弹就跑」还是「拿几分钟」，可用于评估 trailing 参数。
  *
  * 持久化：competitor_trades（每笔买卖）+ 内存 open-lots（未配对的买入）。
  *   重启后从 DB 恢复最近 24h 未平的买入 lots，避免重启丢配对。
