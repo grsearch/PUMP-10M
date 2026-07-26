@@ -54,21 +54,25 @@ async function main() {
   }
   if (process.env.FIXED_STOP_LOSS_PCT != null) {
     console.warn(
-      'FIXED_STOP_LOSS_PCT is retired and ignored; a fixed loss exit would ' +
-        'prevent the qualifying -15% add-on.',
+      `FIXED_STOP_LOSS_PCT is ignored; the production fixed stop is locked at ` +
+        `${config.strategy.fixedStopLossPct}%.`,
     );
   }
   console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
   console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}%`);
   console.log(
+    `RSI(1s) exit before trailing: >${config.strategy.rsi1sOverboughtExit} or ` +
+      `cross below ${config.strategy.rsi1sCrossDownExit}; disabled after trailing arms`,
+  );
+  console.log(
     `Forced exits: FDV < $${config.strategy.fdvExitThresholdUsd} / ` +
       `migration AGE >= ${config.strategy.ageExitMs / 60_000}min`,
   );
   console.log(
-    `Entry: closed RSI(${config.activityFlow.rsi15sPeriod},15s) cross above ` +
-      `${config.activityFlow.rsi15sEntryThreshold}, trailing ` +
-      `${config.activityFlow.rsi15sVolumeWindowMs / 1000}s real volume>=` +
-      `$${config.activityFlow.rsi15sMinVolume60sUsd}, execute immediately after confirmation`,
+    `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
+      `${config.activityFlow.rsi1sEntryThreshold}, trailing ` +
+      `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s real volume>=` +
+      `$${config.activityFlow.rsi1sMinVolume60sUsd}, execute immediately after confirmation`,
   );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
@@ -162,16 +166,17 @@ async function main() {
   // v3.17.17: SS pre-warm 需要 tokenRegistry 做 base_vault → mint 反查
   tickStream.setTokenRegistry(tokenRegistry);
 
-  // RsiCalculator supplies the closed 15-second entry signal and price history.
+  // RsiCalculator supplies the closed 1-second entry/exit signal and price history.
   const RsiCalculator = require('./core/RsiCalculator');
   const rsiCalculator = new RsiCalculator({
+    period1: config.activityFlow.rsi1sPeriod,
     period5: 7,
-    period15: config.activityFlow.rsi15sPeriod,
+    period15: 7,
     period60: config.activityFlow.rsi1mPeriod,
     priceScaleResetRatio: config.activityFlow.rsiPriceScaleResetRatio,
   });
   if (rsiCalculator) {
-    console.log('[main] RSI calculator enabled for closed 5s entry and price-history helpers');
+    console.log('[main] RSI calculator enabled for closed 1s entry/exit and price-history helpers');
     setInterval(() => rsiCalculator.cleanup(), 60_000);
 
     // Rebuild RSI from captured swaps. The lookback is a maximum, not a token-age
@@ -183,14 +188,27 @@ async function main() {
       );
       const warmupStart = Date.now() - warmupMinutes * 60_000;
       const warmupRows = tradeLogger.db.prepare(`
-        SELECT mint, ts, price
+        SELECT mint, ts, price, sol_volume, side, pool_quote_after
         FROM swap_events
         WHERE ts > ? AND price > 0
         ORDER BY ts ASC, id ASC
       `).all(warmupStart);
       let fed = 0;
       for (const r of warmupRows) {
-        rsiCalculator.feedTick(r.mint, Number(r.price), Number(r.ts));
+        const solVolume = Number(r.sol_volume);
+        const side = String(r.side || '').toLowerCase();
+        if (solVolume > 0 && (side === 'buy' || side === 'sell')) {
+          rsiCalculator.feedTrade(
+            r.mint,
+            Number(r.price),
+            solVolume,
+            side,
+            Number(r.ts),
+            Number(r.pool_quote_after) || null,
+          );
+        } else {
+          rsiCalculator.feedTick(r.mint, Number(r.price), Number(r.ts));
+        }
         fed++;
       }
       console.log(
@@ -248,10 +266,10 @@ async function main() {
   );
   console.log(
     `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
-      `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi15sPeriod}) ` +
-      `cross>${activityFlowTracker.rsi15sEntryThreshold} ` +
-      `vol${activityFlowTracker.rsi15sVolumeWindowMs / 1000}s>=` +
-      `$${activityFlowTracker.rsi15sMinVolume60sUsd} immediate-confirmation ` +
+      `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi1sPeriod}) ` +
+      `cross>${activityFlowTracker.rsi1sEntryThreshold} ` +
+      `vol${activityFlowTracker.rsi1sVolumeWindowMs / 1000}s>=` +
+      `$${activityFlowTracker.rsi1sMinVolume60sUsd} immediate-confirmation ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(
@@ -726,6 +744,7 @@ async function main() {
       const rsiSnapshot = rsiCalculator.snapshot(mint);
       if (rsiSnapshot) {
         activityFlowTracker.updateRsiSnapshot(mint, rsiSnapshot);
+        positionManager.handleRsiForExit(mint, price, rsiSnapshot);
       }
     }
   });

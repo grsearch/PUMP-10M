@@ -22,34 +22,36 @@ used to backfill its migration AGE even when that pair does not yet expose compl
 FDV/LP data. Legacy `WATCHDOG_CHECK_INTERVAL_MS` values above one minute are clamped
 to `60000`.
 
-Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 15 秒 RSI(7) 从 ≤30 上穿 >30，且前 60 秒真实成交量至少 $5,000**。
+Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 1 秒 RSI(7) 从 ≤30 上穿 >30，且前 60 秒真实成交量至少 $10,000**；默认每笔仓位为 `0.2 SOL`。
 
 ## 当前买入策略
 
-程序用真实成交的收盘价计算 15 秒 RSI，并按以下顺序判断：
+程序用真实成交的收盘价计算 1 秒 RSI，并按以下顺序判断：
 
-- RSI 周期为 `7`，只用已经收盘的 15 秒 K 线确认信号。
+- RSI 周期为 `7`，只用已经收盘的 1 秒 K 线确认信号。
 - 上一根已收盘 RSI `<=30`、最新已收盘 RSI `>30`，构成从下向上突破 30。
-- 信号收盘前 `60 秒`真实买卖总成交量必须 `>= $5,000`；美元金额按 `SOL_PRICE_USD` 换算。
+- 信号收盘前 `60 秒`真实买卖总成交量必须 `>= $10,000`；美元金额按 `SOL_PRICE_USD` 换算。
 - 收盘信号得到确认后立即进入现有实盘下单链路，不增加额外等待。
 
 默认入口日志应显示：
 
 ```text
-Entry: closed RSI(7,15s) cross above 30, trailing 60s real volume >= $5000, execute immediately after confirmation
+Entry: closed RSI(7,1s) cross above 30, trailing 60s real volume >= $10000, execute immediately after confirmation
 Legacy dumpSignal: suppressed
-[main] ActivityFlow enabled: mode=RSI_CROSS_15S ... immediate-confirmation ...
+[main] ActivityFlow enabled: mode=RSI_CROSS_1S ... immediate-confirmation ...
 ```
 
 ## 当前卖出策略
 
-- 移动止盈：每个仓位独立计算；上涨 `50%` 激活，从各自最高点回撤 `10%` 卖出。
+- 移动止盈：每个仓位独立计算；上涨 `10%` 激活，从各自最高点回撤 `5%` 卖出。
+- RSI 卖出：移动止盈尚未激活时，已收盘 1 秒 RSI `>80`，或从 `>=70` 下穿 `<70` 时卖出；某笔仓位一旦先激活移动止盈，该仓位永久屏蔽这两条 RSI 卖出。
 - FDV 跌破 `$20,000`：全部未平仓仓位逐笔立即卖出，全部确认成交后移出监控。
 - 代币迁移 AGE 达到 `15 分钟`：全部未平仓仓位逐笔立即卖出，全部确认成交后移出监控。
-- 不使用 RSI `>80`、RSI 下穿 `70` 或最长持仓时间卖出。
-- 固定止损已固定关闭，避免在 `-10%` 提前卖出而使 `-15%` 加仓永远无法触发；固定止盈、无反弹退出和资金流反转退出默认关闭。
+- 不使用最长持仓时间卖出。
+- 固定止损：每笔仓位按各自真实买入价下跌 `10%` 时立即卖出，不受稳定期或旧紧急止损宽限影响；固定止盈、无反弹退出和资金流反转退出默认关闭。
 - 首仓价格下跌至少 `15%` 且再次出现完整买入信号时，允许加仓一次；首仓与加仓仓位独立管理，同币最多两次买入和两次对应卖出。
-- 卖出冷静期：实际平仓完成后，同币 `5 分钟` 内禁止再次买入；多仓分批卖出时从最后一笔完成卖出重新计时。
+- 由于固定止损先在 `-10%` 触发，正常连续可信价格路径下首仓会在到达 `-15%` 加仓门槛前退出；保留加仓规则仅用于已有仓位或价格事件跳变等边界场景。
+- 卖出确认后的同币策略冷静期已关闭；执行失败保护仍独立生效。
 
 ## 监控列表过滤
 
@@ -137,4 +139,4 @@ STRATEGY_LAB_TPS_DOUBLE_MIN=5
 STRATEGY_LAB_LP_CHANGE_PCT=10
 ```
 
-上线前核对 `.env` 已填好 Helius、Birdeye 和钱包密钥，并确认启动日志显示 `RSI_CROSS_15S`。
+上线前核对 `.env` 已填好 Helius、Birdeye 和钱包密钥，并确认启动日志显示 `RSI_CROSS_1S`。

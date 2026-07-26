@@ -49,7 +49,7 @@ const config = {
     minPoolQuoteSol: parseFloat(process.env.MIN_POOL_QUOTE_SOL || '30.0'),
 
     // 仓位
-    positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.1'),
+    positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.2'),
 
     // Fixed TP remains configurable but is disabled by default. Core exit
     // thresholds below are fixed so stale server .env values cannot revive
@@ -63,8 +63,8 @@ const config = {
     //   trailingDrawdownPct: armed 后，价格从 HWM 回撤此 % 立即 SELL
     //   trailingMinHwmAgeMs: HWM 必须稳定至少此毫秒数（防单 tick 污染）
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
-    trailingActivatePct: 50,
-    trailingDrawdownPct: 10,
+    trailingActivatePct: 10,
+    trailingDrawdownPct: 5,
     trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '2000', 10),
 
     // Token-wide forced exits and the single independent add-on policy.
@@ -72,6 +72,12 @@ const config = {
     ageExitMs: 15 * 60 * 1000,
     addonDropPct: 15,
     maxBuysPerMint: 2,
+
+    // Before trailing is armed, closed 1-second RSI can close each leg.
+    // Once a leg arms trailing, RSI exits are permanently ignored for that leg.
+    rsi1sExitEnabled: true,
+    rsi1sOverboughtExit: 80,
+    rsi1sCrossDownExit: 70,
 
     // v3.17.6: Stabilization 期 —— reconcile 完成后等价格稳定，再开始 trailing 追踪
     //   原理：砸盘后 + 我们自买入 → 池子价格剧烈波动 + 虚高 5-10%
@@ -99,9 +105,8 @@ const config = {
       process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '0',
     ),
 
-    // A fixed loss exit would make the -15% qualifying add-on unreachable.
-    // Keep it retired even when an older deployment .env still contains -10.
-    fixedStopLossPct: 0,
+    // Absolute loss cap for each independent position leg.
+    fixedStopLossPct: -10,
     emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '0'),
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
@@ -167,7 +172,7 @@ const config = {
 
     // 风控（v3.17 默认 maxConcurrent 5）
     cooldownMsPerToken: parseInt(process.env.COOLDOWN_MS_PER_TOKEN || '0', 10),
-    rebuyCooldownMs: parseInt(process.env.REBUY_COOLDOWN_MS || '300000', 10),
+    rebuyCooldownMs: 0,
     maxConcurrentPositions: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '10', 10),
 
     // v3.17.6: 同砸单去重时间窗（毫秒）
@@ -228,11 +233,11 @@ const config = {
         .toLowerCase() === 'true',
     // The production entry strategy is fixed. Legacy server environment values
     // are intentionally ignored so stale deployments cannot reactivate removed rules.
-    entryMode: 'RSI_CROSS_15S',
-    rsi15sPeriod: 7,
-    rsi15sEntryThreshold: 30,
-    rsi15sVolumeWindowMs: 60_000,
-    rsi15sMinVolume60sUsd: 5_000,
+    entryMode: 'RSI_CROSS_1S',
+    rsi1sPeriod: 7,
+    rsi1sEntryThreshold: 30,
+    rsi1sVolumeWindowMs: 60_000,
+    rsi1sMinVolume60sUsd: 10_000,
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -582,20 +587,27 @@ function validateConfig() {
   if (!config.DRY_RUN && !config.wallet.privateKeyBs58) {
     errors.push('WALLET_PRIVATE_KEY_BS58 required for LIVE mode');
   }
-  if (config.activityFlow.rsi15sPeriod < 1) {
-    errors.push('RSI_15S_PERIOD must be >= 1');
+  if (config.activityFlow.rsi1sPeriod < 1) {
+    errors.push('RSI_1S_PERIOD must be >= 1');
   }
   if (
-    config.activityFlow.rsi15sEntryThreshold <= 0 ||
-    config.activityFlow.rsi15sEntryThreshold >= 100
+    config.activityFlow.rsi1sEntryThreshold <= 0 ||
+    config.activityFlow.rsi1sEntryThreshold >= 100
   ) {
-    errors.push('RSI_15S_ENTRY_THRESHOLD must be between 0 and 100');
+    errors.push('RSI_1S_ENTRY_THRESHOLD must be between 0 and 100');
   }
-  if (config.activityFlow.rsi15sVolumeWindowMs <= 0) {
-    errors.push('RSI_15S_VOLUME_WINDOW_MS must be > 0');
+  if (config.activityFlow.rsi1sVolumeWindowMs <= 0) {
+    errors.push('RSI_1S_VOLUME_WINDOW_MS must be > 0');
   }
-  if (config.activityFlow.rsi15sMinVolume60sUsd <= 0) {
-    errors.push('RSI_15S_MIN_VOLUME_60S_USD must be > 0');
+  if (config.activityFlow.rsi1sMinVolume60sUsd <= 0) {
+    errors.push('RSI_1S_MIN_VOLUME_60S_USD must be > 0');
+  }
+  if (
+    config.strategy.rsi1sCrossDownExit <= 0 ||
+    config.strategy.rsi1sOverboughtExit <= config.strategy.rsi1sCrossDownExit ||
+    config.strategy.rsi1sOverboughtExit >= 100
+  ) {
+    errors.push('RSI_1S exit thresholds must satisfy 0 < cross-down < overbought < 100');
   }
   return errors;
 }

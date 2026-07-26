@@ -22,12 +22,9 @@ class AlertChecker {
 
     this._timer = null;
 
-    // 用于趋势告警的 baseline
-    this._lastTxCount = 0;
-    this._lastTxCountAt = Date.now();
     this._lastBuyFail = 0;
     this._lastSellFail = 0;
-    this._lastForceReconnectAt = 0; // v3.22: 防止重复重连
+    this._lastRegionReconnectAt = new Map();
   }
 
   start() {
@@ -101,62 +98,90 @@ class AlertChecker {
   }
 
   /**
-   * v3.22: 改用 LS-only 的 tx 计数器检测无流量，避免 SS 活跃时掩盖 LS 断连
+   * 窄过滤交易流的“无成交”不等于“断流”。连接健康由 RegionStream 在
+   * 同一条 gRPC 订阅上的 ping/pong 和连接状态给出；只有该信号失活才告警。
    */
   _checkTickStream() {
     const watching = this.tokenRegistry.getActiveMintSet().size;
+    // 清理旧版本基于成交数量产生的误报告警。
+    this.monitor.clearAlert('tickstream.no_traffic');
     if (watching === 0) {
-      this.monitor.clearAlert('tickstream.no_traffic');
+      this.monitor.clearAlert('tickstream.stream_unhealthy');
       return;
     }
 
-    // v3.22: 用 LS region 的 tx 计数器（不含 SS）
-    // 根因：全局 TickStream.txReceived 包含 SS 数据，SS 活跃时 LS 断连不会被检测到
-    let lsTxCount = 0;
-    if (this.tickStream?.regions) {
-      for (const r of this.tickStream.regions) {
-        // LS region labels: LS-EWR, LS-FRA, LS-TYO, JUP-EWR, JUP-FRA, JUP-TYO
-        if (r.label && (r.label.startsWith('LS-') || r.label.startsWith('JUP-'))) {
-          lsTxCount += this.monitor.getCounter(`TickStream.${r.label}.txReceived`);
-        }
-      }
-    }
-    // fallback: 如果取不到 LS 计数器，用全局计数器
-    if (lsTxCount === 0) lsTxCount = this.monitor.getCounter('TickStream.txReceived');
-
     const now = Date.now();
-    if (lsTxCount > this._lastTxCount) {
-      this._lastTxCount = lsTxCount;
-      this._lastTxCountAt = now;
-      this.monitor.clearAlert('tickstream.no_traffic');
-      this._lastForceReconnectAt = 0;
-    } else if (now - this._lastTxCountAt > 60_000) {
-      this.monitor.fireAlert(
-        'tickstream.no_traffic',
-        'warn',
-        `LaserStream 监控 ${watching} 个代币，但 60s+ 无 LS tx 收到`,
-        { watching, last_tx_seconds_ago: Math.round((now - this._lastTxCountAt) / 1000), lsTxCount },
-      );
+    const regions = (this.tickStream?.regions || []).filter(
+      (region) => region.label?.startsWith('LS-') || region.label?.startsWith('JUP-'),
+    );
+    const states = regions.map((region) => {
+      if (typeof region.getHealth === 'function') return region.getHealth(now);
+      const expected = Boolean(region.shouldRun && region._currentMints?.length > 0);
+      return {
+        label: region.label,
+        expected,
+        connected: Boolean(region.connected),
+        healthy: !expected || Boolean(region.connected),
+        activityAgeMs: null,
+        lastPongAgeMs: null,
+        lastTxAgeMs: null,
+        watchedMints: region._currentMints?.length || 0,
+      };
+    });
+    const expectedStates = states.filter((state) => state.expected);
+    const unhealthy = expectedStates.filter((state) => !state.healthy);
 
-      const noTrafficMs = now - this._lastTxCountAt;
-      const lastReconnectAge = now - (this._lastForceReconnectAt || 0);
-      if (noTrafficMs > 90_000 && lastReconnectAge > 300_000 && this.tickStream) {
-        console.warn(
-          `[AlertChecker] 🔄 LS no_traffic ${Math.round(noTrafficMs/1000)}s → force rebuild all LS regions`,
-        );
-        this._lastForceReconnectAt = now;
-        const mints = this.tickStream.watchedMints;
-        for (const r of this.tickStream.regions) {
-          if (r.label && (r.label.startsWith('LS-') || r.label.startsWith('JUP-'))) {
-            try {
-              console.log(`[AlertChecker] force rebuild region ${r.label}...`);
-              r.rebuild(mints).catch(e => console.warn(`[AlertChecker] rebuild ${r.label} failed: ${e.message}`));
-            } catch (e) {
-              console.warn(`[AlertChecker] force rebuild region ${r.label} failed: ${e.message}`);
-            }
-          }
+    this.monitor.set('TickStream.expectedRegions', expectedStates.length, 'TickStream');
+    this.monitor.set(
+      'TickStream.healthyRegions',
+      expectedStates.length - unhealthy.length,
+      'TickStream',
+    );
+
+    if (unhealthy.length === 0) {
+      this.monitor.clearAlert('tickstream.stream_unhealthy');
+      return;
+    }
+
+    const unhealthyLabels = unhealthy.map((state) => state.label);
+    const severity = unhealthy.length === expectedStates.length ? 'error' : 'warn';
+    this.monitor.fireAlert(
+      'tickstream.stream_unhealthy',
+      severity,
+      `LaserStream 订阅异常: ${unhealthyLabels.join(', ')}；正在自动重连`,
+      {
+        watching,
+        healthy_regions: expectedStates.length - unhealthy.length,
+        expected_regions: expectedStates.length,
+        regions: unhealthy.map((state) => ({
+          label: state.label,
+          connected: state.connected,
+          last_activity_seconds_ago:
+            state.activityAgeMs == null ? null : Math.round(state.activityAgeMs / 1000),
+          last_pong_seconds_ago:
+            state.lastPongAgeMs == null ? null : Math.round(state.lastPongAgeMs / 1000),
+          last_matching_tx_seconds_ago:
+            state.lastTxAgeMs == null ? null : Math.round(state.lastTxAgeMs / 1000),
+        })),
+      },
+    );
+
+    for (const state of unhealthy) {
+      const region = regions.find((candidate) => candidate.label === state.label);
+      const lastReconnectAt = this._lastRegionReconnectAt.get(state.label) || 0;
+      if (
+        region &&
+        now - lastReconnectAt >= 60_000 &&
+        typeof region._scheduleReconnect === 'function'
+      ) {
+        this._lastRegionReconnectAt.set(state.label, now);
+        try {
+          region.reconnectAttempts = 0;
+          region._scheduleReconnect();
+          this.monitor.inc('TickStream.forceReconnectUnhealthy', 1, 'TickStream');
+        } catch (err) {
+          console.warn(`[AlertChecker] reconnect ${state.label} failed: ${err.message}`);
         }
-        monitor.inc('TickStream.forceReconnectNoTraffic', 1, 'TickStream');
       }
     }
   }

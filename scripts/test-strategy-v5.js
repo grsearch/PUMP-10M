@@ -286,7 +286,7 @@ function runSlippageTests() {
   assert.strictEqual(config.strategy.noBounceExitMs, 90_000);
   assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
   assert.strictEqual(config.activityFlow.minPoolQuoteSol, undefined);
-  assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_15S');
+  assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_1S');
   assert.strictEqual(config.activityFlow.breadthMinUniqueBuyers1m, 100);
   assert.strictEqual(config.activityFlow.breadthMinNewBuyers1m, 40);
   assert.strictEqual(config.activityFlow.breadthMaxAvgBuyPerWallet5sSol, 0.4);

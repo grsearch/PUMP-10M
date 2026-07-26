@@ -500,10 +500,18 @@ class RsiCalculator {
     if (!s) return null;
 
     const prices1s = this._bucketsToPrices(s.buckets1s);
+    const closes1s = s.buckets1s.map((bucket) => bucket.lastPrice);
     const closes5s = s.buckets5s.map((bucket) => bucket.lastPrice);
 
     const prices30s = this._bucketsToPrices(s.buckets30s);
     const rsi1s = this._wildersRsi(prices1s, this.period1);
+    const rsi1sLive = this._wildersRsi(closes1s, this.period1);
+    const closedPrices1s = closes1s.slice(0, -1);
+    const previousClosedPrices1s = closes1s.slice(0, -2);
+    const rsi1sClosed = this._wildersRsi(closedPrices1s, this.period1);
+    const rsi1sPreviousClosed = this._wildersRsi(previousClosedPrices1s, this.period1);
+    const current1sBucket = s.buckets1s[s.buckets1s.length - 1] || null;
+    const closed1sBucket = s.buckets1s[s.buckets1s.length - 2] || null;
     const rsi5s = this._wildersRsi(closes5s, this.period5);
     const closedPrices5s = closes5s.slice(0, -1);
     const previousClosedPrices5s = closes5s.slice(0, -2);
@@ -533,6 +541,14 @@ class RsiCalculator {
 
     return {
       rsi1s,
+      rsi1sLive,
+      rsi1sClosed,
+      rsi1sPreviousClosed,
+      rsi1sClosedBars: Math.max(0, s.buckets1s.length - 1),
+      rsi1sCurrentBucketTs: current1sBucket ? current1sBucket.idx * this.bucketMs1 : null,
+      rsi1sClosedBucketTs: closed1sBucket ? closed1sBucket.idx * this.bucketMs1 : null,
+      rsi1sLiveClose: current1sBucket ? current1sBucket.lastPrice : null,
+      rsi1sLastClosedClose: closed1sBucket ? closed1sBucket.lastPrice : null,
       rsi5s,
       rsi5sClosed,
       rsi5sPreviousClosed,

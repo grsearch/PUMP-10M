@@ -72,6 +72,8 @@ monitor.registerModule('TickStream', { staleMs: 90_000, label: 'LaserStream gRPC
 // - TTL 5 分钟：覆盖最慢 region 的尾延迟（实测 < 2s）+ 余量
 const DEDUP_TTL_MS = 5 * 60_000;
 const DEDUP_MAX = 2000;
+const STREAM_PING_INTERVAL_MS = 30_000;
+const STREAM_PONG_TIMEOUT_MS = 90_000;
 
 class SignatureDedup {
   constructor() {
@@ -133,6 +135,15 @@ class RegionStream {
     this.shouldRun = false;
     this._reconnectScheduled = false;  // v3.17.21: 防抖标志,防止 error+end 双触发排两个重连
     this._currentMints = [];
+    this._pingTimer = null;
+    this._pingSequence = 0;
+    this._connectedAt = 0;
+    this._lastMessageAt = 0;
+    this._lastPongAt = 0;
+    this._lastPingAt = 0;
+    this._lastTxAt = 0;
+    this._pingIntervalMs = STREAM_PING_INTERVAL_MS;
+    this._pongTimeoutMs = STREAM_PONG_TIMEOUT_MS;
     // v3.17.26: replay — 记录本 region 最后收到的 slot，重连时 fromSlot 从这里开始
     this._lastReceivedSlot = 0;
   }
@@ -140,8 +151,8 @@ class RegionStream {
   async start(mints) {
     this.shouldRun = true;
     this._currentMints = Array.from(mints);
-    // v3.17.24: Jupiter filter mode 不需要 mints（用 JUP_program_ids）
-    if (this._currentMints.length === 0 && this.filterMode !== 'jupiter') {
+    // 空列表时仍保持 shouldRun=true；首个代币加入后的 rebuild 才能真正连接。
+    if (this._currentMints.length === 0) {
       console.log(`[TickStream:${this.label}] no mints to watch, idle`);
       return;
     }
@@ -157,18 +168,20 @@ class RegionStream {
     this._currentMints = Array.from(mints);
     await this._closeStream();
     await new Promise((r) => setTimeout(r, 500));
-    // v3.17.24: Jupiter filter mode 允许 mints 为空
-    if (this.shouldRun && (this._currentMints.length > 0 || this.filterMode === 'jupiter')) {
+    if (this.shouldRun && this._currentMints.length > 0) {
       await this._connect();
     }
   }
 
   async _closeStream() {
+    this._stopKeepalive();
     // v3.17.21: 彻底释放 gRPC 连接,每步独立 try/catch
     //   - cancel() 而非 end(): end() 对卡住的流无效,cancel() 才强制释放
     //   - removeAllListeners(): 释放事件监听闭包引用,允许 GC
     //   - client.close() 优先,兜底 _connectedGrpcClient.close()
     if (this.stream) {
+      const stream = this.stream;
+      this.stream = null;
       // v3.17.26: destroy() 替代 cancel() — destroy 触发 _destroy() → nativeStream.close() 释放 Rust 内存
       // cancel() 在 ClientDuplexStream 上不存在（被静默吞异常），导致 Rust 端 DuplexStream 从未被 close()
       // 这是 RSS 从 ~200MB 爬到 2GB OOM 的根因
@@ -176,9 +189,8 @@ class RegionStream {
       // 重要：先 removeAllListeners() 再 destroy()，否则 destroy() 触发的
       // 'close'/'error' 事件会走到 _handleEnd/_handleError → _scheduleReconnect，
       // 和 _closeStream 调用方的重连冲突（双重重连）
-      try { this.stream.removeAllListeners(); } catch (_) {}
-      try { this.stream.destroy(); } catch (_) {}
-      this.stream = null;
+      try { stream.removeAllListeners(); } catch (_) {}
+      try { stream.destroy(); } catch (_) {}
     }
     if (this.client) {
       try {
@@ -192,8 +204,7 @@ class RegionStream {
   }
 
   async _connect() {
-    // v3.17.24: Jupiter filter mode 不需要 mints
-    if (this._currentMints.length === 0 && this.filterMode !== 'jupiter') return;
+    if (this._currentMints.length === 0) return;
     try {
       this.client = new Client(
         this.endpoint,
@@ -223,7 +234,12 @@ class RegionStream {
 
       await this._sendSubscribeRequest();
       this.connected = true;
+      this._connectedAt = Date.now();
+      this._lastMessageAt = 0;
+      this._lastPongAt = 0;
       this.reconnectAttempts = 0;
+      this._startKeepalive();
+      this._sendKeepalivePing().catch((err) => this._handleKeepaliveError(err));
       monitor.inc(`TickStream.${this.label}.connectsTotal`, 1, 'TickStream');
       monitor.beat('TickStream', `${this.label}:connected:${this._currentMints.length}_mints`);
       console.log(
@@ -231,6 +247,8 @@ class RegionStream {
       );
       if (this.onConnected) this.onConnected(this.label);
     } catch (err) {
+      this.connected = false;
+      this._stopKeepalive();
       monitor.recordError('TickStream', err, { phase: 'connect', region: this.label });
       console.error(`[TickStream:${this.label}] connect failed: ${err.message}`);
       this._scheduleReconnect();
@@ -239,8 +257,7 @@ class RegionStream {
 
   async _sendSubscribeRequest() {
     const mints = this._currentMints;
-    // v3.17.24: Jupiter filter mode 不依赖 mints（用 JUP_program_ids），允许 mints 为空
-    if (mints.length === 0 && this.filterMode !== 'jupiter') return;
+    if (mints.length === 0) return;
 
     // v3.17.24: 支持 filterMode='jupiter' 订阅 Jupiter 路由交易
     //   Jupiter program 总在 staticAccountKeys（不在 ALT），LS 能匹配
@@ -248,6 +265,7 @@ class RegionStream {
     //   本地用 preTokenBalances 过滤是否涉及监控 mint
     //   数据量：Jupiter ~20 tx/s × 3 region = 60 tx/s，完全可控
     let filterPlain;
+    let v2Filter = null;
     if (this.filterMode === 'jupiter') {
       filterPlain = {
         vote: false,
@@ -266,7 +284,7 @@ class RegionStream {
         accountExclude: [],
         accountRequired: [PUMP_AMM_PROGRAM_ID],
       };
-      const v2Filter = {
+      v2Filter = {
         vote: false,
         failed: false,
         accountInclude: mints,
@@ -301,7 +319,7 @@ class RegionStream {
     };
 
     // v3.17.38: 如果是 pumpAmm 模式，额外加 v2 AMM filter
-    if (this.filterMode !== 'jupiter' && typeof v2Filter !== 'undefined') {
+    if (this.filterMode !== 'jupiter' && v2Filter) {
       const v2FilterObj = SubscribeRequestFilterTransactions
         ? SubscribeRequestFilterTransactions.create(v2Filter)
         : v2Filter;
@@ -357,6 +375,25 @@ class RegionStream {
   }
 
   _handleMessage(msg) {
+    const receivedAt = Date.now();
+    this._lastMessageAt = receivedAt;
+
+    if (msg.pong) {
+      this._lastPongAt = receivedAt;
+      monitor.inc(`TickStream.${this.label}.pongsReceived`, 1, 'TickStream');
+      monitor.beat('TickStream', `${this.label}:pong`);
+      return;
+    }
+
+    // Yellowstone 会在空闲流上发送应用层 ping。必须在同一条订阅流回复，
+    // 才能在没有匹配成交时区分“连接健康”和“连接静默失效”。
+    if (msg.ping) {
+      monitor.inc(`TickStream.${this.label}.serverPingsReceived`, 1, 'TickStream');
+      this._sendKeepalivePing().catch((err) => this._handleKeepaliveError(err));
+      monitor.beat('TickStream', `${this.label}:server_ping`);
+      return;
+    }
+
     // v3.17.29: 处理 slot update 消息(SubscribeRequest 里订阅了 slots)
     // slot update 消息结构: { slot: { slot: <num>, parent, status }, filters: ['systemSlot'] }
     // 通过 onSlot 回调上抛给 TickStream 维护 _latestSlot
@@ -382,6 +419,7 @@ class RegionStream {
       }
     }
     // v3.17.26 DEBUG: removed YOTS debug check (no longer needed)
+    this._lastTxAt = receivedAt;
     monitor.inc(`TickStream.${this.label}.txReceived`, 1, 'TickStream');
     monitor.beat('TickStream', `${this.label}:tx`);
     this.onTx(msg.transaction, this.label);
@@ -393,6 +431,7 @@ class RegionStream {
     monitor.recordError('TickStream', err, { phase: 'stream', region: this.label });
     console.error(`[TickStream:${this.label}] stream error: ${err.message || err}`);
     this.connected = false;
+    this._stopKeepalive();
     this._scheduleReconnect();
   }
 
@@ -402,13 +441,109 @@ class RegionStream {
     monitor.inc(`TickStream.${this.label}.streamEnded`, 1, 'TickStream');
     console.warn(`[TickStream:${this.label}] stream ended`);
     this.connected = false;
+    this._stopKeepalive();
     this._scheduleReconnect();
+  }
+
+  _startKeepalive() {
+    this._stopKeepalive();
+    this._pingTimer = setInterval(() => {
+      if (!this.connected || !this.stream) return;
+      const health = this.getHealth();
+      if (!health.healthy) {
+        const err = new Error(
+          `subscription keepalive stale for ${Math.round((health.activityAgeMs || 0) / 1000)}s`,
+        );
+        this._handleKeepaliveError(err);
+        return;
+      }
+      this._sendKeepalivePing().catch((err) => this._handleKeepaliveError(err));
+    }, this._pingIntervalMs);
+    if (typeof this._pingTimer.unref === 'function') this._pingTimer.unref();
+  }
+
+  _stopKeepalive() {
+    if (this._pingTimer) {
+      clearInterval(this._pingTimer);
+      this._pingTimer = null;
+    }
+  }
+
+  async _sendKeepalivePing() {
+    if (!this.connected || !this.stream) return false;
+    const stream = this.stream;
+    this._pingSequence = (this._pingSequence + 1) % 2_147_483_647;
+    if (this._pingSequence === 0) this._pingSequence = 1;
+    const requestPlain = {
+      ping: { id: this._pingSequence },
+      accounts: {},
+      accountsDataSlice: [],
+      transactions: {},
+      transactionsStatus: {},
+      slots: {},
+      blocks: {},
+      blocksMeta: {},
+      entry: {},
+    };
+    const request = SubscribeRequest
+      ? SubscribeRequest.create(requestPlain)
+      : requestPlain;
+    await new Promise((resolve, reject) => {
+      stream.write(request, (err) => {
+        // A subscription rebuild can close this stream while the write is in
+        // flight. That old callback must not reconnect the newly built stream.
+        if (stream !== this.stream) resolve(false);
+        else if (err) reject(err);
+        else resolve();
+      });
+    });
+    if (stream !== this.stream || !this.connected) return false;
+    this._lastPingAt = Date.now();
+    monitor.inc(`TickStream.${this.label}.pingsSent`, 1, 'TickStream');
+    return true;
+  }
+
+  _handleKeepaliveError(err) {
+    if (!this.shouldRun || this._currentMints.length === 0) return;
+    monitor.inc(`TickStream.${this.label}.keepaliveFailures`, 1, 'TickStream');
+    monitor.recordError('TickStream', err, { phase: 'keepalive', region: this.label });
+    console.warn(`[TickStream:${this.label}] keepalive failed: ${err.message}; reconnecting`);
+    this.connected = false;
+    this._stopKeepalive();
+    this._scheduleReconnect();
+  }
+
+  getHealth(now = Date.now()) {
+    const expected = this.shouldRun && this._currentMints.length > 0;
+    const activityAt = Math.max(
+      this._connectedAt || 0,
+      this._lastMessageAt || 0,
+      this._lastPongAt || 0,
+    );
+    const activityAgeMs = activityAt > 0 ? Math.max(0, now - activityAt) : null;
+    const healthy =
+      !expected ||
+      (
+        this.connected &&
+        activityAgeMs != null &&
+        activityAgeMs < this._pongTimeoutMs
+      );
+    return {
+      label: this.label,
+      expected,
+      connected: this.connected,
+      healthy,
+      activityAgeMs,
+      lastPongAgeMs: this._lastPongAt > 0 ? Math.max(0, now - this._lastPongAt) : null,
+      lastTxAgeMs: this._lastTxAt > 0 ? Math.max(0, now - this._lastTxAt) : null,
+      watchedMints: this._currentMints.length,
+    };
   }
 
   _scheduleReconnect() {
     // v3.17.21: 防抖 — error+end 可能短时间双触发,只排一个重连
     if (this._reconnectScheduled) return;
-    if (!this.shouldRun || (this._currentMints.length === 0 && this.filterMode !== 'jupiter')) return;
+    if (!this.shouldRun || this._currentMints.length === 0) return;
     this._reconnectScheduled = true;
     monitor.inc(`TickStream.${this.label}.reconnects`, 1, 'TickStream');
     const delay = Math.min(30_000, 1000 * Math.pow(2, this.reconnectAttempts));
@@ -611,9 +746,11 @@ class TickStream extends EventEmitter {
     this.shouldRun = true;
     initialMints.forEach((m) => this.watchedMints.add(m));
     if (this.watchedMints.size === 0) {
-      console.log('[TickStream] no tokens to watch yet, idle');
-      return;
+      console.log('[TickStream] no tokens to watch yet; regions armed for first subscription');
     }
+    // RegionStream.start(empty) intentionally marks each region shouldRun=true
+    // without opening a transaction stream. A later updateSubscription() can
+    // then rebuild and connect when the first mint is discovered.
     await Promise.all(this.regions.map((r) => r.start(this.watchedMints)));
     // v3.17.29: 启动独立 SlotSubscriber
     this._startSlotSubscriber();
@@ -627,33 +764,47 @@ class TickStream extends EventEmitter {
       this._printSsLeadStats();
     }, 60_000);
 
-    // v3.17.41: LS 延迟自动重连
-    // 故障表现: _latestSlotFromTx 整体落后 SlotSub 几百 slots (实测 943)
-    // 正常抖动: 0-50 slots。真故障: >300 slots。用 300 阈值清晰区分
+    // 仅在最近确实收到匹配交易时判断 slot 延迟。窄过滤订阅可能几分钟
+    // 没有成交，不能把“最后一笔交易的旧 slot”误判成流已经卡死。
     this._laggySec = 0;
-    console.log('[TickStream] 🔧 laggyReconnect timer starting (5s interval, threshold=100 slots, 10s sustained)');
+    console.log('[TickStream] lag monitor armed (only evaluates recently active LS streams)');
     this._laggyReconnectTimer = setInterval(() => {
-      const lsSlot = this._latestLsSlot || 0;
+      const now = Date.now();
       const slotSlot = this._latestSlotFromSlotUpdate || 0;
-      // v3.22: 修复 lsSlot=0 时 lag 永远为0的 bug
-      // 当 SlotSub 有数据但 LS 完全没收到 tx 时，lag = slotSlot（表示 LS 严重滞后）
-      const lag = slotSlot > 0 ? (lsSlot > 0 ? slotSlot - lsSlot : slotSlot) : 0;
+      const activeLsRegions = this.regions.filter((region) =>
+        region.label?.startsWith('LS-') &&
+        region._lastTxAt > 0 &&
+        now - region._lastTxAt <= 15_000 &&
+        region._lastReceivedSlot > 0,
+      );
+      const staleRegions = activeLsRegions.filter(
+        (region) => slotSlot > 0 && slotSlot - region._lastReceivedSlot > 100,
+      );
+      const lag = staleRegions.reduce(
+        (max, region) => Math.max(max, slotSlot - region._lastReceivedSlot),
+        0,
+      );
       monitor.set('TickStream.txStreamLag', lag, 'TickStream');
-      if (slotSlot > 0 && lag > 100) {
+      monitor.set('TickStream.txStreamLagObservable', activeLsRegions.length, 'TickStream');
+      if (staleRegions.length > 0) {
         this._laggySec = (this._laggySec || 0) + 5;
-        console.log(`[TickStream] LS lag detected: ${lag} slots (SlotUpdate=${slotSlot}, LsSlot=${lsSlot}), sustained=${this._laggySec}s`);
+        console.log(
+          `[TickStream] active LS lag detected: ${lag} slots ` +
+            `regions=${staleRegions.map((region) => region.label).join(',')} ` +
+            `sustained=${this._laggySec}s`,
+        );
         if (this._laggySec >= 10) {
-          console.error(`[TickStream] ⚠️ LS lag ${lag} slots for ${this._laggySec}s — reconnecting ALL tx regions`);
-          monitor.inc('TickStream.laggyReconnect', 1, 'TickStream');
-          // 重连所有 tx region (SlotSub 不动, 它是健康的)
-          for (const r of this.regions) {
+          console.error(
+            `[TickStream] active LS streams lag ${lag} slots; reconnecting ` +
+              staleRegions.map((region) => region.label).join(','),
+          );
+          monitor.inc('TickStream.laggyReconnect', staleRegions.length, 'TickStream');
+          for (const region of staleRegions) {
             try {
-              if (typeof r._scheduleReconnect === 'function') {
-                r.reconnectAttempts = 0;
-                r._scheduleReconnect();
-              }
+              region.reconnectAttempts = 0;
+              region._scheduleReconnect();
             } catch (e) {
-              console.warn(`[TickStream] reconnect region ${r.label} failed: ${e.message}`);
+              console.warn(`[TickStream] reconnect region ${region.label} failed: ${e.message}`);
             }
           }
           this._laggySec = 0;
@@ -834,6 +985,7 @@ class TickStream extends EventEmitter {
       monitor.set('TickStream.latestSlot', this._latestSlot, 'TickStream');
     }
     monitor.set('TickStream.latestSlotFromSlotUpdate', this._latestSlotFromSlotUpdate, 'TickStream');
+    monitor.beat('TickStream', `${region}:slot`);
   }
 
   /**
@@ -1512,3 +1664,5 @@ class TickStream extends EventEmitter {
 }
 
 module.exports = TickStream;
+module.exports.RegionStream = RegionStream;
+module.exports.SignatureDedup = SignatureDedup;

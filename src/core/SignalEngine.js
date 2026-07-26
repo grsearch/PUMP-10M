@@ -228,7 +228,7 @@ class SignalEngine extends EventEmitter {
     // v3.17.16: 记录信号到达 SignalEngine 的时间,用于事后分析 emit→BUY 延迟
     const _signalReceivedAt = Date.now();
     const { mint, symbol, sellSol, priceImpactPct, seller, signature, ts, slot } = signal;
-    const isRsi15sSignal = Boolean(signal._activityFlow && signal._flow?.entryRsi15s);
+    const isRsi1sSignal = Boolean(signal._activityFlow && signal._flow?.entryRsi1s);
 
 
     // 1. 自触发过滤
@@ -384,7 +384,7 @@ class SignalEngine extends EventEmitter {
     signal._rsi30sPreDump = rsi30sPreDump;
 
     // v3.17.39: 距近期高点跌幅过滤
-    const minDropFromHighPct = isRsi15sSignal ? 0 : config.strategy.minDropFromRecentHighPct;
+    const minDropFromHighPct = isRsi1sSignal ? 0 : config.strategy.minDropFromRecentHighPct;
     const lookbackSec = config.strategy.minDropLookbackSec || 1200;
     if (minDropFromHighPct > 0 && this.rsiCalculator) {
       const prices = this.rsiCalculator.getRecentPriceHistory(mint, lookbackSec, '5s');
@@ -403,7 +403,7 @@ class SignalEngine extends EventEmitter {
     //   实战案例: Backrooms 30s内从1.4e-6拉到2.0e-6(+42%), 砸单信号在拉盘顶部触发
     //   长窗口(30min)采样粒度太粗,根本看不到秒级脉冲
     //   用 RsiCalculator 的 1s 桶价格历史检测短窗口涨幅
-    const recentPumpShortSec = isRsi15sSignal ? 0 : config.strategy.recentPumpShortSec;
+    const recentPumpShortSec = isRsi1sSignal ? 0 : config.strategy.recentPumpShortSec;
     const recentPumpShortMaxPct = config.strategy.recentPumpShortMaxPct;
     if (recentPumpShortSec > 0 && recentPumpShortMaxPct > 0 && this.rsiCalculator) {
       const prices = this.rsiCalculator.getRecentPriceHistory(mint, recentPumpShortSec, '1s');
@@ -422,7 +422,7 @@ class SignalEngine extends EventEmitter {
     }
 
     // v3.17.40: 长窗口涨幅过滤
-    const recentPumpLongSec = isRsi15sSignal ? 0 : config.strategy.recentPumpLongSec;
+    const recentPumpLongSec = isRsi1sSignal ? 0 : config.strategy.recentPumpLongSec;
     const recentPumpLongMaxPct = config.strategy.recentPumpLongMaxPct;
     if (recentPumpLongSec > 0 && recentPumpLongMaxPct > 0) {
       const pumpPct = this._getLongPumpPct(mint, recentPumpLongSec * 1000);
@@ -587,10 +587,10 @@ class SignalEngine extends EventEmitter {
     // 砸盘深度 = (砸单前5min均价 - 买入价) / 均价 * 100
     // 数据支撑(7天回测): >50%深度 avgPnL -10%, 17笔深亏; 10-25%深度 WR 60-68%
     {
-      const maxDumpDepthPct = isRsi15sSignal
+      const maxDumpDepthPct = isRsi1sSignal
         ? 0
         : parseFloat(process.env.MAX_DUMP_DEPTH_PCT || '0');
-      const minDumpDepthPct = isRsi15sSignal
+      const minDumpDepthPct = isRsi1sSignal
         ? 0
         : parseFloat(process.env.MIN_DUMP_DEPTH_PCT || '0');
       if (maxDumpDepthPct > 0 || minDumpDepthPct > 0) {
@@ -633,7 +633,7 @@ class SignalEngine extends EventEmitter {
     //   过滤后总PnL: -71.89→-35.70 SOL (+36.19 SOL改善)
     //   新币PnL: -35.84→-9.07 SOL (+26.77 SOL改善)
     {
-      const maxPreVol5m = isRsi15sSignal
+      const maxPreVol5m = isRsi1sSignal
         ? 0
         : parseFloat(process.env.MAX_PRE_VOL_5M_PCT || '0');
       if (maxPreVol5m > 0) {
@@ -677,7 +677,7 @@ class SignalEngine extends EventEmitter {
     // ============ v3.24: 趋势过滤 — 5分钟跌+1分钟跌时跳过买入 ============
     // 数据支撑(7天): 5m跌+1m跌 WR=45%, PF=0.07, 深亏35%; 跳过后PF从0.44→0.69
     {
-      const trendFilterEnabled = !isRsi15sSignal && process.env.TREND_FILTER_ENABLED === '1';
+      const trendFilterEnabled = !isRsi1sSignal && process.env.TREND_FILTER_ENABLED === '1';
       if (trendFilterEnabled) {
         const samples = this._longPriceSamples.get(mint);
         if (samples && samples.length >= 5) {
@@ -714,7 +714,7 @@ class SignalEngine extends EventEmitter {
     // 竞对数据: 老币 pool>=100 + impact>=5% PF=7.93, 是最优策略
     // 我们的池子太小(30 SOL)的老币亏损严重, peak才3-4%涨不动
     {
-      const oldCoinMinPoolSol = isRsi15sSignal
+      const oldCoinMinPoolSol = isRsi1sSignal
         ? 0
         : parseFloat(process.env.OLD_COIN_MIN_POOL_SOL || '0');
       if (oldCoinMinPoolSol > 0 && this.tokenRegistry) {
@@ -759,10 +759,10 @@ class SignalEngine extends EventEmitter {
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
     let activityReason = null;
-    if (signal._activityFlow && flow?.entryRsi15s) {
-      const entry = flow.entryRsi15s;
+    if (signal._activityFlow && flow?.entryRsi1s) {
+      const entry = flow.entryRsi1s;
       activityReason =
-        `rsi_15s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
+        `rsi_1s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
         `${entry.currentRsi.toFixed(2)} cross>${entry.threshold} ` +
         `vol60=$${entry.volume60sUsd.toFixed(0)} execution=${entry.executionPrice}` +
         `${signal._isAddOn ? ` add_on_drop=${signal._addOn.dropPct.toFixed(2)}%` : ''}`;
