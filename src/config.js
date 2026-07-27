@@ -53,7 +53,7 @@ const config = {
 
     // Fixed TP remains configurable but is disabled by default. Core exit
     // thresholds below are fixed so stale server .env values cannot revive
-    // retired RSI or timeout exits.
+    // retired stop-loss or FDV exits.
     takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '0'),
     tpConfirmCount: parseInt(process.env.TP_CONFIRM_COUNT || '2', 10),
     tpConfirmMinGapMs: parseInt(process.env.TP_CONFIRM_MIN_GAP_MS || '300', 10),
@@ -61,19 +61,23 @@ const config = {
     // 移动止盈（v3.17.6 调参）
     //   trailingActivatePct: HWM 涨过 entryPrice × (1 + 此值/100) 才 arm
     //   trailingDrawdownPct: armed 后，价格从 HWM 回撤此 % 立即 SELL
-    //   trailingMinHwmAgeMs: HWM 必须稳定至少此毫秒数（防单 tick 污染）
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
     trailingActivatePct: 10,
     trailingDrawdownPct: 5,
-    trailingMinHwmAgeMs: parseInt(process.env.TRAILING_MIN_HWM_AGE_MS || '2000', 10),
+    // Exact production rule: once armed, a 5% drawdown exits immediately.
+    // Ignore stale server env values that previously added a hidden delay.
+    trailingMinHwmAgeMs: 0,
 
-    // Token-wide forced exits and the single independent add-on policy.
-    fdvExitThresholdUsd: 20_000,
+    // Timed/AGE exits and concurrent-leg policy. The cap applies only while
+    // positions are open; after all legs close, a fresh signal may buy again.
+    // FDV and fixed-stop exits are explicitly disabled.
+    fdvExitThresholdUsd: 0,
     ageExitMs: 15 * 60 * 1000,
+    maxHoldMs: 30_000,
     addonDropPct: 15,
     maxBuysPerMint: 2,
 
-    // Before trailing is armed, closed 1-second RSI can close each leg.
+    // Before trailing is armed, live 1-second RSI can close each leg.
     // Once a leg arms trailing, RSI exits are permanently ignored for that leg.
     rsi1sExitEnabled: true,
     rsi1sOverboughtExit: 80,
@@ -105,8 +109,7 @@ const config = {
       process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '0',
     ),
 
-    // Absolute loss cap for each independent position leg.
-    fixedStopLossPct: -10,
+    fixedStopLossPct: 0,
     emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '0'),
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
@@ -333,8 +336,8 @@ const config = {
     maxPriceChange5sPct: parseFloat(process.env.ACTIVITY_FLOW_MAX_PRICE_CHANGE_5S_PCT || '5'),
     maxPriceChange30sPct: parseFloat(process.env.ACTIVITY_FLOW_MAX_PRICE_CHANGE_30S_PCT || '10'),
     maxPriceChange60sPct: parseFloat(process.env.ACTIVITY_FLOW_MAX_PRICE_CHANGE_60S_PCT || '10'),
-    // The second qualifying signal is reserved for the one add-on; stale
-    // deployment cooldown values must not suppress it.
+    // No strategy cooldown after a successful sell. The synchronous inflight
+    // lock still prevents duplicate orders for the same signal.
     cooldownMs: 0,
     maxSignalAgeMs: parseInt(process.env.ACTIVITY_FLOW_MAX_SIGNAL_AGE_MS || process.env.MAX_PUSH_LAG_MS || '5000', 10),
     maxEventsPerMint: parseInt(process.env.ACTIVITY_FLOW_MAX_EVENTS_PER_MINT || '600', 10),

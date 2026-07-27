@@ -491,7 +491,7 @@ async function refreshStatus() {
   $('stat-trades1m').textContent = `1s RSI(${r.config.rsi1sPeriod}) ↑ ${r.config.rsi1sEntryThreshold}`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-trailing').textContent = `+${r.config.trailingActivatePct}% / ${r.config.trailingDrawdownPct}%`;
-  $('stat-forced').textContent = `FDV<${fmtMoney(r.config.fdvExitThresholdUsd)} / AGE ${Math.round(r.config.ageExitMs / 60000)}m`;
+  $('stat-forced').textContent = `最长 ${Math.round((r.config.maxHoldMs ?? 30000) / 1000)}s / AGE ${Math.round(r.config.ageExitMs / 60000)}m`;
   $('statusMeta').textContent = new Date().toLocaleTimeString();
 }
 
@@ -757,9 +757,9 @@ async function refreshSignals() {
     `<span>近60s真实成交量 <b>≥ ${fmtMoney(thresholds.minVolume60sUsd ?? 10000)}</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
     `<span>RSI卖出 <b>&gt;${thresholds.exitOverbought ?? 80} 或下穿 ${thresholds.exitCrossDown ?? 70}；移动止盈激活后屏蔽</b></span>`,
-    `<span>固定止损 <b>${thresholds.fixedStopLossPct ?? -10}%（每笔仓位独立）</b></span>`,
-    `<span>强制卖出 <b>FDV &lt; ${fmtMoney(thresholds.fdvExitThresholdUsd ?? 20000)} / AGE ≥ ${Math.round((thresholds.ageExitMs ?? 900000) / 60000)}m</b></span>`,
-    `<span>加仓 <b>初始买入价下跌 ${thresholds.addonDropPct ?? 15}% 后出现新信号；最多 ${thresholds.maxBuysPerMint ?? 2} 次买卖</b></span>`,
+    `<span>固定止损 <b>${(thresholds.fixedStopLossPct ?? 0) < 0 ? `${thresholds.fixedStopLossPct}%` : '关闭'}</b></span>`,
+    `<span>强制卖出 <b>最长持仓 ${Math.round((thresholds.maxHoldMs ?? 30000) / 1000)}s / AGE ≥ ${Math.round((thresholds.ageExitMs ?? 900000) / 60000)}m；FDV退出关闭</b></span>`,
+    `<span>同币重入 <b>无卖后冷却；同时最多 ${thresholds.maxBuysPerMint ?? 2} 笔，全部平仓后新信号可立即重入</b></span>`,
     `<span>活跃 <b>${summary.active || 0}</b></span>`,
     `<span>预热 <b>${summary.warming || 0}</b></span>`,
     `<span>量不足 <b>${summary.volumeBlocked || 0}</b></span>`,

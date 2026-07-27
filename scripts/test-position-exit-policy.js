@@ -42,7 +42,7 @@ function managerWith(tokenInfo, ...positions) {
   manager.positions = new Map();
   manager.byMint = new Map();
   manager._flowExitEvents = new Map();
-  manager._rsi1sLastExitBucketByMint = new Map();
+  manager._rsi1sLastLiveByMint = new Map();
   manager._exitCalls = [];
   manager.priceTracker = { getPrice: () => 1 };
   manager.tokenRegistry = { getToken: () => tokenInfo };
@@ -71,9 +71,10 @@ function run() {
 
   assert.strictEqual(config.strategy.trailingActivatePct, 10);
   assert.strictEqual(config.strategy.trailingDrawdownPct, 5);
-  assert.strictEqual(config.strategy.fixedStopLossPct, -10);
-  assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
-  assert.strictEqual(config.strategy.fdvExitThresholdUsd, 20_000);
+  assert.strictEqual(config.strategy.trailingMinHwmAgeMs, 0);
+  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
+  assert.strictEqual(config.strategy.maxHoldMs, 30_000);
+  assert.strictEqual(config.strategy.fdvExitThresholdUsd, 0);
   assert.strictEqual(config.strategy.ageExitMs, 15 * 60_000);
   assert.strictEqual(typeof PositionManager.prototype.handleRsiForExit, 'function');
 
@@ -87,8 +88,9 @@ function run() {
     const manager = managerWith(healthyToken, unarmed, armed);
     const exited = manager.handleRsiForExit(mint, 1.01, {
       rsi1sClosedBucketTs: 1_000,
-      rsi1sPreviousClosed: 75,
-      rsi1sClosed: 81,
+      rsi1sPreviousClosed: 65,
+      rsi1sClosed: 65,
+      rsi1sLive: 81,
     });
     assert.strictEqual(exited, true);
     assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1']);
@@ -97,23 +99,24 @@ function run() {
 
     manager.handleRsiForExit(mint, 1.01, {
       rsi1sClosedBucketTs: 1_000,
-      rsi1sPreviousClosed: 75,
-      rsi1sClosed: 81,
+      rsi1sPreviousClosed: 65,
+      rsi1sClosed: 65,
+      rsi1sLive: 81,
     });
-    assert.strictEqual(manager._exitCalls.length, 1, 'same closed 1s candle must be evaluated once');
+    assert.strictEqual(manager._exitCalls.length, 1, 'an already exiting leg must not enqueue a duplicate sell');
   }
 
   {
     const leg = position('p1', mint);
     const manager = managerWith(healthyToken, leg);
     manager._checkExit('p1', 1.1, { source: 'trailing_arm_priority' });
-    manager._checkExit('p1', 1.1, { source: 'trailing_arm_priority' });
-    assert.strictEqual(leg.trailingArmed, true, 'two confirmed +10% ticks must arm trailing');
+    assert.strictEqual(leg.trailingArmed, true, 'one trusted +10% tick must update HWM and arm trailing');
 
     const exited = manager.handleRsiForExit(mint, 1.1, {
       rsi1sClosedBucketTs: 1_500,
       rsi1sPreviousClosed: 75,
-      rsi1sClosed: 81,
+      rsi1sClosed: 75,
+      rsi1sLive: 81,
     });
     assert.strictEqual(exited, false);
     assert.strictEqual(manager._exitCalls.length, 0, 'RSI must not exit after trailing arms first');
@@ -123,32 +126,35 @@ function run() {
     const manager = managerWith(healthyToken, position('p1', mint));
     manager.handleRsiForExit(mint, 1.01, {
       rsi1sClosedBucketTs: 2_000,
-      rsi1sPreviousClosed: 72,
-      rsi1sClosed: 69,
+      rsi1sClosed: 72,
+      rsi1sLive: 72,
+    });
+    assert.strictEqual(manager._exitCalls.length, 0);
+    manager.handleRsiForExit(mint, 1.01, {
+      rsi1sClosedBucketTs: 2_000,
+      rsi1sClosed: 72,
+      rsi1sLive: 69,
     });
     assert.strictEqual(manager._exitCalls.length, 1);
     assert.strictEqual(manager._exitCalls[0].reason, 'RSI_1S_CROSS_DOWN');
   }
 
   {
-    const aboveStop = position('p1', mint);
-    const manager = managerWith(healthyToken, aboveStop);
-    manager._checkExit('p1', 0.9001, { source: 'fixed_stop_boundary' });
-    assert.strictEqual(manager._exitCalls.length, 0, 'price above -10% must stay open');
-
-    manager._checkExit('p1', 0.9, { source: 'fixed_stop_boundary' });
-    assert.strictEqual(manager._exitCalls.length, 1, 'price at -10% must exit immediately');
-    assert.strictEqual(manager._exitCalls[0].reason, 'FIXED_STOP_LOSS');
-    assert.strictEqual(manager._exitCalls[0].id, 'p1');
+    const leg = position('p1', mint);
+    const manager = managerWith(healthyToken, leg);
+    manager._checkExit('p1', 1.27, { source: 'volatile_single_tick_high' });
+    assert.strictEqual(leg.highWaterMark, 1.27, 'a one-tick volatile high must immediately become HWM');
+    assert.strictEqual(leg.trailingArmed, true);
+    manager._checkExit('p1', 1.2, { source: 'immediate_trailing_drawdown' });
+    assert.strictEqual(manager._exitCalls.length, 1, '5% drawdown must not be hidden behind an age delay');
+    assert.strictEqual(manager._exitCalls[0].reason, 'TRAILING_STOP');
   }
 
   {
-    const first = position('p1', mint);
-    const second = position('p2', mint, { isAddOn: true, entryPrice: 0.85 });
-    const manager = managerWith(healthyToken, first, second);
-    manager._checkExit('p1', 0.9, { source: 'fixed_stop_independent_leg' });
-    assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1']);
-    assert.strictEqual(second.exiting, false, 'fixed stop must not close another independent leg');
+    const leg = position('p1', mint);
+    const manager = managerWith(healthyToken, leg);
+    manager._checkExit('p1', 0.5, { source: 'fixed_stop_disabled' });
+    assert.strictEqual(manager._exitCalls.length, 0, 'fixed stop must remain disabled at any loss');
   }
 
   {
@@ -189,7 +195,7 @@ function run() {
 
   {
     const engine = Object.create(SignalEngine.prototype);
-    engine.tradeLogger = { countSuccessfulBuysByMint: () => 1 };
+    engine.tradeLogger = { countSuccessfulBuysByMint: () => 999 };
     engine.positionManager = {
       openPositionCountByMint: () => 1,
       canAddOn: (_mint, price) => ({
@@ -203,19 +209,21 @@ function run() {
     assert.strictEqual(addOn.isAddOn, true);
     assert.strictEqual(engine._getMintBuyAllowance(mint, 0.8501).allowed, false);
 
-    engine.tradeLogger.countSuccessfulBuysByMint = () => 2;
+    engine.positionManager.openPositionCountByMint = () => 2;
     assert.strictEqual(
       engine._getMintBuyAllowance(mint, 0.5).allowed,
       false,
-      'historical successful buys must enforce the lifetime two-buy cap',
+      'two concurrently open legs must block a third leg',
     );
 
-    engine.tradeLogger.countSuccessfulBuysByMint = () => 1;
     engine.positionManager.openPositionCountByMint = () => 0;
+    const reentry = engine._getMintBuyAllowance(mint, 0.5);
+    assert.strictEqual(reentry.allowed, true);
+    assert.strictEqual(reentry.isAddOn, false);
     assert.strictEqual(
-      engine._getMintBuyAllowance(mint, 0.5).allowed,
-      false,
-      'a closed first leg cannot be replaced by a later second initial buy',
+      engine.tradeLogger.countSuccessfulBuysByMint(),
+      999,
+      'historical buys may exist but must not block a fresh re-entry after full close',
     );
   }
 
@@ -231,10 +239,9 @@ function run() {
     const second = position('p2', mint, { isAddOn: true, entryPrice: 0.85 });
     const manager = managerWith({ ...healthyToken, fdv: 19_999 }, first, second);
     manager._tick();
-    assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1', 'p2']);
-    assert(manager._exitCalls.every((row) => row.reason === 'FDV_BELOW_20000'));
-    assert.strictEqual(first.removeFromMonitoringAfterClose, true);
-    assert.strictEqual(second.removeFromMonitoringAfterClose, true);
+    assert.strictEqual(manager._exitCalls.length, 0, 'FDV below $20k must no longer force an exit');
+    assert.strictEqual(first.removeFromMonitoringAfterClose, undefined);
+    assert.strictEqual(second.removeFromMonitoringAfterClose, undefined);
   }
 
   {
@@ -257,11 +264,28 @@ function run() {
     manager._checkExit('p1', 0.0000002, { source: 'test_live_fdv' });
     assert.strictEqual(
       manager._exitCalls.length,
-      1,
-      'live effective price must trigger FDV exit without waiting for market refresh',
+      0,
+      'live effective price must not trigger an FDV exit when the rule is disabled',
     );
-    assert.strictEqual(manager._exitCalls[0].reason, 'FDV_BELOW_20000');
-    assert.strictEqual(liveFdvPosition.removeFromMonitoringAfterClose, true);
+    assert.strictEqual(liveFdvPosition.removeFromMonitoringAfterClose, undefined);
+  }
+
+  {
+    const timedOut = position('p1', mint, {
+      openedAt: Date.now() - 30_000,
+      reconciledAt: Date.now() - 29_000,
+    });
+    const recent = position('p2', mint, {
+      isAddOn: true,
+      openedAt: Date.now() - 29_000,
+      reconciledAt: Date.now() - 29_000,
+    });
+    const manager = managerWith(healthyToken, timedOut, recent);
+    manager._tick();
+    assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1']);
+    assert.strictEqual(manager._exitCalls[0].reason, 'HOLD_TIMEOUT_30S');
+    assert.strictEqual(recent.exiting, false, 'each leg must use its own 30-second holding timer');
+    assert.strictEqual(timedOut.removeFromMonitoringAfterClose, undefined);
   }
 
   {

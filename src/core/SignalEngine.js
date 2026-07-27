@@ -166,24 +166,13 @@ class SignalEngine extends EventEmitter {
     const openCount = this.positionManager.openPositionCountByMint
       ? this.positionManager.openPositionCountByMint(mint)
       : (this.positionManager.hasOpenPosition(mint) ? 1 : 0);
-    const successfulBuyCount =
-      typeof this.tradeLogger.countSuccessfulBuysByMint === 'function'
-        ? this.tradeLogger.countSuccessfulBuysByMint(mint)
-        : openCount;
 
-    if (
-      openCount >= config.strategy.maxBuysPerMint ||
-      successfulBuyCount >= config.strategy.maxBuysPerMint
-    ) {
+    // Limit only concurrently open legs. Historical successful buys must not
+    // turn into a one-buy-per-mint blacklist after the position is closed.
+    if (openCount >= config.strategy.maxBuysPerMint) {
       return {
         allowed: false,
-        reason: `same mint reached ${config.strategy.maxBuysPerMint} buys`,
-      };
-    }
-    if (openCount === 0 && successfulBuyCount > 0) {
-      return {
-        allowed: false,
-        reason: 'initial leg already closed; second buy is only allowed as an add-on',
+        reason: `same mint already has ${config.strategy.maxBuysPerMint} open legs`,
       };
     }
     if (openCount === 1) {
@@ -483,6 +472,7 @@ class SignalEngine extends EventEmitter {
       }
       const registryFdv = tokenInfo?.fdv == null ? NaN : Number(tokenInfo.fdv);
       if (
+        config.strategy.fdvExitThresholdUsd > 0 &&
         Number.isFinite(registryFdv) &&
         registryFdv >= 0 &&
         registryFdv < config.strategy.fdvExitThresholdUsd
@@ -855,6 +845,7 @@ class SignalEngine extends EventEmitter {
         monitor.recordError('SignalEngine', err, { phase: 'logSignal_async' });
       }
     });
+    return true;
   }
 
   //   出场：EMA9下穿EMA20清仓 / 20%止盈 / 10%激活3%回撤移动止盈

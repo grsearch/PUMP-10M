@@ -57,7 +57,7 @@ class PositionManager extends EventEmitter {
     this._sellInProgress = new Set(); // 正在卖出的 mint
     this._tickCount = 0;  // v3.26: tick counter for PoolStateCache price check
     this._flowExitEvents = new Map(); // mint -> recent BUY/SELL swaps while holding
-    this._rsi1sLastExitBucketByMint = new Map(); // mint -> last evaluated closed 1s bucket
+    this._rsi1sLastLiveByMint = new Map(); // mint -> last observed live 1s RSI
 
     this.positions = new Map(); // positionId → position obj
     this.byMint = new Map();    // mint → Set<positionId> (v3.17.13: 同币多仓)
@@ -297,7 +297,7 @@ class PositionManager extends EventEmitter {
     if (pids.size === 0) {
       this.byMint.delete(mint);
       this._flowExitEvents.delete(mint);
-      this._rsi1sLastExitBucketByMint.delete(mint);
+      this._rsi1sLastLiveByMint.delete(mint);
     }
   }
 
@@ -313,21 +313,21 @@ class PositionManager extends EventEmitter {
     const pids = this.byMint.get(mint);
     if (!pids || pids.size === 0) return false;
 
-    const closedBucketTs = snapshot?.rsi1sClosedBucketTs == null
-      ? NaN
-      : Number(snapshot.rsi1sClosedBucketTs);
-    const previousRsi = snapshot?.rsi1sPreviousClosed == null
-      ? NaN
-      : Number(snapshot.rsi1sPreviousClosed);
-    const currentRsi = snapshot?.rsi1sClosed == null
+    // Exit signals are intentionally live. Entry still uses two closed 1s
+    // RSI values, but waiting for an exit candle to close can miss a brief
+    // >80 reading or a fast downward cross through 70.
+    const currentRsi = snapshot?.rsi1sLive == null
+      ? Number(snapshot?.rsi1sClosed)
+      : Number(snapshot.rsi1sLive);
+    if (!Number.isFinite(currentRsi)) return false;
+    const observedPrevious = this._rsi1sLastLiveByMint.get(mint);
+    const latestClosed = snapshot?.rsi1sClosed == null
       ? NaN
       : Number(snapshot.rsi1sClosed);
-    if (
-      !Number.isFinite(closedBucketTs) ||
-      !Number.isFinite(currentRsi)
-    ) return false;
-    if (this._rsi1sLastExitBucketByMint.get(mint) === closedBucketTs) return false;
-    this._rsi1sLastExitBucketByMint.set(mint, closedBucketTs);
+    const previousRsi = Number.isFinite(observedPrevious)
+      ? observedPrevious
+      : latestClosed;
+    this._rsi1sLastLiveByMint.set(mint, currentRsi);
 
     let reason = null;
     if (currentRsi > config.strategy.rsi1sOverboughtExit) {
@@ -340,6 +340,12 @@ class PositionManager extends EventEmitter {
       reason = 'RSI_1S_CROSS_DOWN';
     }
     if (!reason) return false;
+
+    const hasRsiEligibleLeg = [...pids].some((pid) => {
+      const pos = this.positions.get(pid);
+      return pos && !pos.exiting && pos.status !== 'stuck' && !pos.trailingArmed;
+    });
+    if (!hasRsiEligibleLeg) return false;
 
     let exited = 0;
     let trailingProtected = 0;
@@ -1057,6 +1063,12 @@ class PositionManager extends EventEmitter {
       const migrationTime = normalizeUnixMs(tokenInfo?.migration_time);
       let forcedExitReason = null;
       if (
+        config.strategy.maxHoldMs > 0 &&
+        age >= config.strategy.maxHoldMs
+      ) {
+        forcedExitReason = 'HOLD_TIMEOUT_30S';
+      } else if (
+        config.strategy.fdvExitThresholdUsd > 0 &&
         Number.isFinite(fdv) &&
         fdv >= 0 &&
         fdv < config.strategy.fdvExitThresholdUsd
@@ -1071,7 +1083,9 @@ class PositionManager extends EventEmitter {
       }
       if (forcedExitReason) {
         pos.pendingForcedExitReason = pos.pendingForcedExitReason || forcedExitReason;
-        pos.removeFromMonitoringAfterClose = true;
+        if (forcedExitReason === 'FDV_BELOW_20000' || forcedExitReason === 'AGE_15M') {
+          pos.removeFromMonitoringAfterClose = true;
+        }
       }
       forcedExitReason = pos.pendingForcedExitReason || forcedExitReason;
       if (forcedExitReason && (pos.reconciled || pos.dryRun)) {
@@ -1527,13 +1541,12 @@ class PositionManager extends EventEmitter {
     pos._lastTickPrice = price;
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
 
-    // Pump migration tokens have a fixed 1B-token supply. Derive FDV from the
-    // latest trusted effective-reserve price so the $20k forced exit runs on
-    // the sub-second position path instead of waiting for the 1-minute market
-    // metadata refresh.
+    // Keep the trusted live-FDV path behind an explicit positive threshold.
+    // The production threshold is currently zero, so FDV cannot force a sell.
     const solPriceUsd = config.priceFilter.swapSanitizer.solPriceUsd;
     const liveFdvUsd = price * 1_000_000_000 * solPriceUsd;
     if (
+      config.strategy.fdvExitThresholdUsd > 0 &&
       Number.isFinite(liveFdvUsd) &&
       liveFdvUsd >= 0 &&
       liveFdvUsd < config.strategy.fdvExitThresholdUsd
@@ -1872,41 +1885,12 @@ class PositionManager extends EventEmitter {
     }
 
     // ============ 2. 始终更新 HWM 和 trailing 状态 ============
-    //    v3.17.27: HWM 2-tick 确认机制
-    //    根因(PP420): 竞争对手大单买入推高池子 mid price → _pollPoolPrices
-    //    读到虚假高价 → 单 tick 就更新 HWM → trailing armed → 价格回落 → 亏损卖出。
-    //    修复：新 HWM 需要连续 2 个 tick 确认才能生效，单 tick spike 自动丢弃。
-    //    pendingHwm: 待确认的新高价格
-    //    pendingHwmTicks: 已连续 >= pendingHwm 的 tick 数
+    // Trusted effective-reserve prices update HWM immediately. The previous
+    // two-tick confirmation could never confirm a one-tick high in volatile
+    // pools, leaving HWM stuck at entry and preventing trailing from arming.
     if (price > pos.highWaterMark) {
-      // v3.17.28: HWM 2-tick 确认 — 保留最高 pending，不因次高价覆盖
-      //   旧 bug：price > HWM 但 < pendingHwm 时重置 pending 为更低值，
-      //   导致真实峰值（如 +10.71%）只出现 1 tick 就被次高价覆盖，
-      //   最终确认的 HWM 只有 +7.80%，差 0.2% 没到 trailing 激活线 → 死扛亏损。
-      //   修复：pendingHwm 只升不降。price >= pendingHwm 时刷新 pending + 累计 ticks；
-      //   price 在 HWM~pendingHwm 之间时只累计 tick（视为价格在高位区间延续），
-      //   不覆盖 pendingHwm，也不重置 ticks。
-      if (!pos._pendingHwm || price >= pos._pendingHwm) {
-        // 新的高点 → 刷新 pending + 累计 ticks
-        pos._pendingHwm = price;
-        pos._pendingHwmTicks = (pos._pendingHwmTicks || 0) + 1;
-      } else {
-        // price > HWM 但 < pendingHwm → 高位延续，只累计 tick 不覆盖 pending
-        pos._pendingHwmTicks = (pos._pendingHwmTicks || 0) + 1;
-      }
-      if (pos._pendingHwmTicks >= 2) {
-        // 连续 2 个 tick 确认 → 正式更新 HWM
-        pos.highWaterMark = pos._pendingHwm;
-        pos.highWaterMarkTs = Date.now();
-        pos._pendingHwm = null;
-        pos._pendingHwmTicks = 0;
-      }
-    } else {
-      // price <= HWM → 清除 pending（高点没延续）
-      if (pos._pendingHwm) {
-        pos._pendingHwm = null;
-        pos._pendingHwmTicks = 0;
-      }
+      pos.highWaterMark = price;
+      pos.highWaterMarkTs = Date.now();
     }
     // v3.17.27: 持久化 peak_price — 节流5秒，不管是否创新高都写
     //   之前只在 price > HWM 时写，导致没涨过的仓 peak_price 永远 null → 重启 HWM 丢失

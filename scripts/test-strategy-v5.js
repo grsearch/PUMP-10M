@@ -236,7 +236,11 @@ function runExitTests() {
   manager._tick();
   config.strategy.noBounceExitEnabled = noBounceDefault;
   assert.strictEqual(manager._exitCalls.length, 1);
-  assert.strictEqual(manager._exitCalls[0].reason, 'NO_BOUNCE_EXIT');
+  assert.strictEqual(
+    manager._exitCalls[0].reason,
+    'HOLD_TIMEOUT_30S',
+    'the 30-second hard hold limit must take priority over legacy no-bounce exits',
+  );
 
   const timeout = Object.create(PositionManager.prototype);
   timeout.positions = new Map([["position-2", {
@@ -245,7 +249,7 @@ function runExitTests() {
     symbol: 'TEST',
     entryPrice: 1,
     highWaterMark: 1.10,
-    openedAt: now - 301_000,
+    openedAt: now - 29_000,
     reconciled: true,
     dryRun: false,
     exiting: false,
@@ -257,7 +261,7 @@ function runExitTests() {
   timeout._exitCalls = [];
   timeout._exitForCondition = manager._exitForCondition;
   timeout._tick();
-  assert.strictEqual(timeout._exitCalls.length, 0, 'the retired max-hold exit must stay disabled');
+  assert.strictEqual(timeout._exitCalls.length, 0, 'a position younger than 30 seconds must remain open');
 }
 
 function runSlippageTests() {
@@ -284,7 +288,7 @@ function runSlippageTests() {
   assert.strictEqual(config.strategy.buyMaxPoolStateAgeMs, 500);
   assert.strictEqual(config.strategy.buyMaxEstimatedSlippagePct, 5);
   assert.strictEqual(config.strategy.noBounceExitMs, 90_000);
-  assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
+  assert.strictEqual(config.strategy.maxHoldMs, 30_000);
   assert.strictEqual(config.activityFlow.minPoolQuoteSol, undefined);
   assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_1S');
   assert.strictEqual(config.activityFlow.breadthMinUniqueBuyers1m, 100);

@@ -86,20 +86,47 @@ function runClosedCandleSignalTest() {
     signature: 'same-bucket-second-trade',
   });
   assert.strictEqual(signals.length, 1, 'a closed candle may signal only once');
+  const state = tracker.states.get(MINT);
+  assert.strictEqual(state.rsi1sInflight, true, 'emitting an RSI signal must lock the mint synchronously');
+
+  tracker.updateRsiSnapshot(MINT, {
+    ...state.rsi1sSnapshot,
+    rsi1sCurrentBucketTs: BASE + 10 * FRAME_MS,
+    rsi1sClosedBucketTs: BASE + 9 * FRAME_MS,
+    rsi1sPreviousClosed: 25,
+    rsi1sClosed: 35,
+  });
+  tracker.handleSwap(event(10, 76, 20, 'second-region'));
+  assert.strictEqual(
+    signals.length,
+    1,
+    'a second region callback must not emit another signal while the first buy is inflight',
+  );
+
+  assert.strictEqual(tracker.clearRsi1sInflight(MINT), true);
+  tracker.updateRsiSnapshot(MINT, {
+    ...state.rsi1sSnapshot,
+    rsi1sCurrentBucketTs: BASE + 11 * FRAME_MS,
+    rsi1sClosedBucketTs: BASE + 10 * FRAME_MS,
+    rsi1sPreviousClosed: 25,
+    rsi1sClosed: 35,
+  });
+  tracker.handleSwap(event(11, 77, 20, 'after-buy-complete'));
+  assert.strictEqual(signals.length, 2, 'clearing the buy lock must allow a later full RSI signal');
 
   const view = tracker.getStrategyCandidates(10, confirmation.ts);
   assert.strictEqual(view.mode, 'RSI_CROSS_1S');
   assert.strictEqual(view.candidates[0].stage, 'signaled');
   assert.strictEqual(view.thresholds.trailingActivatePct, 10);
   assert.strictEqual(view.thresholds.trailingDrawdownPct, 5);
-  assert.strictEqual(view.thresholds.fdvExitThresholdUsd, 20_000);
+  assert.strictEqual(view.thresholds.fdvExitThresholdUsd, 0);
   assert.strictEqual(view.thresholds.ageExitMs, 15 * 60_000);
+  assert.strictEqual(view.thresholds.maxHoldMs, 30_000);
   assert.strictEqual(view.thresholds.addonDropPct, 15);
   assert.strictEqual(view.thresholds.maxBuysPerMint, 2);
-  assert.strictEqual(view.thresholds.fixedStopLossPct, -10);
+  assert.strictEqual(view.thresholds.fixedStopLossPct, 0);
   assert.strictEqual(view.thresholds.exitOverbought, 80);
   assert.strictEqual(view.thresholds.exitCrossDown, 70);
-  assert.strictEqual(Object.hasOwn(view.thresholds, 'maxHoldMs'), false);
 }
 
 function runVolumeGateTests() {
@@ -137,12 +164,12 @@ function runDefaultsTest() {
   assert.strictEqual(config.strategy.positionSizeSol, 0.2);
   assert.strictEqual(config.strategy.trailingActivatePct, 10);
   assert.strictEqual(config.strategy.trailingDrawdownPct, 5);
-  assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
-  assert.strictEqual(config.strategy.fdvExitThresholdUsd, 20_000);
+  assert.strictEqual(config.strategy.maxHoldMs, 30_000);
+  assert.strictEqual(config.strategy.fdvExitThresholdUsd, 0);
   assert.strictEqual(config.strategy.ageExitMs, 15 * 60_000);
   assert.strictEqual(config.strategy.addonDropPct, 15);
   assert.strictEqual(config.strategy.maxBuysPerMint, 2);
-  assert.strictEqual(config.strategy.fixedStopLossPct, -10);
+  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
   assert.strictEqual(config.strategy.rsi1sExitEnabled, true);
   assert.strictEqual(config.strategy.rsi1sOverboughtExit, 80);
   assert.strictEqual(config.strategy.rsi1sCrossDownExit, 70);
@@ -155,13 +182,15 @@ function runDashboardContractTest() {
     assert(html.includes('1s RSI Strategy'));
     assert(html.includes('已收盘 1s K'));
     assert(html.includes('近 60s 真实成交量'));
-    assert(html.includes('FDV &lt;'));
+    assert(html.includes('FDV退出关闭'));
     assert(html.includes('AGE ≥'));
     assert(html.includes('固定止损'));
     assert(html.includes('最多 ${thresholds.maxBuysPerMint'));
+    assert(html.includes('无卖后冷却'));
+    assert(html.includes('全部平仓后新信号可立即重入'));
     assert(!html.includes('下一可成交 K 开盘'));
     assert(html.includes('移动止盈激活后屏蔽'));
-    assert(!html.includes('最长持仓'));
+    assert(html.includes('最长持仓'));
     assert(!html.includes('最大持仓'));
     assert(!html.includes('stat-hold'));
     const inlineScripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]

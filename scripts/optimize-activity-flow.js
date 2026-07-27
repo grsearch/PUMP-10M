@@ -45,7 +45,7 @@ const FALLBACK = {
     stopLossPct: -20,
     maxHoldMs: 0,
     stabilizationMs: 5_000,
-    trailingMinHwmAgeMs: 2_000,
+    trailingMinHwmAgeMs: 0,
   },
 };
 

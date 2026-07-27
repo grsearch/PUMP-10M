@@ -68,6 +68,14 @@ class OrderFlowTracker extends EventEmitter {
     this.rsi1sVolumeWindowMs = opts.rsi1sVolumeWindowMs ?? flowConfig.rsi1sVolumeWindowMs ?? 60_000;
     this.rsi1sMinVolume60sUsd =
       opts.rsi1sMinVolume60sUsd ?? flowConfig.rsi1sMinVolume60sUsd ?? 10_000;
+    // Source-level lock for an emitted RSI entry. SignalEngine performs
+    // asynchronous checks, so its own inflight set alone cannot stop two
+    // region callbacks from entering the pipeline at nearly the same time.
+    // The timeout is only a fail-safe for rejected/aborted signals.
+    this.rsi1sInflightTimeoutMs = Math.max(
+      5_000,
+      Number(opts.rsi1sInflightTimeoutMs ?? 30_000) || 30_000,
+    );
     this.minVolume1mUsd =
       opts.minVolume1mUsd ?? flowConfig.minVolume1mUsd ?? numEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
     this.minVolume1mSol =
@@ -322,6 +330,18 @@ class OrderFlowTracker extends EventEmitter {
   updateRsiSnapshot(mint, snapshot) {
     if (!this.enabled || this.entryMode !== 'RSI_CROSS_1S' || !mint || !snapshot) return;
     this._stateOf(mint).rsi1sSnapshot = snapshot;
+  }
+
+  clearRsi1sInflight(mint) {
+    if (!mint) return false;
+    const state = this.states.get(mint);
+    if (!state || !state.rsi1sInflight) return false;
+    state.rsi1sInflight = false;
+    state.rsi1sInflightAt = null;
+    if (state.rsi1sStage === 'signaled') {
+      state.rsi1sStage = 'monitoring';
+    }
+    return true;
   }
 
   handleSwap(swap) {
@@ -645,6 +665,7 @@ class OrderFlowTracker extends EventEmitter {
         trailingDrawdownPct: config.strategy.trailingDrawdownPct,
         fdvExitThresholdUsd: config.strategy.fdvExitThresholdUsd,
         ageExitMs: config.strategy.ageExitMs,
+        maxHoldMs: config.strategy.maxHoldMs,
         addonDropPct: config.strategy.addonDropPct,
         maxBuysPerMint: config.strategy.maxBuysPerMint,
         fixedStopLossPct: config.strategy.fixedStopLossPct,
@@ -687,6 +708,8 @@ class OrderFlowTracker extends EventEmitter {
         rsi1sSignalCandleTs: null,
         rsi1sSignalTs: null,
         rsi1sWaitReason: null,
+        rsi1sInflight: false,
+        rsi1sInflightAt: null,
       };
       this.states.set(mint, state);
     }
@@ -859,6 +882,21 @@ class OrderFlowTracker extends EventEmitter {
   }
 
   _tryRsiCross1s(state, ev) {
+    if (state.rsi1sInflight) {
+      const lockAgeMs = Date.now() - (state.rsi1sInflightAt || Date.now());
+      if (lockAgeMs < this.rsi1sInflightTimeoutMs) {
+        return;
+      }
+      // Do not permanently disable a mint if the downstream signal was
+      // rejected or an unexpected exception skipped the normal release.
+      state.rsi1sInflight = false;
+      state.rsi1sInflightAt = null;
+      console.warn(
+        `[ActivityFlow] stale RSI inflight lock cleared for ${state.symbol || ev.mint.slice(0, 6)} ` +
+          `after ${lockAgeMs}ms`,
+      );
+    }
+
     const snapshot = state.rsi1sSnapshot;
     if (!snapshot) return;
 
@@ -964,6 +1002,10 @@ class OrderFlowTracker extends EventEmitter {
     state.rsi1sSignalTs = ev.ts;
     state.rsi1sStage = 'signaled';
     state.rsi1sWaitReason = null;
+    // Set synchronously before emit. EventEmitter listeners may start async
+    // work immediately, but the next region callback cannot pass this guard.
+    state.rsi1sInflight = true;
+    state.rsi1sInflightAt = Date.now();
     this.cooldowns.set(ev.mint, Date.now() + this.cooldownMs);
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_1S ` +

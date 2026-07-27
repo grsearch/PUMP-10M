@@ -384,6 +384,7 @@ class Server {
           trailingDrawdownPct: config.strategy.trailingDrawdownPct,
           fdvExitThresholdUsd: config.strategy.fdvExitThresholdUsd,
           ageExitMs: config.strategy.ageExitMs,
+          maxHoldMs: config.strategy.maxHoldMs,
           addonDropPct: config.strategy.addonDropPct,
           maxBuysPerMint: config.strategy.maxBuysPerMint,
           fixedStopLossPct: config.strategy.fixedStopLossPct,

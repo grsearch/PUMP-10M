@@ -54,8 +54,7 @@ async function main() {
   }
   if (process.env.FIXED_STOP_LOSS_PCT != null) {
     console.warn(
-      `FIXED_STOP_LOSS_PCT is ignored; the production fixed stop is locked at ` +
-        `${config.strategy.fixedStopLossPct}%.`,
+      'FIXED_STOP_LOSS_PCT is ignored; the production fixed stop is disabled.',
     );
   }
   console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
@@ -65,8 +64,8 @@ async function main() {
       `cross below ${config.strategy.rsi1sCrossDownExit}; disabled after trailing arms`,
   );
   console.log(
-    `Forced exits: FDV < $${config.strategy.fdvExitThresholdUsd} / ` +
-      `migration AGE >= ${config.strategy.ageExitMs / 60_000}min`,
+    `Forced exits: max hold ${config.strategy.maxHoldMs / 1000}s / ` +
+      `migration AGE >= ${config.strategy.ageExitMs / 60_000}min / FDV disabled`,
   );
   console.log(
     `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
@@ -96,7 +95,7 @@ async function main() {
   );
   console.log(
     `Add-on: one qualifying add-on at -${config.strategy.addonDropPct}% from initial entry; ` +
-      `max ${config.strategy.maxBuysPerMint} independent legs per mint`,
+      `max ${config.strategy.maxBuysPerMint} concurrent legs per mint; immediate re-entry after full close`,
   );
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
   console.log(`Pump graduation discovery: ${config.pumpDiscovery.enabled ? 'enabled' : 'disabled'}`);
@@ -339,9 +338,17 @@ async function main() {
   // v3.17.41: PositionManager blacklist needs signalEngine reference
   positionManager.signalEngine = signalEngine;
   activityFlowTracker.on('flowReversalSignal', (signal) => {
-    Promise.resolve(signalEngine.handleDumpSignal(signal)).catch((err) => {
-      console.error(`[ActivityFlow] SignalEngine error: ${err.message}`);
-    });
+    Promise.resolve(signalEngine.handleDumpSignal(signal))
+      .then((accepted) => {
+        // Rejected signals never reach the buyOrder listener, so release the
+        // source-level lock here. Accepted signals stay locked until the
+        // complete buy/register flow finishes.
+        if (accepted !== true) activityFlowTracker.clearRsi1sInflight(signal.mint);
+      })
+      .catch((err) => {
+        activityFlowTracker.clearRsi1sInflight(signal.mint);
+        console.error(`[ActivityFlow] SignalEngine error: ${err.message}`);
+      });
   });
   // ============ 服务器 ============
   const server = new Server({
@@ -821,6 +828,7 @@ async function main() {
 
   // ============ buyOrder → BUY → register position ============
   signalEngine.on('buyOrder', async (order) => {
+    try {
     console.log(`[main] buyOrder received: ${order.symbol || order.mint.slice(0,6)} mint=${order.mint.slice(0,8)}.. reason=${order.reason} sig=${order.signature?.slice(0,12)}..`);
     const _t0 = Date.now();
     const tokenInfo = tokenRegistry.getToken(order.mint);
@@ -850,20 +858,15 @@ async function main() {
     }
 
     const _t2 = Date.now();
-    let buyResult;
-    try {
-      buyResult = await executor.buy({
-        mint: order.mint,
-        symbol: order.symbol,
-        sizeSol: order.sizeSol,
-        priceAfter: order.priceAfter, // 用于 DRY_RUN 模拟
-        signalPrice: order.priceAfter,
-        baseDecimals: order.baseDecimals ?? tokenInfo?.decimals ?? 6,
-        poolAddress: tokenInfo?.pool_address, // Pump SDK 需要 pool address
-      });
-    } finally {
-      signalEngine.markBuyDone(order.mint);
-    }
+    const buyResult = await executor.buy({
+      mint: order.mint,
+      symbol: order.symbol,
+      sizeSol: order.sizeSol,
+      priceAfter: order.priceAfter, // 用于 DRY_RUN 模拟
+      signalPrice: order.priceAfter,
+      baseDecimals: order.baseDecimals ?? tokenInfo?.decimals ?? 6,
+      poolAddress: tokenInfo?.pool_address, // Pump SDK 需要 pool address
+    });
     if (order._signalReceivedAt && buyResult && buyResult.success) {
       console.log('[main] buyOrder_timing: getToken=%dms preBuy=%dms buy=%dms', _t1-_t0, _t2-_t1, Date.now()-_t2);
     }
@@ -1000,18 +1003,18 @@ async function main() {
     priceTracker.forceSet(order.mint, buyResult.price);
 
     if (buyResult.signature) signalEngine.registerOurSignature(buyResult.signature);
+    } finally {
+      signalEngine.markBuyDone(order.mint);
+      activityFlowTracker.clearRsi1sInflight(order.mint);
+    }
   });
 
   positionManager.on('opened', (pos) =>
     server.broadcast({ type: 'positionOpened', position: pos }),
   );
   positionManager.on('closed', (pos) => {
-    // Start cooldown from confirmed close. Sequential add-on exits extend the
-    // same mint cooldown from the latest completed sale.
-    signalEngine.lastTriggerTs.set(pos.mint, Date.now());
-    if (config.strategy.rebuyCooldownMs > 0) {
-      signalEngine._exitCooldowns.set(pos.mint, Date.now() + config.strategy.rebuyCooldownMs);
-    }
+    // A confirmed sell never starts a strategy cooldown. A later fresh signal
+    // may re-enter immediately; execution-failure protection remains separate.
     if (
       pos.removeFromMonitoringAfterClose &&
       !positionManager.hasOpenPosition(pos.mint)
