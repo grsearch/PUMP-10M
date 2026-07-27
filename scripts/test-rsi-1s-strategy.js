@@ -52,9 +52,15 @@ function event(index, price, solVolume = 20, suffix = '') {
   };
 }
 
-function feed(calc, tracker, ev) {
+function feed(calc, tracker, ev, snapshotOverrides = {}) {
   calc.feedTrade(ev.mint, ev.price, ev.solVolume, ev.side.toLowerCase(), ev.ts, ev.poolQuoteAfter);
-  tracker.updateRsiSnapshot(ev.mint, calc.snapshot(ev.mint));
+  tracker.updateRsiSnapshot(ev.mint, {
+    ...calc.snapshot(ev.mint),
+    ema15sFastClosed: 101,
+    ema15sSlowClosed: 100,
+    rsi15sClosedBars: 20,
+    ...snapshotOverrides,
+  });
   tracker.handleSwap(ev);
 }
 
@@ -76,6 +82,9 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(entry.signalCandleTs, BASE + 8 * FRAME_MS);
   assert.strictEqual(entry.signalCloseTs, BASE + 9 * FRAME_MS);
   assert.strictEqual(entry.executionPrice, CLOSES[9]);
+  assert.strictEqual(entry.emaFastPeriod, 9);
+  assert.strictEqual(entry.emaSlowPeriod, 20);
+  assert(entry.ema15sFast > entry.ema15sSlow);
   assert.strictEqual(Object.hasOwn(entry, 'entryCandleTs'), false);
   assert.strictEqual(Object.hasOwn(entry, 'entryOpenPrice'), false);
   assert(entry.volume60sUsd >= 10_000);
@@ -127,6 +136,41 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(view.thresholds.fixedStopLossPct, 0);
   assert.strictEqual(view.thresholds.exitOverbought, 80);
   assert.strictEqual(view.thresholds.exitCrossDown, 70);
+  assert.strictEqual(view.thresholds.emaTimeframeSeconds, 15);
+  assert.strictEqual(view.thresholds.emaFastPeriod, 9);
+  assert.strictEqual(view.thresholds.emaSlowPeriod, 20);
+  assert.strictEqual(view.candidates[0].ema15sFast, 101);
+  assert.strictEqual(view.candidates[0].ema15sSlow, 100);
+}
+
+function runEmaGateTests() {
+  const bearishCalc = new RsiCalculator({ period1: 7 });
+  const bearish = makeTracker();
+  const bearishSignals = [];
+  bearish.on('flowReversalSignal', (signal) => bearishSignals.push(signal));
+  CLOSES.forEach((price, index) => feed(
+    bearishCalc,
+    bearish,
+    event(index, price, 20, 'ema-bearish'),
+    { ema15sFastClosed: 99, ema15sSlowClosed: 100 },
+  ));
+  assert.strictEqual(bearishSignals.length, 0);
+  assert.strictEqual(bearish.states.get(MINT).rsi1sStage, 'ema-blocked');
+  assert.match(bearish.states.get(MINT).rsi1sWaitReason, /EMA9 .*<= EMA20/);
+
+  const warmingCalc = new RsiCalculator({ period1: 7 });
+  const warming = makeTracker();
+  const warmingSignals = [];
+  warming.on('flowReversalSignal', (signal) => warmingSignals.push(signal));
+  CLOSES.forEach((price, index) => feed(
+    warmingCalc,
+    warming,
+    event(index, price, 20, 'ema-warming'),
+    { ema15sFastClosed: null, ema15sSlowClosed: null, rsi15sClosedBars: 19 },
+  ));
+  assert.strictEqual(warmingSignals.length, 0);
+  assert.strictEqual(warming.states.get(MINT).rsi1sStage, 'warming');
+  assert.match(warming.states.get(MINT).rsi1sWaitReason, /need 20 closed 15s candles/);
 }
 
 function runVolumeGateTests() {
@@ -161,6 +205,8 @@ function runDefaultsTest() {
   assert.strictEqual(config.activityFlow.rsi1sPeriod, 7);
   assert.strictEqual(config.activityFlow.rsi1sEntryThreshold, 30);
   assert.strictEqual(config.activityFlow.rsi1sMinVolume60sUsd, 10_000);
+  assert.strictEqual(config.activityFlow.ema15sFastPeriod, 9);
+  assert.strictEqual(config.activityFlow.ema15sSlowPeriod, 20);
   assert.strictEqual(config.strategy.positionSizeSol, 0.2);
   assert.strictEqual(config.strategy.trailingActivatePct, 10);
   assert.strictEqual(config.strategy.trailingDrawdownPct, 5);
@@ -181,6 +227,9 @@ function runDashboardContractTest() {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'public', filename), 'utf8');
     assert(html.includes('1s RSI Strategy'));
     assert(html.includes('已收盘 1s K'));
+    assert(html.includes('15s EMA9'));
+    assert(html.includes('15s EMA20'));
+    assert(html.includes('已收盘 15s EMA'));
     assert(html.includes('近 60s 真实成交量'));
     assert(html.includes('FDV退出关闭'));
     assert(html.includes('AGE ≥'));
@@ -201,6 +250,7 @@ function runDashboardContractTest() {
 }
 
 runClosedCandleSignalTest();
+runEmaGateTests();
 runVolumeGateTests();
 runDefaultsTest();
 runDashboardContractTest();

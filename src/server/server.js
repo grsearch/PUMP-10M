@@ -378,6 +378,8 @@ class Server {
           rsi1sEntryThreshold: config.activityFlow.rsi1sEntryThreshold,
           rsi1sVolumeWindowMs: config.activityFlow.rsi1sVolumeWindowMs,
           rsi1sMinVolume60sUsd: config.activityFlow.rsi1sMinVolume60sUsd,
+          ema15sFastPeriod: config.activityFlow.ema15sFastPeriod,
+          ema15sSlowPeriod: config.activityFlow.ema15sSlowPeriod,
           positionSizeSol: config.strategy.positionSizeSol,
           takeProfitPct: config.strategy.takeProfitPct,
           trailingActivatePct: config.strategy.trailingActivatePct,

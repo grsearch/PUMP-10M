@@ -69,7 +69,8 @@ async function main() {
   );
   console.log(
     `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
-      `${config.activityFlow.rsi1sEntryThreshold}, trailing ` +
+      `${config.activityFlow.rsi1sEntryThreshold}, closed 15s ` +
+      `EMA${config.activityFlow.ema15sFastPeriod}>EMA${config.activityFlow.ema15sSlowPeriod}, trailing ` +
       `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s real volume>=` +
       `$${config.activityFlow.rsi1sMinVolume60sUsd}, execute immediately after confirmation`,
   );
@@ -171,11 +172,16 @@ async function main() {
     period1: config.activityFlow.rsi1sPeriod,
     period5: 7,
     period15: 7,
+    ema15sFastPeriod: config.activityFlow.ema15sFastPeriod,
+    ema15sSlowPeriod: config.activityFlow.ema15sSlowPeriod,
     period60: config.activityFlow.rsi1mPeriod,
     priceScaleResetRatio: config.activityFlow.rsiPriceScaleResetRatio,
   });
   if (rsiCalculator) {
-    console.log('[main] RSI calculator enabled for closed 1s entry/exit and price-history helpers');
+    console.log(
+      `[main] RSI calculator enabled for closed 1s entry/exit and closed 15s ` +
+        `EMA(${config.activityFlow.ema15sFastPeriod},${config.activityFlow.ema15sSlowPeriod}) entry filter`,
+    );
     setInterval(() => rsiCalculator.cleanup(), 60_000);
 
     // Rebuild RSI from captured swaps. The lookback is a maximum, not a token-age

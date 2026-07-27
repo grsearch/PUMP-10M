@@ -68,6 +68,8 @@ class OrderFlowTracker extends EventEmitter {
     this.rsi1sVolumeWindowMs = opts.rsi1sVolumeWindowMs ?? flowConfig.rsi1sVolumeWindowMs ?? 60_000;
     this.rsi1sMinVolume60sUsd =
       opts.rsi1sMinVolume60sUsd ?? flowConfig.rsi1sMinVolume60sUsd ?? 10_000;
+    this.ema15sFastPeriod = opts.ema15sFastPeriod ?? flowConfig.ema15sFastPeriod ?? 9;
+    this.ema15sSlowPeriod = opts.ema15sSlowPeriod ?? flowConfig.ema15sSlowPeriod ?? 20;
     // Source-level lock for an emitted RSI entry. SignalEngine performs
     // asynchronous checks, so its own inflight set alone cannot stop two
     // region callbacks from entering the pipeline at nearly the same time.
@@ -602,7 +604,14 @@ class OrderFlowTracker extends EventEmitter {
   _getRsi1sCandidates(limit = 100, now = Date.now()) {
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
     const candidates = [];
-    const summary = { active: 0, warming: 0, monitoring: 0, volumeBlocked: 0, signaled: 0 };
+    const summary = {
+      active: 0,
+      warming: 0,
+      monitoring: 0,
+      volumeBlocked: 0,
+      emaBlocked: 0,
+      signaled: 0,
+    };
 
     for (const [mint, state] of this.states) {
       const snapshot = state.rsi1sSnapshot || {};
@@ -626,6 +635,7 @@ class OrderFlowTracker extends EventEmitter {
       }
       summary.active++;
       if (stage === 'volume-blocked') summary.volumeBlocked++;
+      else if (stage === 'ema-blocked') summary.emaBlocked++;
       else if (Object.prototype.hasOwnProperty.call(summary, stage)) summary[stage]++;
 
       candidates.push({
@@ -638,13 +648,16 @@ class OrderFlowTracker extends EventEmitter {
         rsiCurrent: state.rsi1sClosed ?? snapshot.rsi1sClosed ?? null,
         rsiLive: snapshot.rsi1sLive ?? null,
         closedBars: snapshot.rsi1sClosedBars || 0,
+        ema15sFast: snapshot.ema15sFastClosed ?? null,
+        ema15sSlow: snapshot.ema15sSlowClosed ?? null,
+        ema15sClosedBars: snapshot.rsi15sClosedBars || 0,
         volume60sUsd: round(liveVolume60sUsd, 2),
         signalCandleTs: state.rsi1sSignalCandleTs || null,
         waitReason: state.rsi1sWaitReason || null,
       });
     }
 
-    const rank = { signaled: 4, 'volume-blocked': 3, monitoring: 2, warming: 1 };
+    const rank = { signaled: 5, 'volume-blocked': 4, 'ema-blocked': 3, monitoring: 2, warming: 1 };
     candidates.sort((a, b) =>
       ((rank[b.stage] || 0) - (rank[a.stage] || 0)) ||
       (b.volume60sUsd - a.volume60sUsd) ||
@@ -659,6 +672,9 @@ class OrderFlowTracker extends EventEmitter {
         entryCross: this.rsi1sEntryThreshold,
         volumeWindowMs: this.rsi1sVolumeWindowMs,
         minVolume60sUsd: this.rsi1sMinVolume60sUsd,
+        emaTimeframeSeconds: 15,
+        emaFastPeriod: this.ema15sFastPeriod,
+        emaSlowPeriod: this.ema15sSlowPeriod,
         exitOverbought: config.strategy.rsi1sOverboughtExit,
         exitCrossDown: config.strategy.rsi1sCrossDownExit,
         trailingActivatePct: config.strategy.trailingActivatePct,
@@ -941,6 +957,27 @@ class OrderFlowTracker extends EventEmitter {
     }
     if (state.rsi1sLastSignalCandleTs === signalBucketTs) return;
 
+    const ema15sFast = snapshot.ema15sFastClosed == null
+      ? NaN
+      : Number(snapshot.ema15sFastClosed);
+    const ema15sSlow = snapshot.ema15sSlowClosed == null
+      ? NaN
+      : Number(snapshot.ema15sSlowClosed);
+    if (!Number.isFinite(ema15sFast) || !Number.isFinite(ema15sSlow)) {
+      state.rsi1sStage = 'warming';
+      state.rsi1sWaitReason =
+        `need ${this.ema15sSlowPeriod} closed 15s candles for EMA` +
+        `(${this.ema15sFastPeriod},${this.ema15sSlowPeriod})`;
+      return;
+    }
+    if (ema15sFast <= ema15sSlow) {
+      state.rsi1sStage = 'ema-blocked';
+      state.rsi1sWaitReason =
+        `15s EMA${this.ema15sFastPeriod} ${ema15sFast.toExponential(4)} ` +
+        `<= EMA${this.ema15sSlowPeriod} ${ema15sSlow.toExponential(4)}`;
+      return;
+    }
+
     const signalCloseTs = signalBucketTs + 1_000;
     const volumeStart = signalCloseTs - this.rsi1sVolumeWindowMs;
     const volume60sSol = [...state.rsiVolumeBuckets].reduce((total, [bucketTs, bucketVolume]) => {
@@ -967,6 +1004,11 @@ class OrderFlowTracker extends EventEmitter {
       threshold: this.rsi1sEntryThreshold,
       volume60sSol: round(volume60sSol, 4),
       volume60sUsd: round(volume60sUsd, 2),
+      emaTimeframeSeconds: 15,
+      emaFastPeriod: this.ema15sFastPeriod,
+      emaSlowPeriod: this.ema15sSlowPeriod,
+      ema15sFast: ema15sFast,
+      ema15sSlow: ema15sSlow,
       signalCandleTs: signalBucketTs,
       signalCloseTs,
       executionPrice: ev.price,
@@ -1010,6 +1052,8 @@ class OrderFlowTracker extends EventEmitter {
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_1S ` +
         `RSI(${this.rsi1sPeriod})=${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} ` +
+        `EMA15s=${this.ema15sFastPeriod}:${ema15sFast.toExponential(4)}>` +
+        `${this.ema15sSlowPeriod}:${ema15sSlow.toExponential(4)} ` +
         `vol60=$${volume60sUsd.toFixed(0)} execution=${ev.price}`,
     );
     this.emit('flowReversalSignal', signal);

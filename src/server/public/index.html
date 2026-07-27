@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0">
 <meta charset="UTF-8">
-<title>Dump Sniper · 1s RSI</title>
+<title>Dump Sniper · 1s RSI + 15s EMA</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
@@ -173,6 +173,7 @@
   .pill.fail { background: rgba(239, 83, 80, 0.2); color: var(--red); }
   .pill.monitoring, .pill.warming { background: rgba(139, 148, 170, 0.14); color: var(--text-dim); }
   .pill.volume-blocked { background: rgba(239, 83, 80, 0.14); color: #ff8a87; }
+  .pill.ema-blocked { background: rgba(255, 167, 38, 0.16); color: #ffbd59; }
   .pill.ready, .pill.armed, .pill.waiting { background: rgba(245, 176, 65, 0.2); color: var(--yellow); }
   .pill.confirming { background: rgba(41, 182, 246, 0.2); color: var(--accent); }
   .pill.signaled { background: rgba(38, 166, 154, 0.24); color: var(--green); }
@@ -271,7 +272,7 @@
 <body>
 
 <div class="header">
-  <h1>🎯 Dump Sniper <span class="v">1s RSI Strategy</span></h1>
+  <h1>🎯 Dump Sniper <span class="v">1s RSI Strategy + 15s EMA</span></h1>
   <div class="badges">
     <a href="/reports.html" style="color:var(--accent);text-decoration:none;font-size:12px;font-weight:500;margin-right:8px;">📅 报告</a>
     <span id="modeBadge" class="badge dry">DRY_RUN</span>
@@ -389,8 +390,8 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一收盘 RSI(7)</th><th>当前收盘 RSI(7)</th><th>实时 RSI(7)</th><th>已收盘 1s K</th><th>近 60s 真实成交量</th><th>信号 K 收盘</th><th>状态说明</th><th>阶段</th></tr></thead>
-            <tbody id="signalsTbody"><tr><td colspan="11" class="empty">暂无活跃成交</td></tr></tbody>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一收盘 RSI(7)</th><th>当前收盘 RSI(7)</th><th>实时 RSI(7)</th><th>已收盘 1s K</th><th>15s EMA9</th><th>15s EMA20</th><th>近 60s 真实成交量</th><th>信号 K 收盘</th><th>状态说明</th><th>阶段</th></tr></thead>
+            <tbody id="signalsTbody"><tr><td colspan="13" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -488,7 +489,7 @@ async function refreshStatus() {
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
   $('stat-volume1m').textContent = `>= ${fmtMoney(r.config.rsi1sMinVolume60sUsd)}`;
-  $('stat-trades1m').textContent = `1s RSI(${r.config.rsi1sPeriod}) ↑ ${r.config.rsi1sEntryThreshold}`;
+  $('stat-trades1m').textContent = `1s RSI(${r.config.rsi1sPeriod}) ↑ ${r.config.rsi1sEntryThreshold} + 15s EMA${r.config.ema15sFastPeriod}>EMA${r.config.ema15sSlowPeriod}`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-trailing').textContent = `+${r.config.trailingActivatePct}% / ${r.config.trailingDrawdownPct}%`;
   $('stat-forced').textContent = `最长 ${Math.round((r.config.maxHoldMs ?? 30000) / 1000)}s / AGE ${Math.round(r.config.ageExitMs / 60000)}m`;
@@ -719,6 +720,7 @@ function _strategyStage(candidate, now) {
     monitoring: '扫描',
     warming: 'RSI预热',
     'volume-blocked': '成交量不足',
+    'ema-blocked': 'EMA趋势不符',
     collecting: '累计10m',
     cancelled: '已取消',
     ready: '待激活',
@@ -744,7 +746,7 @@ async function refreshSignals() {
   const tbody = $('signalsTbody');
   if (!r.ok) {
     meta.innerHTML = `<span class="neg">${escapeHtml(r.error || '1s RSI 实时数据不可用')}</span>`;
-    tbody.innerHTML = '<tr><td colspan="11" class="empty">等待 1s RSI 数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">等待 1s RSI / 15s EMA 数据</td></tr>';
     return;
   }
 
@@ -755,6 +757,7 @@ async function refreshSignals() {
   const trailingDrawdown = thresholds.trailingDrawdownPct ?? 5;
   meta.innerHTML = [
     `<span>买入 <b>已收盘 1s RSI(${thresholds.rsiPeriod || 7}) 从 ≤${thresholds.entryCross ?? 30} 上穿</b></span>`,
+    `<span>趋势 <b>已收盘 15s EMA${thresholds.emaFastPeriod ?? 9} &gt; EMA${thresholds.emaSlowPeriod ?? 20}</b></span>`,
     `<span>近60s真实成交量 <b>≥ ${fmtMoney(thresholds.minVolume60sUsd ?? 10000)}</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
     `<span>RSI卖出 <b>&gt;${thresholds.exitOverbought ?? 80} 或下穿 ${thresholds.exitCrossDown ?? 70}；移动止盈激活后屏蔽</b></span>`,
@@ -764,15 +767,16 @@ async function refreshSignals() {
     `<span>活跃 <b>${summary.active || 0}</b></span>`,
     `<span>预热 <b>${summary.warming || 0}</b></span>`,
     `<span>量不足 <b>${summary.volumeBlocked || 0}</b></span>`,
+    `<span>趋势不符 <b>${summary.emaBlocked || 0}</b></span>`,
     `<span>实盘信号 <b>${summary.signaled || 0}</b></span>`,
   ].join('');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="11" class="empty">暂无活跃成交</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">暂无活跃成交</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(candidate => {
     const detail = candidate.waitReason ||
-      (candidate.stage === 'signaled' ? '信号确认后已立即触发' : '等待 RSI 上穿与成交量确认');
+      (candidate.stage === 'signaled' ? '信号确认后已立即触发' : '等待 RSI 上穿、EMA 趋势与成交量确认');
     return `
       <tr>
         <td class="mono">${fmtTime(candidate.updatedAt)}</td>
@@ -782,6 +786,8 @@ async function refreshSignals() {
         <td>${_strategyNumber(candidate.rsiCurrent)}</td>
         <td>${_strategyNumber(candidate.rsiLive)}</td>
         <td>${candidate.closedBars || 0}</td>
+        <td>${_strategyNumber(candidate.ema15sFast)}</td>
+        <td>${_strategyNumber(candidate.ema15sSlow)}</td>
         <td>${fmtMoney(candidate.volume60sUsd)} / ${fmtMoney(thresholds.minVolume60sUsd ?? 10000)}</td>
         <td class="mono">${candidate.signalCandleTs ? fmtTime(candidate.signalCandleTs) : '-'}</td>
         <td style="max-width:260px">${escapeHtml(detail)}</td>

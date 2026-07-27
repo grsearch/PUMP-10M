@@ -241,6 +241,8 @@ const config = {
     rsi1sEntryThreshold: 30,
     rsi1sVolumeWindowMs: 60_000,
     rsi1sMinVolume60sUsd: 10_000,
+    ema15sFastPeriod: 9,
+    ema15sSlowPeriod: 20,
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -604,6 +606,12 @@ function validateConfig() {
   }
   if (config.activityFlow.rsi1sMinVolume60sUsd <= 0) {
     errors.push('RSI_1S_MIN_VOLUME_60S_USD must be > 0');
+  }
+  if (
+    config.activityFlow.ema15sFastPeriod < 1 ||
+    config.activityFlow.ema15sSlowPeriod <= config.activityFlow.ema15sFastPeriod
+  ) {
+    errors.push('15s EMA periods must satisfy 0 < fast < slow');
   }
   if (
     config.strategy.rsi1sCrossDownExit <= 0 ||

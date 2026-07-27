@@ -29,6 +29,16 @@ function referenceRsi(closes, period) {
   return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
+function referenceEma(closes, period) {
+  if (closes.length < period) return null;
+  let ema = closes.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  const multiplier = 2 / (period + 1);
+  for (let index = period; index < closes.length; index += 1) {
+    ema = (closes[index] - ema) * multiplier + ema;
+  }
+  return ema;
+}
+
 function run() {
   const rsi1 = new RsiCalculator({ period1: 7 });
   const frame1 = 1_000;
@@ -91,6 +101,25 @@ function run() {
   assert.strictEqual(snapshot15.rsi15sClosedBars, 9);
   assert.strictEqual(snapshot15.rsi15sClosedBucketTs, 8 * frame15);
   assert.strictEqual(snapshot15.rsi15sCurrentBucketTs, 9 * frame15);
+
+  const ema15 = new RsiCalculator({ ema15sFastPeriod: 9, ema15sSlowPeriod: 20 });
+  const emaCloses15 = Array.from({ length: 21 }, (_, index) => 100 + index);
+  emaCloses15.slice(0, 20).forEach((price, index) => {
+    ema15.feedTrade('ema-15s', price, 1, 'buy', index * frame15 + 1_000, 50);
+  });
+  assert.strictEqual(
+    ema15.snapshot('ema-15s').ema15sSlowClosed,
+    null,
+    'EMA20 must wait for 20 fully closed 15-second candles',
+  );
+  ema15.feedTrade('ema-15s', emaCloses15[20], 1, 'buy', 20 * frame15 + 1_000, 50);
+  const emaSnapshot15 = ema15.snapshot('ema-15s');
+  const fullyClosedEmaPrices = emaCloses15.slice(0, -1);
+  approx(emaSnapshot15.ema15sFastClosed, referenceEma(fullyClosedEmaPrices, 9));
+  approx(emaSnapshot15.ema15sSlowClosed, referenceEma(fullyClosedEmaPrices, 20));
+  assert(emaSnapshot15.ema15sFastClosed > emaSnapshot15.ema15sSlowClosed);
+  assert.strictEqual(emaSnapshot15.ema15sFastPeriod, 9);
+  assert.strictEqual(emaSnapshot15.ema15sSlowPeriod, 20);
 
   const calculator = new RsiCalculator({ period60: 7 });
   const mint = 'rsi-test-mint';

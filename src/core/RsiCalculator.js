@@ -53,6 +53,8 @@ class RsiCalculator {
     period1 = 14,
     period5 = 7,
     period15 = 7,
+    ema15sFastPeriod = 9,
+    ema15sSlowPeriod = 20,
     period30 = 7,
     period60 = 7,
     bucketMs1 = 1000,
@@ -66,6 +68,11 @@ class RsiCalculator {
     this.period1 = period1;
     this.period5 = period5;
     this.period15 = Math.max(1, period15);
+    this.ema15sFastPeriod = Math.max(1, Math.trunc(ema15sFastPeriod));
+    this.ema15sSlowPeriod = Math.max(
+      this.ema15sFastPeriod + 1,
+      Math.trunc(ema15sSlowPeriod),
+    );
     this.period30 = period30;
     this.period60 = Math.max(1, period60);
     // 向后兼容:旧代码用 this.period
@@ -165,6 +172,12 @@ class RsiCalculator {
         rsi15sAvgLoss: null,
         rsi15sClosed: null,
         rsi15sPreviousClosed: null,
+        ema15sFastSeedCount: 0,
+        ema15sFastSeedSum: 0,
+        ema15sFastClosed: null,
+        ema15sSlowSeedCount: 0,
+        ema15sSlowSeedSum: 0,
+        ema15sSlowClosed: null,
         rsi1mCurrentIdx: null,
         rsi1mCurrentClose: null,
         rsi1mFinalClose: null,
@@ -273,6 +286,7 @@ class RsiCalculator {
   }
 
   _commitRsi15sClose(s, close, bucketIdx) {
+    this._commitEma15sClose(s, close);
     if (s.rsi15sFinalClose == null) {
       s.rsi15sFinalClose = close;
       s.rsi15sFinalIdx = bucketIdx;
@@ -307,6 +321,30 @@ class RsiCalculator {
       s.rsi15sPreviousClosed = s.rsi15sClosed;
       s.rsi15sClosed = this._rsiFromAverages(s.rsi15sAvgGain, s.rsi15sAvgLoss);
     }
+  }
+
+  _commitEma15sValue(s, close, prefix, period) {
+    const countKey = `${prefix}SeedCount`;
+    const sumKey = `${prefix}SeedSum`;
+    const valueKey = `${prefix}Closed`;
+    const count = Number(s[countKey]) || 0;
+
+    if (count < period) {
+      s[sumKey] = (Number(s[sumKey]) || 0) + close;
+      s[countKey] = count + 1;
+      if (s[countKey] === period) {
+        s[valueKey] = s[sumKey] / period;
+      }
+      return;
+    }
+
+    const multiplier = 2 / (period + 1);
+    s[valueKey] = (close - s[valueKey]) * multiplier + s[valueKey];
+  }
+
+  _commitEma15sClose(s, close) {
+    this._commitEma15sValue(s, close, 'ema15sFast', this.ema15sFastPeriod);
+    this._commitEma15sValue(s, close, 'ema15sSlow', this.ema15sSlowPeriod);
   }
 
   _updateRsi15sState(s, price, ts) {
@@ -561,6 +599,10 @@ class RsiCalculator {
       rsi15sLive,
       rsi15sClosed: s.rsi15sClosed,
       rsi15sPreviousClosed: s.rsi15sPreviousClosed,
+      ema15sFastPeriod: this.ema15sFastPeriod,
+      ema15sSlowPeriod: this.ema15sSlowPeriod,
+      ema15sFastClosed: s.ema15sFastClosed,
+      ema15sSlowClosed: s.ema15sSlowClosed,
       rsi30s,
       // rsi1m remains an alias for the live value for backward compatibility.
       rsi1m: rsi1mLive,
