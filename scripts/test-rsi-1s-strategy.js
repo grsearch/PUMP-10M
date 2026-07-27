@@ -84,6 +84,7 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(entry.executionPrice, CLOSES[9]);
   assert.strictEqual(entry.emaFastPeriod, 9);
   assert.strictEqual(entry.emaSlowPeriod, 20);
+  assert.strictEqual(entry.emaReady, true);
   assert(entry.ema15sFast > entry.ema15sSlow);
   assert.strictEqual(Object.hasOwn(entry, 'entryCandleTs'), false);
   assert.strictEqual(Object.hasOwn(entry, 'entryOpenPrice'), false);
@@ -139,6 +140,7 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(view.thresholds.emaTimeframeSeconds, 15);
   assert.strictEqual(view.thresholds.emaFastPeriod, 9);
   assert.strictEqual(view.thresholds.emaSlowPeriod, 20);
+  assert.strictEqual(view.thresholds.emaWarmupPasses, true);
   assert.strictEqual(view.candidates[0].ema15sFast, 101);
   assert.strictEqual(view.candidates[0].ema15sSlow, 100);
 }
@@ -168,9 +170,14 @@ function runEmaGateTests() {
     event(index, price, 20, 'ema-warming'),
     { ema15sFastClosed: null, ema15sSlowClosed: null, rsi15sClosedBars: 19 },
   ));
-  assert.strictEqual(warmingSignals.length, 0);
-  assert.strictEqual(warming.states.get(MINT).rsi1sStage, 'warming');
-  assert.match(warming.states.get(MINT).rsi1sWaitReason, /need 20 closed 15s candles/);
+  assert.strictEqual(
+    warmingSignals.length,
+    1,
+    'insufficient 15-second history must pass instead of blocking a valid RSI/volume signal',
+  );
+  assert.strictEqual(warmingSignals[0]._flow.entryRsi1s.emaReady, false);
+  assert.strictEqual(warmingSignals[0]._flow.entryRsi1s.ema15sFast, null);
+  assert.strictEqual(warmingSignals[0]._flow.entryRsi1s.ema15sSlow, null);
 }
 
 function runVolumeGateTests() {
@@ -230,6 +237,7 @@ function runDashboardContractTest() {
     assert(html.includes('15s EMA9'));
     assert(html.includes('15s EMA20'));
     assert(html.includes('已收盘 15s EMA'));
+    assert(html.includes('预热不足放行'));
     assert(html.includes('近 60s 真实成交量'));
     assert(html.includes('FDV退出关闭'));
     assert(html.includes('AGE ≥'));

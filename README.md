@@ -22,7 +22,7 @@ used to backfill its migration AGE even when that pair does not yet expose compl
 FDV/LP data. Legacy `WATCHDOG_CHECK_INTERVAL_MS` values above one minute are clamped
 to `60000`.
 
-Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 1 秒 RSI(7) 从 ≤30 上穿 >30、最新已收盘 15 秒 EMA9 > EMA20，且前 60 秒真实成交量至少 $10,000**；默认每笔仓位为 `0.2 SOL`。
+Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 1 秒 RSI(7) 从 ≤30 上穿 >30、EMA 已预热时最新已收盘 15 秒 EMA9 > EMA20，且前 60 秒真实成交量至少 $10,000**；EMA 预热不足时放行，默认每笔仓位为 `0.2 SOL`。
 
 ## 当前买入策略
 
@@ -30,14 +30,14 @@ Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收�
 
 - RSI 周期为 `7`，只用已经收盘的 1 秒 K 线确认信号。
 - 上一根已收盘 RSI `<=30`、最新已收盘 RSI `>30`，构成从下向上突破 30。
-- 最新已收盘 15 秒 K 线必须满足 `EMA9 > EMA20`；EMA20 未预热完成或 `EMA9 <= EMA20` 时不买。
+- EMA9、EMA20 都已生成时，最新已收盘 15 秒 K 线必须满足 `EMA9 > EMA20`；K 线不足、EMA20 尚未预热完成时直接放行。
 - 信号收盘前 `60 秒`真实买卖总成交量必须 `>= $10,000`；美元金额按 `SOL_PRICE_USD` 换算。
 - 收盘信号得到确认后立即进入现有实盘下单链路，不增加额外等待。
 
 默认入口日志应显示：
 
 ```text
-Entry: closed RSI(7,1s) cross above 30, closed 15s EMA9>EMA20, trailing 60s real volume >= $10000, execute immediately after confirmation
+Entry: closed RSI(7,1s) cross above 30, closed 15s EMA9>EMA20 (warmup passes), trailing 60s real volume >= $10000, execute immediately after confirmation
 Legacy dumpSignal: suppressed
 [main] ActivityFlow enabled: mode=RSI_CROSS_1S ... immediate-confirmation ...
 ```

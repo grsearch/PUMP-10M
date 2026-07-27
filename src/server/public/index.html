@@ -757,7 +757,7 @@ async function refreshSignals() {
   const trailingDrawdown = thresholds.trailingDrawdownPct ?? 5;
   meta.innerHTML = [
     `<span>买入 <b>已收盘 1s RSI(${thresholds.rsiPeriod || 7}) 从 ≤${thresholds.entryCross ?? 30} 上穿</b></span>`,
-    `<span>趋势 <b>已收盘 15s EMA${thresholds.emaFastPeriod ?? 9} &gt; EMA${thresholds.emaSlowPeriod ?? 20}</b></span>`,
+    `<span>趋势 <b>已收盘 15s EMA${thresholds.emaFastPeriod ?? 9} &gt; EMA${thresholds.emaSlowPeriod ?? 20}；预热不足放行</b></span>`,
     `<span>近60s真实成交量 <b>≥ ${fmtMoney(thresholds.minVolume60sUsd ?? 10000)}</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
     `<span>RSI卖出 <b>&gt;${thresholds.exitOverbought ?? 80} 或下穿 ${thresholds.exitCrossDown ?? 70}；移动止盈激活后屏蔽</b></span>`,

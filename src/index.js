@@ -70,7 +70,8 @@ async function main() {
   console.log(
     `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
       `${config.activityFlow.rsi1sEntryThreshold}, closed 15s ` +
-      `EMA${config.activityFlow.ema15sFastPeriod}>EMA${config.activityFlow.ema15sSlowPeriod}, trailing ` +
+      `EMA${config.activityFlow.ema15sFastPeriod}>EMA${config.activityFlow.ema15sSlowPeriod}` +
+      ` (warmup passes), trailing ` +
       `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s real volume>=` +
       `$${config.activityFlow.rsi1sMinVolume60sUsd}, execute immediately after confirmation`,
   );

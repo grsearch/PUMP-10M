@@ -675,6 +675,7 @@ class OrderFlowTracker extends EventEmitter {
         emaTimeframeSeconds: 15,
         emaFastPeriod: this.ema15sFastPeriod,
         emaSlowPeriod: this.ema15sSlowPeriod,
+        emaWarmupPasses: true,
         exitOverbought: config.strategy.rsi1sOverboughtExit,
         exitCrossDown: config.strategy.rsi1sCrossDownExit,
         trailingActivatePct: config.strategy.trailingActivatePct,
@@ -963,14 +964,8 @@ class OrderFlowTracker extends EventEmitter {
     const ema15sSlow = snapshot.ema15sSlowClosed == null
       ? NaN
       : Number(snapshot.ema15sSlowClosed);
-    if (!Number.isFinite(ema15sFast) || !Number.isFinite(ema15sSlow)) {
-      state.rsi1sStage = 'warming';
-      state.rsi1sWaitReason =
-        `need ${this.ema15sSlowPeriod} closed 15s candles for EMA` +
-        `(${this.ema15sFastPeriod},${this.ema15sSlowPeriod})`;
-      return;
-    }
-    if (ema15sFast <= ema15sSlow) {
+    const ema15sReady = Number.isFinite(ema15sFast) && Number.isFinite(ema15sSlow);
+    if (ema15sReady && ema15sFast <= ema15sSlow) {
       state.rsi1sStage = 'ema-blocked';
       state.rsi1sWaitReason =
         `15s EMA${this.ema15sFastPeriod} ${ema15sFast.toExponential(4)} ` +
@@ -1007,8 +1002,9 @@ class OrderFlowTracker extends EventEmitter {
       emaTimeframeSeconds: 15,
       emaFastPeriod: this.ema15sFastPeriod,
       emaSlowPeriod: this.ema15sSlowPeriod,
-      ema15sFast: ema15sFast,
-      ema15sSlow: ema15sSlow,
+      emaReady: ema15sReady,
+      ema15sFast: Number.isFinite(ema15sFast) ? ema15sFast : null,
+      ema15sSlow: Number.isFinite(ema15sSlow) ? ema15sSlow : null,
       signalCandleTs: signalBucketTs,
       signalCloseTs,
       executionPrice: ev.price,
@@ -1052,8 +1048,10 @@ class OrderFlowTracker extends EventEmitter {
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_1S ` +
         `RSI(${this.rsi1sPeriod})=${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} ` +
-        `EMA15s=${this.ema15sFastPeriod}:${ema15sFast.toExponential(4)}>` +
-        `${this.ema15sSlowPeriod}:${ema15sSlow.toExponential(4)} ` +
+        (ema15sReady
+          ? `EMA15s=${this.ema15sFastPeriod}:${ema15sFast.toExponential(4)}>` +
+            `${this.ema15sSlowPeriod}:${ema15sSlow.toExponential(4)} `
+          : `EMA15s=warmup-pass(${snapshot.rsi15sClosedBars || 0}/${this.ema15sSlowPeriod}) `) +
         `vol60=$${volume60sUsd.toFixed(0)} execution=${ev.price}`,
     );
     this.emit('flowReversalSignal', signal);
