@@ -42,6 +42,7 @@ function managerWith(tokenInfo, ...positions) {
   manager.positions = new Map();
   manager.byMint = new Map();
   manager._flowExitEvents = new Map();
+  manager._rsi1sLastExitBucketByMint = new Map();
   manager._exitCalls = [];
   manager.priceTracker = { getPrice: () => 1 };
   manager.tokenRegistry = { getToken: () => tokenInfo };
@@ -68,13 +69,87 @@ function run() {
     migration_time: Date.now() - 10 * 60_000,
   };
 
-  assert.strictEqual(config.strategy.trailingActivatePct, 50);
-  assert.strictEqual(config.strategy.trailingDrawdownPct, 10);
-  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
+  assert.strictEqual(config.strategy.trailingActivatePct, 10);
+  assert.strictEqual(config.strategy.trailingDrawdownPct, 5);
+  assert.strictEqual(config.strategy.fixedStopLossPct, -10);
   assert.strictEqual(Object.hasOwn(config.strategy, 'maxHoldMs'), false);
   assert.strictEqual(config.strategy.fdvExitThresholdUsd, 20_000);
   assert.strictEqual(config.strategy.ageExitMs, 15 * 60_000);
-  assert.strictEqual(PositionManager.prototype.handleRsiForExit, undefined);
+  assert.strictEqual(typeof PositionManager.prototype.handleRsiForExit, 'function');
+
+  {
+    const unarmed = position('p1', mint);
+    const armed = position('p2', mint, {
+      isAddOn: true,
+      entryPrice: 0.85,
+      trailingArmed: true,
+    });
+    const manager = managerWith(healthyToken, unarmed, armed);
+    const exited = manager.handleRsiForExit(mint, 1.01, {
+      rsi1sClosedBucketTs: 1_000,
+      rsi1sPreviousClosed: 75,
+      rsi1sClosed: 81,
+    });
+    assert.strictEqual(exited, true);
+    assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1']);
+    assert.strictEqual(manager._exitCalls[0].reason, 'RSI_1S_OVERBOUGHT');
+    assert.strictEqual(armed.exiting, false, 'trailing-armed leg must ignore RSI exits');
+
+    manager.handleRsiForExit(mint, 1.01, {
+      rsi1sClosedBucketTs: 1_000,
+      rsi1sPreviousClosed: 75,
+      rsi1sClosed: 81,
+    });
+    assert.strictEqual(manager._exitCalls.length, 1, 'same closed 1s candle must be evaluated once');
+  }
+
+  {
+    const leg = position('p1', mint);
+    const manager = managerWith(healthyToken, leg);
+    manager._checkExit('p1', 1.1, { source: 'trailing_arm_priority' });
+    manager._checkExit('p1', 1.1, { source: 'trailing_arm_priority' });
+    assert.strictEqual(leg.trailingArmed, true, 'two confirmed +10% ticks must arm trailing');
+
+    const exited = manager.handleRsiForExit(mint, 1.1, {
+      rsi1sClosedBucketTs: 1_500,
+      rsi1sPreviousClosed: 75,
+      rsi1sClosed: 81,
+    });
+    assert.strictEqual(exited, false);
+    assert.strictEqual(manager._exitCalls.length, 0, 'RSI must not exit after trailing arms first');
+  }
+
+  {
+    const manager = managerWith(healthyToken, position('p1', mint));
+    manager.handleRsiForExit(mint, 1.01, {
+      rsi1sClosedBucketTs: 2_000,
+      rsi1sPreviousClosed: 72,
+      rsi1sClosed: 69,
+    });
+    assert.strictEqual(manager._exitCalls.length, 1);
+    assert.strictEqual(manager._exitCalls[0].reason, 'RSI_1S_CROSS_DOWN');
+  }
+
+  {
+    const aboveStop = position('p1', mint);
+    const manager = managerWith(healthyToken, aboveStop);
+    manager._checkExit('p1', 0.9001, { source: 'fixed_stop_boundary' });
+    assert.strictEqual(manager._exitCalls.length, 0, 'price above -10% must stay open');
+
+    manager._checkExit('p1', 0.9, { source: 'fixed_stop_boundary' });
+    assert.strictEqual(manager._exitCalls.length, 1, 'price at -10% must exit immediately');
+    assert.strictEqual(manager._exitCalls[0].reason, 'FIXED_STOP_LOSS');
+    assert.strictEqual(manager._exitCalls[0].id, 'p1');
+  }
+
+  {
+    const first = position('p1', mint);
+    const second = position('p2', mint, { isAddOn: true, entryPrice: 0.85 });
+    const manager = managerWith(healthyToken, first, second);
+    manager._checkExit('p1', 0.9, { source: 'fixed_stop_independent_leg' });
+    assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1']);
+    assert.strictEqual(second.exiting, false, 'fixed stop must not close another independent leg');
+  }
 
   {
     const manager = managerWith(healthyToken);

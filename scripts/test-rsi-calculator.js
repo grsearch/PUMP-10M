@@ -30,6 +30,36 @@ function referenceRsi(closes, period) {
 }
 
 function run() {
+  const rsi1 = new RsiCalculator({ period1: 7 });
+  const frame1 = 1_000;
+  const closes1 = [100, 90, 80, 70, 60, 50, 40, 35, 80, 75];
+  closes1.forEach((price, index) => {
+    rsi1.feedTrade('rsi-1s', price, 1, 'buy', index * frame1 + 100, 50);
+  });
+  const snapshot1 = rsi1.snapshot('rsi-1s');
+  approx(snapshot1.rsi1sPreviousClosed, referenceRsi(closes1.slice(0, 8), 7));
+  approx(snapshot1.rsi1sClosed, referenceRsi(closes1.slice(0, 9), 7));
+  approx(snapshot1.rsi1sLive, referenceRsi(closes1, 7));
+  assert(snapshot1.rsi1sPreviousClosed <= 30);
+  assert(snapshot1.rsi1sClosed > 30);
+  assert.strictEqual(snapshot1.rsi1sClosedBars, 9);
+  assert.strictEqual(snapshot1.rsi1sClosedBucketTs, 8 * frame1);
+  assert.strictEqual(snapshot1.rsi1sCurrentBucketTs, 9 * frame1);
+
+  const closeBased1s = new RsiCalculator({ period1: 7 });
+  closes1.forEach((close, index) => {
+    const bucketStart = index * frame1;
+    closeBased1s.feedTrade('rsi-1s-close', close + 20 + index * 3, 100, 'buy', bucketStart + 100, 50);
+    closeBased1s.feedTrade('rsi-1s-close', close, 1, 'sell', bucketStart + 900, 50);
+  });
+  const closeSnapshot1 = closeBased1s.snapshot('rsi-1s-close');
+  approx(closeSnapshot1.rsi1sLive, referenceRsi(closes1, 7));
+  assert.notStrictEqual(
+    closeSnapshot1.rsi1s,
+    closeSnapshot1.rsi1sLive,
+    'strategy RSI must use each 1s candle close rather than its volume-weighted average',
+  );
+
   const rsi5 = new RsiCalculator({ period5: 7 });
   const frame5 = 5_000;
   const closes5 = [100, 90, 80, 70, 60, 50, 40, 35, 80, 75];
@@ -142,7 +172,7 @@ function run() {
     'price changes below the configured ratio must not reset RSI history',
   );
 
-  console.log('RsiCalculator TradingView 5s/15s/1m RSI self-test: PASS');
+  console.log('RsiCalculator TradingView 1s/5s/15s/1m RSI self-test: PASS');
 }
 
 run();

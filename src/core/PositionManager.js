@@ -57,6 +57,7 @@ class PositionManager extends EventEmitter {
     this._sellInProgress = new Set(); // 正在卖出的 mint
     this._tickCount = 0;  // v3.26: tick counter for PoolStateCache price check
     this._flowExitEvents = new Map(); // mint -> recent BUY/SELL swaps while holding
+    this._rsi1sLastExitBucketByMint = new Map(); // mint -> last evaluated closed 1s bucket
 
     this.positions = new Map(); // positionId → position obj
     this.byMint = new Map();    // mint → Set<positionId> (v3.17.13: 同币多仓)
@@ -296,6 +297,7 @@ class PositionManager extends EventEmitter {
     if (pids.size === 0) {
       this.byMint.delete(mint);
       this._flowExitEvents.delete(mint);
+      this._rsi1sLastExitBucketByMint.delete(mint);
     }
   }
 
@@ -304,6 +306,68 @@ class PositionManager extends EventEmitter {
   _exitForCondition(pos, price, reason) {
     if (!pos || pos.exiting) return;
     this._exit(pos, price, reason);
+  }
+
+  handleRsiForExit(mint, price, snapshot) {
+    if (!config.strategy.rsi1sExitEnabled) return false;
+    const pids = this.byMint.get(mint);
+    if (!pids || pids.size === 0) return false;
+
+    const closedBucketTs = snapshot?.rsi1sClosedBucketTs == null
+      ? NaN
+      : Number(snapshot.rsi1sClosedBucketTs);
+    const previousRsi = snapshot?.rsi1sPreviousClosed == null
+      ? NaN
+      : Number(snapshot.rsi1sPreviousClosed);
+    const currentRsi = snapshot?.rsi1sClosed == null
+      ? NaN
+      : Number(snapshot.rsi1sClosed);
+    if (
+      !Number.isFinite(closedBucketTs) ||
+      !Number.isFinite(currentRsi)
+    ) return false;
+    if (this._rsi1sLastExitBucketByMint.get(mint) === closedBucketTs) return false;
+    this._rsi1sLastExitBucketByMint.set(mint, closedBucketTs);
+
+    let reason = null;
+    if (currentRsi > config.strategy.rsi1sOverboughtExit) {
+      reason = 'RSI_1S_OVERBOUGHT';
+    } else if (
+      Number.isFinite(previousRsi) &&
+      previousRsi >= config.strategy.rsi1sCrossDownExit &&
+      currentRsi < config.strategy.rsi1sCrossDownExit
+    ) {
+      reason = 'RSI_1S_CROSS_DOWN';
+    }
+    if (!reason) return false;
+
+    let exited = 0;
+    let trailingProtected = 0;
+    for (const pid of pids) {
+      const pos = this.positions.get(pid);
+      if (!pos || pos.exiting || pos.status === 'stuck') continue;
+      if (pos.trailingArmed) {
+        trailingProtected++;
+        continue;
+      }
+      exited++;
+      this._exitForCondition(pos, price, reason);
+    }
+
+    const symbol = [...pids]
+      .map((pid) => this.positions.get(pid)?.symbol)
+      .find(Boolean) || mint.slice(0, 6);
+    console.log(
+      `[PositionManager] ${reason} ${symbol} ` +
+        `RSI1s=${Number.isFinite(previousRsi) ? previousRsi.toFixed(2) : 'n/a'}->` +
+        `${currentRsi.toFixed(2)} ` +
+        `exited=${exited} trailingProtected=${trailingProtected}`,
+    );
+    monitor.inc(`PositionManager.${reason}`, exited, 'PositionManager');
+    if (trailingProtected > 0) {
+      monitor.inc('PositionManager.rsi1sExitSkippedTrailingArmed', trailingProtected, 'PositionManager');
+    }
+    return exited > 0;
   }
 
   openPositionCount() {
@@ -1488,7 +1552,10 @@ class PositionManager extends EventEmitter {
 
     // Absolute loss cap: no stabilization or legacy emergency-stop grace delay.
     const fixedStopPct = config.strategy.fixedStopLossPct;
-    if (fixedStopPct < 0 && pnlPct <= fixedStopPct) {
+    const fixedStopPrice = fixedStopPct < 0
+      ? pos.entryPrice * (1 + fixedStopPct / 100)
+      : null;
+    if (fixedStopPrice != null && price <= fixedStopPrice) {
       const rawPrice = Number(context?.rawPrice) || null;
       const virtualQuoteReserveSol = Number(context?.virtualQuoteReserveSol) || 0;
       const priceFormulaGapPct = rawPrice && rawPrice > 0
