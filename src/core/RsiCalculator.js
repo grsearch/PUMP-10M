@@ -53,8 +53,8 @@ class RsiCalculator {
     period1 = 14,
     period5 = 7,
     period15 = 7,
-    ema15sFastPeriod = 9,
-    ema15sSlowPeriod = 20,
+    ema1sPeriod = 20,
+    ema1sSlopeLookbackSeconds = 20,
     period30 = 7,
     period60 = 7,
     bucketMs1 = 1000,
@@ -68,11 +68,8 @@ class RsiCalculator {
     this.period1 = period1;
     this.period5 = period5;
     this.period15 = Math.max(1, period15);
-    this.ema15sFastPeriod = Math.max(1, Math.trunc(ema15sFastPeriod));
-    this.ema15sSlowPeriod = Math.max(
-      this.ema15sFastPeriod + 1,
-      Math.trunc(ema15sSlowPeriod),
-    );
+    this.ema1sPeriod = Math.max(1, Math.trunc(ema1sPeriod));
+    this.ema1sSlopeLookbackSeconds = Math.max(1, Math.trunc(ema1sSlopeLookbackSeconds));
     this.period30 = period30;
     this.period60 = Math.max(1, period60);
     // 向后兼容:旧代码用 this.period
@@ -172,12 +169,6 @@ class RsiCalculator {
         rsi15sAvgLoss: null,
         rsi15sClosed: null,
         rsi15sPreviousClosed: null,
-        ema15sFastSeedCount: 0,
-        ema15sFastSeedSum: 0,
-        ema15sFastClosed: null,
-        ema15sSlowSeedCount: 0,
-        ema15sSlowSeedSum: 0,
-        ema15sSlowClosed: null,
         rsi1mCurrentIdx: null,
         rsi1mCurrentClose: null,
         rsi1mFinalClose: null,
@@ -286,7 +277,6 @@ class RsiCalculator {
   }
 
   _commitRsi15sClose(s, close, bucketIdx) {
-    this._commitEma15sClose(s, close);
     if (s.rsi15sFinalClose == null) {
       s.rsi15sFinalClose = close;
       s.rsi15sFinalIdx = bucketIdx;
@@ -321,30 +311,6 @@ class RsiCalculator {
       s.rsi15sPreviousClosed = s.rsi15sClosed;
       s.rsi15sClosed = this._rsiFromAverages(s.rsi15sAvgGain, s.rsi15sAvgLoss);
     }
-  }
-
-  _commitEma15sValue(s, close, prefix, period) {
-    const countKey = `${prefix}SeedCount`;
-    const sumKey = `${prefix}SeedSum`;
-    const valueKey = `${prefix}Closed`;
-    const count = Number(s[countKey]) || 0;
-
-    if (count < period) {
-      s[sumKey] = (Number(s[sumKey]) || 0) + close;
-      s[countKey] = count + 1;
-      if (s[countKey] === period) {
-        s[valueKey] = s[sumKey] / period;
-      }
-      return;
-    }
-
-    const multiplier = 2 / (period + 1);
-    s[valueKey] = (close - s[valueKey]) * multiplier + s[valueKey];
-  }
-
-  _commitEma15sClose(s, close) {
-    this._commitEma15sValue(s, close, 'ema15sFast', this.ema15sFastPeriod);
-    this._commitEma15sValue(s, close, 'ema15sSlow', this.ema15sSlowPeriod);
   }
 
   _updateRsi15sState(s, price, ts) {
@@ -528,6 +494,20 @@ class RsiCalculator {
     return 100 - 100 / (1 + rs);
   }
 
+  _emaSeries(prices, period) {
+    const values = Array(prices.length).fill(null);
+    if (prices.length < period) return values;
+
+    let ema = prices.slice(0, period).reduce((total, price) => total + price, 0) / period;
+    values[period - 1] = ema;
+    const multiplier = 2 / (period + 1);
+    for (let index = period; index < prices.length; index += 1) {
+      ema = (prices[index] - ema) * multiplier + ema;
+      values[index] = ema;
+    }
+    return values;
+  }
+
   /**
    * v3.17.38: 内部 snapshot 计算逻辑(接受 state,不查 map)
    * 用于:
@@ -548,6 +528,18 @@ class RsiCalculator {
     const previousClosedPrices1s = closes1s.slice(0, -2);
     const rsi1sClosed = this._wildersRsi(closedPrices1s, this.period1);
     const rsi1sPreviousClosed = this._wildersRsi(previousClosedPrices1s, this.period1);
+    const ema1sSeries = this._emaSeries(closedPrices1s, this.ema1sPeriod);
+    const ema1s20Closed = ema1sSeries[ema1sSeries.length - 1] ?? null;
+    const emaSlopeReferenceIndex = ema1sSeries.length - 1 - this.ema1sSlopeLookbackSeconds;
+    const ema1s20Reference = emaSlopeReferenceIndex >= 0
+      ? ema1sSeries[emaSlopeReferenceIndex]
+      : null;
+    const ema1s20Slope20sPct =
+      Number.isFinite(ema1s20Closed) &&
+      Number.isFinite(ema1s20Reference) &&
+      ema1s20Reference > 0
+        ? ((ema1s20Closed - ema1s20Reference) / ema1s20Reference) * 100
+        : null;
     const current1sBucket = s.buckets1s[s.buckets1s.length - 1] || null;
     const closed1sBucket = s.buckets1s[s.buckets1s.length - 2] || null;
     const rsi5s = this._wildersRsi(closes5s, this.period5);
@@ -587,6 +579,19 @@ class RsiCalculator {
       rsi1sClosedBucketTs: closed1sBucket ? closed1sBucket.idx * this.bucketMs1 : null,
       rsi1sLiveClose: current1sBucket ? current1sBucket.lastPrice : null,
       rsi1sLastClosedClose: closed1sBucket ? closed1sBucket.lastPrice : null,
+      ema1sPeriod: this.ema1sPeriod,
+      ema1sSlopeLookbackSeconds: this.ema1sSlopeLookbackSeconds,
+      ema1s20Closed,
+      ema1s20Slope20sPct,
+      ema1s20SlopeReady: Number.isFinite(ema1s20Slope20sPct),
+      rsi1sClosedCandles: s.buckets1s
+        .slice(0, -1)
+        .slice(-(this.ema1sSlopeLookbackSeconds + 41))
+        .map((bucket) => ({
+          ts: bucket.idx * this.bucketMs1,
+          close: bucket.lastPrice,
+          solVolume: bucket.sumVolume,
+        })),
       rsi5s,
       rsi5sClosed,
       rsi5sPreviousClosed,
@@ -599,10 +604,6 @@ class RsiCalculator {
       rsi15sLive,
       rsi15sClosed: s.rsi15sClosed,
       rsi15sPreviousClosed: s.rsi15sPreviousClosed,
-      ema15sFastPeriod: this.ema15sFastPeriod,
-      ema15sSlowPeriod: this.ema15sSlowPeriod,
-      ema15sFastClosed: s.ema15sFastClosed,
-      ema15sSlowClosed: s.ema15sSlowClosed,
       rsi30s,
       // rsi1m remains an alias for the live value for backward compatibility.
       rsi1m: rsi1mLive,

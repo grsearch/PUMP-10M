@@ -239,10 +239,12 @@ const config = {
     entryMode: 'RSI_CROSS_1S',
     rsi1sPeriod: 7,
     rsi1sEntryThreshold: 30,
+    // Observational trailing volume only. It is deliberately not an entry threshold.
     rsi1sVolumeWindowMs: 60_000,
-    rsi1sMinVolume60sUsd: 10_000,
-    ema15sFastPeriod: 9,
-    ema15sSlowPeriod: 20,
+    rsi1sPhaseLookbackMs: 60_000,
+    ema1sPeriod: 20,
+    ema1sSlopeLookbackSeconds: 20,
+    ema1sMinSlopePct: -0.3,
     minVolume1mUsd: parseFloat(process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_USD || '3000'),
     minVolume1mSol: parseFloat(
       process.env.ACTIVITY_FLOW_1M_MIN_VOLUME_SOL || String(activityFlow1mMinVolumeSolDefault),
@@ -604,14 +606,15 @@ function validateConfig() {
   if (config.activityFlow.rsi1sVolumeWindowMs <= 0) {
     errors.push('RSI_1S_VOLUME_WINDOW_MS must be > 0');
   }
-  if (config.activityFlow.rsi1sMinVolume60sUsd <= 0) {
-    errors.push('RSI_1S_MIN_VOLUME_60S_USD must be > 0');
+  if (config.activityFlow.rsi1sPhaseLookbackMs < 3_000) {
+    errors.push('RSI_1S_PHASE_LOOKBACK_MS must be >= 3000');
   }
   if (
-    config.activityFlow.ema15sFastPeriod < 1 ||
-    config.activityFlow.ema15sSlowPeriod <= config.activityFlow.ema15sFastPeriod
+    config.activityFlow.ema1sPeriod < 1 ||
+    config.activityFlow.ema1sSlopeLookbackSeconds < 1 ||
+    config.activityFlow.ema1sMinSlopePct > 0
   ) {
-    errors.push('15s EMA periods must satisfy 0 < fast < slow');
+    errors.push('1s EMA slope settings must use positive periods and a non-positive minimum slope');
   }
   if (
     config.strategy.rsi1sCrossDownExit <= 0 ||

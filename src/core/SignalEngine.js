@@ -754,7 +754,10 @@ class SignalEngine extends EventEmitter {
       activityReason =
         `rsi_1s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
         `${entry.currentRsi.toFixed(2)} cross>${entry.threshold} ` +
-        `vol60=$${entry.volume60sUsd.toFixed(0)} execution=${entry.executionPrice}` +
+        `pullbackVolRatio=${entry.downUpVolumeRatio?.toFixed(3) ?? 'n/a'} ` +
+        `ema${entry.emaPeriod}Slope${entry.emaSlopeLookbackSeconds}s=` +
+        `${entry.ema1s20Slope20sPct?.toFixed(3) ?? 'warmup-pass'}% ` +
+        `vol60(observe)=$${entry.volume60sUsd.toFixed(0)} execution=${entry.executionPrice}` +
         `${signal._isAddOn ? ` add_on_drop=${signal._addOn.dropPct.toFixed(2)}%` : ''}`;
     } else if (signal._activityFlow && flow?.entryV6) {
       activityReason =
