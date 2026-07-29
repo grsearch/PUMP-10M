@@ -49,6 +49,7 @@ class OrderFlowTracker extends EventEmitter {
     super();
     const flowConfig = config.activityFlow || {};
     this.tokenRegistry = opts.tokenRegistry || null;
+    this.tradeLogger = opts.tradeLogger || null;
     this.solPriceUsd = opts.solPriceUsd ?? numEnv('SOL_PRICE_USD', 72);
 
     this.enabled =
@@ -66,10 +67,12 @@ class OrderFlowTracker extends EventEmitter {
     this.rsi1sPeriod = opts.rsi1sPeriod ?? flowConfig.rsi1sPeriod ?? 7;
     this.rsi1sEntryThreshold = opts.rsi1sEntryThreshold ?? flowConfig.rsi1sEntryThreshold ?? 30;
     this.rsi1sVolumeWindowMs = opts.rsi1sVolumeWindowMs ?? flowConfig.rsi1sVolumeWindowMs ?? 60_000;
-    this.rsi1sMinVolume60sUsd =
-      opts.rsi1sMinVolume60sUsd ?? flowConfig.rsi1sMinVolume60sUsd ?? 10_000;
-    this.ema15sFastPeriod = opts.ema15sFastPeriod ?? flowConfig.ema15sFastPeriod ?? 9;
-    this.ema15sSlowPeriod = opts.ema15sSlowPeriod ?? flowConfig.ema15sSlowPeriod ?? 20;
+    this.rsi1sPhaseLookbackMs =
+      opts.rsi1sPhaseLookbackMs ?? flowConfig.rsi1sPhaseLookbackMs ?? 60_000;
+    this.ema1sPeriod = opts.ema1sPeriod ?? flowConfig.ema1sPeriod ?? 20;
+    this.ema1sSlopeLookbackSeconds =
+      opts.ema1sSlopeLookbackSeconds ?? flowConfig.ema1sSlopeLookbackSeconds ?? 20;
+    this.ema1sMinSlopePct = opts.ema1sMinSlopePct ?? flowConfig.ema1sMinSlopePct ?? -0.3;
     // Source-level lock for an emitted RSI entry. SignalEngine performs
     // asynchronous checks, so its own inflight set alone cannot stop two
     // region callbacks from entering the pipeline at nearly the same time.
@@ -608,8 +611,8 @@ class OrderFlowTracker extends EventEmitter {
       active: 0,
       warming: 0,
       monitoring: 0,
-      volumeBlocked: 0,
-      emaBlocked: 0,
+      pullbackVolumeBlocked: 0,
+      emaSlopeBlocked: 0,
       signaled: 0,
     };
 
@@ -634,8 +637,8 @@ class OrderFlowTracker extends EventEmitter {
         stage = 'monitoring';
       }
       summary.active++;
-      if (stage === 'volume-blocked') summary.volumeBlocked++;
-      else if (stage === 'ema-blocked') summary.emaBlocked++;
+      if (stage === 'pullback-volume-blocked') summary.pullbackVolumeBlocked++;
+      else if (stage === 'ema-slope-blocked') summary.emaSlopeBlocked++;
       else if (Object.prototype.hasOwnProperty.call(summary, stage)) summary[stage]++;
 
       candidates.push({
@@ -648,16 +651,27 @@ class OrderFlowTracker extends EventEmitter {
         rsiCurrent: state.rsi1sClosed ?? snapshot.rsi1sClosed ?? null,
         rsiLive: snapshot.rsi1sLive ?? null,
         closedBars: snapshot.rsi1sClosedBars || 0,
-        ema15sFast: snapshot.ema15sFastClosed ?? null,
-        ema15sSlow: snapshot.ema15sSlowClosed ?? null,
-        ema15sClosedBars: snapshot.rsi15sClosedBars || 0,
+        ema1s20: snapshot.ema1s20Closed ?? null,
+        ema1s20Slope20sPct: snapshot.ema1s20Slope20sPct ?? null,
+        ema1s20SlopeReady: snapshot.ema1s20SlopeReady === true,
+        upVolumeAvgUsd: state.rsi1sPullbackVolume?.upVolumeAvgUsd ?? null,
+        downVolumeAvgUsd: state.rsi1sPullbackVolume?.downVolumeAvgUsd ?? null,
+        downUpVolumeRatio: state.rsi1sPullbackVolume?.downUpVolumeRatio ?? null,
+        upPhaseSeconds: state.rsi1sPullbackVolume?.upPhaseSeconds ?? null,
+        pullbackPhaseSeconds: state.rsi1sPullbackVolume?.pullbackPhaseSeconds ?? null,
         volume60sUsd: round(liveVolume60sUsd, 2),
         signalCandleTs: state.rsi1sSignalCandleTs || null,
         waitReason: state.rsi1sWaitReason || null,
       });
     }
 
-    const rank = { signaled: 5, 'volume-blocked': 4, 'ema-blocked': 3, monitoring: 2, warming: 1 };
+    const rank = {
+      signaled: 5,
+      'pullback-volume-blocked': 4,
+      'ema-slope-blocked': 3,
+      monitoring: 2,
+      warming: 1,
+    };
     candidates.sort((a, b) =>
       ((rank[b.stage] || 0) - (rank[a.stage] || 0)) ||
       (b.volume60sUsd - a.volume60sUsd) ||
@@ -671,10 +685,13 @@ class OrderFlowTracker extends EventEmitter {
         rsiPeriod: this.rsi1sPeriod,
         entryCross: this.rsi1sEntryThreshold,
         volumeWindowMs: this.rsi1sVolumeWindowMs,
-        minVolume60sUsd: this.rsi1sMinVolume60sUsd,
-        emaTimeframeSeconds: 15,
-        emaFastPeriod: this.ema15sFastPeriod,
-        emaSlowPeriod: this.ema15sSlowPeriod,
+        volume60sFilterEnabled: false,
+        pullbackPhaseLookbackMs: this.rsi1sPhaseLookbackMs,
+        pullbackVolumeMaxRatio: 1,
+        emaTimeframeSeconds: 1,
+        emaPeriod: this.ema1sPeriod,
+        emaSlopeLookbackSeconds: this.ema1sSlopeLookbackSeconds,
+        emaMinSlopePct: this.ema1sMinSlopePct,
         emaWarmupPasses: true,
         exitOverbought: config.strategy.rsi1sOverboughtExit,
         exitCrossDown: config.strategy.rsi1sCrossDownExit,
@@ -722,11 +739,14 @@ class OrderFlowTracker extends EventEmitter {
         rsi1sPreviousClosed: null,
         rsi1sClosed: null,
         rsi1sVolume60sUsd: 0,
+        rsi1sPullbackVolume: null,
         rsi1sSignalCandleTs: null,
         rsi1sSignalTs: null,
         rsi1sWaitReason: null,
         rsi1sInflight: false,
         rsi1sInflightAt: null,
+        lastRsiObservationHolders: null,
+        lastRsiObservationTs: null,
       };
       this.states.set(mint, state);
     }
@@ -898,6 +918,181 @@ class OrderFlowTracker extends EventEmitter {
     }
   }
 
+  _analyzePullbackVolume(state, snapshot, signalBucketTs) {
+    const candles = Array.isArray(snapshot.rsi1sClosedCandles)
+      ? snapshot.rsi1sClosedCandles
+        .map((candle) => ({
+          ts: Number(candle.ts),
+          close: Number(candle.close),
+          solVolume: Number(candle.solVolume),
+        }))
+        .filter((candle) =>
+          Number.isFinite(candle.ts) &&
+          Number.isFinite(candle.close) &&
+          candle.close > 0 &&
+          candle.ts >= signalBucketTs - this.rsi1sPhaseLookbackMs &&
+          candle.ts <= signalBucketTs)
+        .sort((a, b) => a.ts - b.ts)
+      : [];
+
+    const signalIndex = candles.findIndex((candle) => candle.ts === signalBucketTs);
+    const beforeTrigger = signalIndex > 0 ? candles.slice(0, signalIndex) : [];
+    if (beforeTrigger.length < 3) {
+      return {
+        ready: false,
+        passed: false,
+        reason: 'need a completed low-to-peak-to-pullback structure',
+      };
+    }
+
+    // Split the available path dynamically:
+    // latest low -> highest subsequent close = up phase;
+    // that peak -> candle immediately before the RSI rebound = pullback phase.
+    // The 60-second value is only a maximum pivot-search horizon, not two
+    // fixed comparison windows.
+    let peakIndex = -1;
+    let peakPrice = Number.NEGATIVE_INFINITY;
+    for (let index = 1; index < beforeTrigger.length - 1; index += 1) {
+      if (beforeTrigger[index].close >= peakPrice) {
+        peakIndex = index;
+        peakPrice = beforeTrigger[index].close;
+      }
+    }
+    if (peakIndex < 1) {
+      return { ready: false, passed: false, reason: 'no pullback peak found before RSI rebound' };
+    }
+
+    let upStartIndex = 0;
+    for (let index = 1; index < peakIndex; index += 1) {
+      if (beforeTrigger[index].close <= beforeTrigger[upStartIndex].close) {
+        upStartIndex = index;
+      }
+    }
+    const pullbackEndIndex = beforeTrigger.length - 1;
+    if (
+      peakPrice <= beforeTrigger[upStartIndex].close ||
+      beforeTrigger[pullbackEndIndex].close >= peakPrice
+    ) {
+      return {
+        ready: false,
+        passed: false,
+        reason: 'price path is not a completed rise followed by a pullback',
+      };
+    }
+
+    const upCandles = beforeTrigger.slice(upStartIndex + 1, peakIndex + 1);
+    const pullbackCandles = beforeTrigger.slice(peakIndex + 1);
+    if (upCandles.length === 0 || pullbackCandles.length === 0) {
+      return { ready: false, passed: false, reason: 'up or pullback phase has no closed 1s candle' };
+    }
+
+    const averageSol = (rows) =>
+      rows.reduce((total, candle) => {
+        const volume = state.rsiVolumeBuckets.has(candle.ts)
+          ? state.rsiVolumeBuckets.get(candle.ts)
+          : candle.solVolume;
+        return total + (Number.isFinite(volume) && volume > 0 ? volume : 0);
+      }, 0) / rows.length;
+    const upVolumeAvgSol = averageSol(upCandles);
+    const downVolumeAvgSol = averageSol(pullbackCandles);
+    const downUpVolumeRatio = upVolumeAvgSol > 0
+      ? downVolumeAvgSol / upVolumeAvgSol
+      : Number.POSITIVE_INFINITY;
+
+    return {
+      ready: true,
+      passed: upVolumeAvgSol > 0 && downVolumeAvgSol <= upVolumeAvgSol,
+      upVolumeAvgSol: round(upVolumeAvgSol, 6),
+      downVolumeAvgSol: round(downVolumeAvgSol, 6),
+      upVolumeAvgUsd: round(upVolumeAvgSol * this.solPriceUsd, 2),
+      downVolumeAvgUsd: round(downVolumeAvgSol * this.solPriceUsd, 2),
+      downUpVolumeRatio: Number.isFinite(downUpVolumeRatio) ? round(downUpVolumeRatio, 4) : null,
+      upPhaseSeconds: upCandles.length,
+      pullbackPhaseSeconds: pullbackCandles.length,
+      upStartTs: beforeTrigger[upStartIndex].ts,
+      peakTs: beforeTrigger[peakIndex].ts,
+      pullbackEndTs: beforeTrigger[pullbackEndIndex].ts,
+      upStartPrice: beforeTrigger[upStartIndex].close,
+      peakPrice,
+      pullbackEndPrice: beforeTrigger[pullbackEndIndex].close,
+      reason: downVolumeAvgSol <= upVolumeAvgSol
+        ? null
+        : 'pullback average volume exceeded up-phase average volume',
+    };
+  }
+
+  _findNumericMeta(value, keys) {
+    if (!value || typeof value !== 'object') return null;
+    for (const key of Object.keys(value)) {
+      if (keys.has(key)) {
+        const number = Number(value[key]);
+        if (Number.isFinite(number)) return number;
+      }
+    }
+    for (const key of Object.keys(value)) {
+      const nested = this._findNumericMeta(value[key], keys);
+      if (nested != null) return nested;
+    }
+    return null;
+  }
+
+  _recordRsiBuyPoint(state, ev, entry, s60) {
+    if (!this.tradeLogger?.logTokenEvent) return;
+    const token = this.tokenRegistry?.getToken(ev.mint) || null;
+    let holders = Number(token?.holders);
+    if (!Number.isFinite(holders) && token?.meta_json) {
+      try {
+        holders = this._findNumericMeta(
+          JSON.parse(token.meta_json),
+          new Set(['holders', 'holder_count', 'holderCount']),
+        );
+      } catch (_) {
+        holders = null;
+      }
+    }
+    if (!Number.isFinite(holders)) holders = null;
+    const holderChange = holders != null && Number.isFinite(state.lastRsiObservationHolders)
+      ? holders - state.lastRsiObservationHolders
+      : null;
+    const migrationTime = Number(token?.migration_time);
+    const addedAt = Number(token?.added_at);
+    const ageBase = Number.isFinite(migrationTime) && migrationTime > 0
+      ? migrationTime
+      : (Number.isFinite(addedAt) && addedAt > 0 ? addedAt : null);
+    const ageMs = ageBase == null ? null : Math.max(0, ev.ts - ageBase);
+    const fdv = Number(token?.fdv);
+    const liquidity = Number(token?.liquidity);
+
+    this.tradeLogger.logTokenEvent({
+      ts: ev.ts,
+      mint: ev.mint,
+      symbol: state.symbol || ev.symbol || token?.symbol || null,
+      eventType: 'RSI_BUY_POINT',
+      eventKey: 'pullback_v1',
+      price: ev.price,
+      fdv: Number.isFinite(fdv) ? fdv : null,
+      liquidity: Number.isFinite(liquidity) ? liquidity : null,
+      ageMs,
+      value: entry.currentRsi,
+      details: {
+        ...entry,
+        activeBuySellRatio60s: round(s60.buySellRatio, 4),
+        activeBuyVolume60sSol: round(s60.buySol, 6),
+        activeSellVolume60sSol: round(s60.sellSol, 6),
+        uniqueBuyers60s: s60.uniqueBuyers,
+        uniqueSellers60s: s60.uniqueSellers,
+        holders,
+        holderChangeSincePreviousRsiPoint: holderChange,
+        previousRsiPointTs: state.lastRsiObservationTs,
+        fdv: Number.isFinite(fdv) ? fdv : null,
+        liquidity: Number.isFinite(liquidity) ? liquidity : null,
+        ageMs,
+      },
+    });
+    state.lastRsiObservationHolders = holders;
+    state.lastRsiObservationTs = ev.ts;
+  }
+
   _tryRsiCross1s(state, ev) {
     if (state.rsi1sInflight) {
       const lockAgeMs = Date.now() - (state.rsi1sInflightAt || Date.now());
@@ -958,21 +1153,6 @@ class OrderFlowTracker extends EventEmitter {
     }
     if (state.rsi1sLastSignalCandleTs === signalBucketTs) return;
 
-    const ema15sFast = snapshot.ema15sFastClosed == null
-      ? NaN
-      : Number(snapshot.ema15sFastClosed);
-    const ema15sSlow = snapshot.ema15sSlowClosed == null
-      ? NaN
-      : Number(snapshot.ema15sSlowClosed);
-    const ema15sReady = Number.isFinite(ema15sFast) && Number.isFinite(ema15sSlow);
-    if (ema15sReady && ema15sFast <= ema15sSlow) {
-      state.rsi1sStage = 'ema-blocked';
-      state.rsi1sWaitReason =
-        `15s EMA${this.ema15sFastPeriod} ${ema15sFast.toExponential(4)} ` +
-        `<= EMA${this.ema15sSlowPeriod} ${ema15sSlow.toExponential(4)}`;
-      return;
-    }
-
     const signalCloseTs = signalBucketTs + 1_000;
     const volumeStart = signalCloseTs - this.rsi1sVolumeWindowMs;
     const volume60sSol = [...state.rsiVolumeBuckets].reduce((total, [bucketTs, bucketVolume]) => {
@@ -982,15 +1162,15 @@ class OrderFlowTracker extends EventEmitter {
     const volume60sUsd = volume60sSol * this.solPriceUsd;
     state.rsi1sVolume60sUsd = volume60sUsd;
     state.rsi1sSignalCandleTs = signalBucketTs;
-
-    if (volume60sUsd < this.rsi1sMinVolume60sUsd) {
-      state.rsi1sStage = 'volume-blocked';
-      state.rsi1sWaitReason =
-        `60s volume $${volume60sUsd.toFixed(0)}<${this.rsi1sMinVolume60sUsd}`;
-      return;
-    }
-
     const s60 = this._stats(state, signalCloseTs - 1, this.rsi1sVolumeWindowMs);
+    const pullbackVolume = this._analyzePullbackVolume(state, snapshot, signalBucketTs);
+    state.rsi1sPullbackVolume = pullbackVolume;
+    const ema1s20 = snapshot.ema1s20Closed == null ? NaN : Number(snapshot.ema1s20Closed);
+    const ema1s20Slope20sPct = snapshot.ema1s20Slope20sPct == null
+      ? NaN
+      : Number(snapshot.ema1s20Slope20sPct);
+    const emaSlopeReady = Number.isFinite(ema1s20) && Number.isFinite(ema1s20Slope20sPct);
+    const emaSlopePassed = !emaSlopeReady || ema1s20Slope20sPct >= this.ema1sMinSlopePct;
     const entry = {
       timeframeSeconds: 1,
       period: this.rsi1sPeriod,
@@ -999,16 +1179,47 @@ class OrderFlowTracker extends EventEmitter {
       threshold: this.rsi1sEntryThreshold,
       volume60sSol: round(volume60sSol, 4),
       volume60sUsd: round(volume60sUsd, 2),
-      emaTimeframeSeconds: 15,
-      emaFastPeriod: this.ema15sFastPeriod,
-      emaSlowPeriod: this.ema15sSlowPeriod,
-      emaReady: ema15sReady,
-      ema15sFast: Number.isFinite(ema15sFast) ? ema15sFast : null,
-      ema15sSlow: Number.isFinite(ema15sSlow) ? ema15sSlow : null,
+      volume60sFilterEnabled: false,
+      pullbackVolumeReady: pullbackVolume.ready,
+      pullbackVolumePassed: pullbackVolume.passed,
+      upVolumeAvgSol: pullbackVolume.upVolumeAvgSol ?? null,
+      downVolumeAvgSol: pullbackVolume.downVolumeAvgSol ?? null,
+      upVolumeAvgUsd: pullbackVolume.upVolumeAvgUsd ?? null,
+      downVolumeAvgUsd: pullbackVolume.downVolumeAvgUsd ?? null,
+      downUpVolumeRatio: pullbackVolume.downUpVolumeRatio ?? null,
+      upPhaseSeconds: pullbackVolume.upPhaseSeconds ?? null,
+      pullbackPhaseSeconds: pullbackVolume.pullbackPhaseSeconds ?? null,
+      upStartTs: pullbackVolume.upStartTs ?? null,
+      peakTs: pullbackVolume.peakTs ?? null,
+      pullbackEndTs: pullbackVolume.pullbackEndTs ?? null,
+      emaTimeframeSeconds: 1,
+      emaPeriod: this.ema1sPeriod,
+      emaSlopeLookbackSeconds: this.ema1sSlopeLookbackSeconds,
+      emaMinSlopePct: this.ema1sMinSlopePct,
+      emaReady: emaSlopeReady,
+      ema1s20: Number.isFinite(ema1s20) ? ema1s20 : null,
+      ema1s20Slope20sPct: Number.isFinite(ema1s20Slope20sPct) ? ema1s20Slope20sPct : null,
+      emaSlopePassed,
       signalCandleTs: signalBucketTs,
       signalCloseTs,
       executionPrice: ev.price,
     };
+    this._recordRsiBuyPoint(state, ev, entry, s60);
+
+    if (!pullbackVolume.ready || !pullbackVolume.passed) {
+      state.rsi1sStage = 'pullback-volume-blocked';
+      state.rsi1sWaitReason = pullbackVolume.ready
+        ? `pullback volume ratio ${pullbackVolume.downUpVolumeRatio}>1`
+        : pullbackVolume.reason;
+      return;
+    }
+    if (!emaSlopePassed) {
+      state.rsi1sStage = 'ema-slope-blocked';
+      state.rsi1sWaitReason =
+        `1s EMA${this.ema1sPeriod} ${this.ema1sSlopeLookbackSeconds}s slope ` +
+        `${ema1s20Slope20sPct.toFixed(3)}%<${this.ema1sMinSlopePct}%`;
+      return;
+    }
     const signal = {
       mint: ev.mint,
       symbol: state.symbol || ev.symbol,
@@ -1048,11 +1259,13 @@ class OrderFlowTracker extends EventEmitter {
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_1S ` +
         `RSI(${this.rsi1sPeriod})=${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} ` +
-        (ema15sReady
-          ? `EMA15s=${this.ema15sFastPeriod}:${ema15sFast.toExponential(4)}>` +
-            `${this.ema15sSlowPeriod}:${ema15sSlow.toExponential(4)} `
-          : `EMA15s=warmup-pass(${snapshot.rsi15sClosedBars || 0}/${this.ema15sSlowPeriod}) `) +
-        `vol60=$${volume60sUsd.toFixed(0)} execution=${ev.price}`,
+        `pullbackVol=${pullbackVolume.downVolumeAvgUsd.toFixed(0)}/` +
+          `${pullbackVolume.upVolumeAvgUsd.toFixed(0)}=${pullbackVolume.downUpVolumeRatio.toFixed(3)} ` +
+        (emaSlopeReady
+          ? `EMA${this.ema1sPeriod}Slope${this.ema1sSlopeLookbackSeconds}s=` +
+            `${ema1s20Slope20sPct.toFixed(3)}% `
+          : `EMA${this.ema1sPeriod}Slope=warmup-pass `) +
+        `vol60(observe)=$${volume60sUsd.toFixed(0)} execution=${ev.price}`,
     );
     this.emit('flowReversalSignal', signal);
   }

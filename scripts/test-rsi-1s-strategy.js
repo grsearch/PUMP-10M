@@ -10,7 +10,6 @@ Module._load = function loadWithDotenvStub(request, parent, isMain) {
   if (request === 'dotenv') return { config() {} };
   return originalLoad.call(this, request, parent, isMain);
 };
-const RsiCalculator = require('../src/core/RsiCalculator');
 const OrderFlowTracker = require('../src/core/OrderFlowTracker');
 const { config } = require('../src/config');
 Module._load = originalLoad;
@@ -18,23 +17,39 @@ Module._load = originalLoad;
 const BASE = 1_800_000_000_000;
 const FRAME_MS = 1_000;
 const MINT = 'Rsi1sTestMint1111111111111111111111111111';
-const CLOSES = [100, 90, 80, 70, 60, 50, 40, 35, 80, 75];
+const PRICES = [100, 102, 105, 110, 108, 106, 104, 105];
 
 function makeTracker(overrides = {}) {
-  return new OrderFlowTracker({
+  const token = {
+    mint: MINT,
+    symbol: 'RSI1',
+    fdv: 50_000,
+    liquidity: 8_000,
+    holders: 123,
+    migration_time: BASE - 120_000,
+  };
+  const observations = [];
+  const tracker = new OrderFlowTracker({
     entryMode: 'RSI_CROSS_1S',
     solPriceUsd: 100,
     rsi1sPeriod: 7,
     rsi1sEntryThreshold: 30,
     rsi1sVolumeWindowMs: 60_000,
-    rsi1sMinVolume60sUsd: 10_000,
+    rsi1sPhaseLookbackMs: 60_000,
+    ema1sPeriod: 20,
+    ema1sSlopeLookbackSeconds: 20,
+    ema1sMinSlopePct: -0.3,
     maxSignalAgeMs: 0,
     cooldownMs: 0,
+    tokenRegistry: { getToken: () => token },
+    tradeLogger: { logTokenEvent: (row) => observations.push(row) },
     ...overrides,
   });
+  tracker._testObservations = observations;
+  return tracker;
 }
 
-function event(index, price, solVolume = 20, suffix = '') {
+function event(index, price, solVolume = 1, suffix = '') {
   return {
     mint: MINT,
     symbol: 'RSI1',
@@ -52,176 +67,178 @@ function event(index, price, solVolume = 20, suffix = '') {
   };
 }
 
-function feed(calc, tracker, ev, snapshotOverrides = {}) {
-  calc.feedTrade(ev.mint, ev.price, ev.solVolume, ev.side.toLowerCase(), ev.ts, ev.poolQuoteAfter);
-  tracker.updateRsiSnapshot(ev.mint, {
-    ...calc.snapshot(ev.mint),
-    ema15sFastClosed: 101,
-    ema15sSlowClosed: 100,
-    rsi15sClosedBars: 20,
-    ...snapshotOverrides,
-  });
-  tracker.handleSwap(ev);
-}
-
-function runClosedCandleSignalTest() {
-  const calc = new RsiCalculator({ period1: 7 });
+function runScenario({
+  upVolume = 10,
+  pullbackVolume = 2,
+  emaSlope = 0,
+  emaReady = true,
+  suffix = '',
+} = {}) {
   const tracker = makeTracker();
   const signals = [];
   tracker.on('flowReversalSignal', (signal) => signals.push(signal));
 
-  CLOSES.slice(0, 9).forEach((price, index) => feed(calc, tracker, event(index, price)));
-  assert.strictEqual(signals.length, 0, 'an open 1s candle must not confirm itself');
+  const volumes = [1, upVolume, upVolume, upVolume, pullbackVolume, pullbackVolume, pullbackVolume, 1];
+  PRICES.forEach((price, index) => tracker.handleSwap(event(index, price, volumes[index], suffix)));
 
-  const confirmation = event(9, CLOSES[9]);
-  feed(calc, tracker, confirmation);
-  assert.strictEqual(signals.length, 1, 'the first trusted event after close must emit immediately');
+  const signalBucketTs = BASE + 7 * FRAME_MS;
+  tracker.updateRsiSnapshot(MINT, {
+    rsi1sPreviousClosed: 25,
+    rsi1sClosed: 35,
+    rsi1sLive: 36,
+    rsi1sClosedBars: 50,
+    rsi1sCurrentBucketTs: BASE + 8 * FRAME_MS,
+    rsi1sClosedBucketTs: signalBucketTs,
+    rsi1sLastClosedClose: PRICES[7],
+    ema1s20Closed: emaReady ? 105 : null,
+    ema1s20Slope20sPct: emaReady ? emaSlope : null,
+    ema1s20SlopeReady: emaReady,
+    rsi1sClosedCandles: PRICES.map((close, index) => ({
+      ts: BASE + index * FRAME_MS,
+      close,
+    })),
+  });
+  const confirmation = event(8, 106, 0.5, `${suffix}-confirm`);
+  tracker.handleSwap(confirmation);
+  return { tracker, signals, confirmation };
+}
+
+function runClosedCandleSignalTest() {
+  const { tracker, signals, confirmation } = runScenario({
+    upVolume: 10,
+    pullbackVolume: 2,
+    emaSlope: -0.1,
+    suffix: 'pass',
+  });
+  assert.strictEqual(signals.length, 1, 'a valid closed RSI pullback signal must emit immediately');
   const entry = signals[0]._flow.entryRsi1s;
   assert(entry.previousRsi <= 30);
   assert(entry.currentRsi > 30);
-  assert.strictEqual(entry.signalCandleTs, BASE + 8 * FRAME_MS);
-  assert.strictEqual(entry.signalCloseTs, BASE + 9 * FRAME_MS);
-  assert.strictEqual(entry.executionPrice, CLOSES[9]);
-  assert.strictEqual(entry.emaFastPeriod, 9);
-  assert.strictEqual(entry.emaSlowPeriod, 20);
-  assert.strictEqual(entry.emaReady, true);
-  assert(entry.ema15sFast > entry.ema15sSlow);
-  assert.strictEqual(Object.hasOwn(entry, 'entryCandleTs'), false);
-  assert.strictEqual(Object.hasOwn(entry, 'entryOpenPrice'), false);
-  assert(entry.volume60sUsd >= 10_000);
-
-  feed(calc, tracker, {
-    ...confirmation,
-    ts: confirmation.ts + 200,
-    signature: 'same-bucket-second-trade',
-  });
-  assert.strictEqual(signals.length, 1, 'a closed candle may signal only once');
-  const state = tracker.states.get(MINT);
-  assert.strictEqual(state.rsi1sInflight, true, 'emitting an RSI signal must lock the mint synchronously');
-
-  tracker.updateRsiSnapshot(MINT, {
-    ...state.rsi1sSnapshot,
-    rsi1sCurrentBucketTs: BASE + 10 * FRAME_MS,
-    rsi1sClosedBucketTs: BASE + 9 * FRAME_MS,
-    rsi1sPreviousClosed: 25,
-    rsi1sClosed: 35,
-  });
-  tracker.handleSwap(event(10, 76, 20, 'second-region'));
-  assert.strictEqual(
-    signals.length,
-    1,
-    'a second region callback must not emit another signal while the first buy is inflight',
+  assert.strictEqual(entry.signalCandleTs, BASE + 7 * FRAME_MS);
+  assert.strictEqual(entry.signalCloseTs, BASE + 8 * FRAME_MS);
+  assert.strictEqual(entry.executionPrice, 106);
+  assert.strictEqual(entry.pullbackVolumeReady, true);
+  assert.strictEqual(entry.pullbackVolumePassed, true);
+  assert.strictEqual(entry.upPhaseSeconds, 3);
+  assert.strictEqual(entry.pullbackPhaseSeconds, 3);
+  assert.strictEqual(entry.downUpVolumeRatio, 0.2);
+  assert.strictEqual(entry.emaPeriod, 20);
+  assert.strictEqual(entry.emaSlopeLookbackSeconds, 20);
+  assert.strictEqual(entry.ema1s20Slope20sPct, -0.1);
+  assert.strictEqual(entry.volume60sFilterEnabled, false);
+  assert(
+    entry.volume60sUsd < 10_000,
+    'a low trailing 60-second total must be recorded without blocking the entry',
   );
 
-  assert.strictEqual(tracker.clearRsi1sInflight(MINT), true);
-  tracker.updateRsiSnapshot(MINT, {
-    ...state.rsi1sSnapshot,
-    rsi1sCurrentBucketTs: BASE + 11 * FRAME_MS,
-    rsi1sClosedBucketTs: BASE + 10 * FRAME_MS,
-    rsi1sPreviousClosed: 25,
-    rsi1sClosed: 35,
+  tracker.handleSwap({
+    ...confirmation,
+    ts: confirmation.ts + 200,
+    signature: 'same-bucket-second-region',
   });
-  tracker.handleSwap(event(11, 77, 20, 'after-buy-complete'));
-  assert.strictEqual(signals.length, 2, 'clearing the buy lock must allow a later full RSI signal');
+  assert.strictEqual(signals.length, 1, 'the same closed candle may signal only once');
+  assert.strictEqual(tracker.states.get(MINT).rsi1sInflight, true);
+
+  const observation = tracker._testObservations[0];
+  assert.strictEqual(observation.eventType, 'RSI_BUY_POINT');
+  assert.strictEqual(observation.eventKey, 'pullback_v1');
+  assert.strictEqual(observation.details.downUpVolumeRatio, 0.2);
+  assert(Number.isFinite(observation.details.activeBuySellRatio60s));
+  assert.strictEqual(observation.details.holders, 123);
+  assert.strictEqual(observation.fdv, 50_000);
+  assert.strictEqual(observation.liquidity, 8_000);
+  assert.strictEqual(observation.ageMs, 128_100);
 
   const view = tracker.getStrategyCandidates(10, confirmation.ts);
   assert.strictEqual(view.mode, 'RSI_CROSS_1S');
   assert.strictEqual(view.candidates[0].stage, 'signaled');
+  assert.strictEqual(view.thresholds.volume60sFilterEnabled, false);
+  assert.strictEqual(view.thresholds.pullbackVolumeMaxRatio, 1);
+  assert.strictEqual(view.thresholds.emaTimeframeSeconds, 1);
+  assert.strictEqual(view.thresholds.emaPeriod, 20);
+  assert.strictEqual(view.thresholds.emaSlopeLookbackSeconds, 20);
+  assert.strictEqual(view.thresholds.emaMinSlopePct, -0.3);
+  assert.strictEqual(view.thresholds.emaWarmupPasses, true);
+  assert.strictEqual(view.candidates[0].downUpVolumeRatio, 0.2);
+  assert.strictEqual(view.candidates[0].ema1s20Slope20sPct, -0.1);
   assert.strictEqual(view.thresholds.trailingActivatePct, 10);
   assert.strictEqual(view.thresholds.trailingDrawdownPct, 5);
-  assert.strictEqual(view.thresholds.fdvExitThresholdUsd, 0);
-  assert.strictEqual(view.thresholds.ageExitMs, 15 * 60_000);
   assert.strictEqual(view.thresholds.maxHoldMs, 30_000);
-  assert.strictEqual(view.thresholds.addonDropPct, 15);
-  assert.strictEqual(view.thresholds.maxBuysPerMint, 2);
-  assert.strictEqual(view.thresholds.fixedStopLossPct, 0);
-  assert.strictEqual(view.thresholds.exitOverbought, 80);
-  assert.strictEqual(view.thresholds.exitCrossDown, 70);
-  assert.strictEqual(view.thresholds.emaTimeframeSeconds, 15);
-  assert.strictEqual(view.thresholds.emaFastPeriod, 9);
-  assert.strictEqual(view.thresholds.emaSlowPeriod, 20);
-  assert.strictEqual(view.thresholds.emaWarmupPasses, true);
-  assert.strictEqual(view.candidates[0].ema15sFast, 101);
-  assert.strictEqual(view.candidates[0].ema15sSlow, 100);
 }
 
-function runEmaGateTests() {
-  const bearishCalc = new RsiCalculator({ period1: 7 });
-  const bearish = makeTracker();
-  const bearishSignals = [];
-  bearish.on('flowReversalSignal', (signal) => bearishSignals.push(signal));
-  CLOSES.forEach((price, index) => feed(
-    bearishCalc,
-    bearish,
-    event(index, price, 20, 'ema-bearish'),
-    { ema15sFastClosed: 99, ema15sSlowClosed: 100 },
-  ));
-  assert.strictEqual(bearishSignals.length, 0);
-  assert.strictEqual(bearish.states.get(MINT).rsi1sStage, 'ema-blocked');
-  assert.match(bearish.states.get(MINT).rsi1sWaitReason, /EMA9 .*<= EMA20/);
-
-  const warmingCalc = new RsiCalculator({ period1: 7 });
-  const warming = makeTracker();
-  const warmingSignals = [];
-  warming.on('flowReversalSignal', (signal) => warmingSignals.push(signal));
-  CLOSES.forEach((price, index) => feed(
-    warmingCalc,
-    warming,
-    event(index, price, 20, 'ema-warming'),
-    { ema15sFastClosed: null, ema15sSlowClosed: null, rsi15sClosedBars: 19 },
-  ));
-  assert.strictEqual(
-    warmingSignals.length,
-    1,
-    'insufficient 15-second history must pass instead of blocking a valid RSI/volume signal',
-  );
-  assert.strictEqual(warmingSignals[0]._flow.entryRsi1s.emaReady, false);
-  assert.strictEqual(warmingSignals[0]._flow.entryRsi1s.ema15sFast, null);
-  assert.strictEqual(warmingSignals[0]._flow.entryRsi1s.ema15sSlow, null);
-}
-
-function runVolumeGateTests() {
-  const blockedCalc = new RsiCalculator({ period1: 7 });
-  const blocked = makeTracker();
-  const blockedSignals = [];
-  blocked.on('flowReversalSignal', (signal) => blockedSignals.push(signal));
-  CLOSES.forEach((price, index) => feed(blockedCalc, blocked, event(index, price, 5, 'blocked')));
-  assert.strictEqual(blockedSignals.length, 0);
-  assert.strictEqual(blocked.states.get(MINT).rsi1sStage, 'volume-blocked');
-  assert.strictEqual(blocked.states.get(MINT).rsi1sVolume60sUsd, 4_500);
-
-  const exactCalc = new RsiCalculator({ period1: 7 });
-  const exact = makeTracker();
-  const exactSignals = [];
-  exact.on('flowReversalSignal', (signal) => exactSignals.push(signal));
-  CLOSES.slice(0, 9).forEach((price, index) => feed(exactCalc, exact, event(index, price, 10, 'exact')));
-  exact.handleVolumeSwap({
-    mint: MINT,
-    symbol: 'RSI1',
-    side: 'BUY',
-    solVolume: 10,
-    ts: BASE + 8 * FRAME_MS + 200,
+function runPullbackVolumeGateTests() {
+  const blocked = runScenario({
+    upVolume: 2,
+    pullbackVolume: 4,
+    suffix: 'expanded-pullback',
   });
-  feed(exactCalc, exact, event(9, CLOSES[9], 10, 'exact'));
-  assert.strictEqual(exactSignals.length, 1, 'true volume must pass at the exact $10k boundary');
-  assert.strictEqual(exactSignals[0]._flow.entryRsi1s.volume60sUsd, 10_000);
+  assert.strictEqual(blocked.signals.length, 0);
+  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sStage, 'pullback-volume-blocked');
+  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sPullbackVolume.downUpVolumeRatio, 2);
+  assert.strictEqual(
+    blocked.tracker._testObservations.length,
+    1,
+    'filtered RSI buy points must still be written to the observation dataset',
+  );
+
+  const exact = runScenario({
+    upVolume: 3,
+    pullbackVolume: 3,
+    suffix: 'equal-volume',
+  });
+  assert.strictEqual(exact.signals.length, 1, 'equal pullback and up-phase average volume must pass');
+  assert.strictEqual(exact.signals[0]._flow.entryRsi1s.downUpVolumeRatio, 1);
+
+  const coldTracker = makeTracker();
+  const coldState = coldTracker._stateOf(MINT);
+  const coldResult = coldTracker._analyzePullbackVolume(coldState, {
+    rsi1sClosedCandles: PRICES.map((close, index) => ({
+      ts: BASE + index * FRAME_MS,
+      close,
+      solVolume: [1, 10, 10, 10, 2, 2, 2, 1][index],
+    })),
+  }, BASE + 7 * FRAME_MS);
+  assert.strictEqual(
+    coldResult.downUpVolumeRatio,
+    0.2,
+    'database-prewarmed candle volume must protect pullback analysis immediately after restart',
+  );
+}
+
+function runEmaSlopeGateTests() {
+  const blocked = runScenario({ emaSlope: -0.301, suffix: 'ema-blocked' });
+  assert.strictEqual(blocked.signals.length, 0);
+  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sStage, 'ema-slope-blocked');
+  assert.match(blocked.tracker.states.get(MINT).rsi1sWaitReason, /-0\.301%<-0\.3%/);
+
+  const boundary = runScenario({ emaSlope: -0.3, suffix: 'ema-boundary' });
+  assert.strictEqual(boundary.signals.length, 1, 'a 0.3% EMA20 decline is still allowed');
+
+  const warming = runScenario({ emaReady: false, suffix: 'ema-warmup' });
+  assert.strictEqual(
+    warming.signals.length,
+    1,
+    'insufficient EMA20 slope history must preserve the existing warmup-pass behavior',
+  );
+  assert.strictEqual(warming.signals[0]._flow.entryRsi1s.emaReady, false);
+  assert.strictEqual(warming.signals[0]._flow.entryRsi1s.ema1s20Slope20sPct, null);
 }
 
 function runDefaultsTest() {
   assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_1S');
   assert.strictEqual(config.activityFlow.rsi1sPeriod, 7);
   assert.strictEqual(config.activityFlow.rsi1sEntryThreshold, 30);
-  assert.strictEqual(config.activityFlow.rsi1sMinVolume60sUsd, 10_000);
-  assert.strictEqual(config.activityFlow.ema15sFastPeriod, 9);
-  assert.strictEqual(config.activityFlow.ema15sSlowPeriod, 20);
+  assert.strictEqual(config.activityFlow.rsi1sPhaseLookbackMs, 60_000);
+  assert.strictEqual(config.activityFlow.ema1sPeriod, 20);
+  assert.strictEqual(config.activityFlow.ema1sSlopeLookbackSeconds, 20);
+  assert.strictEqual(config.activityFlow.ema1sMinSlopePct, -0.3);
+  assert.strictEqual(Object.hasOwn(config.activityFlow, 'rsi1sMinVolume60sUsd'), false);
+  assert.strictEqual(Object.hasOwn(config.activityFlow, 'ema15sFastPeriod'), false);
+  assert.strictEqual(Object.hasOwn(config.activityFlow, 'ema15sSlowPeriod'), false);
   assert.strictEqual(config.strategy.positionSizeSol, 0.2);
   assert.strictEqual(config.strategy.trailingActivatePct, 10);
   assert.strictEqual(config.strategy.trailingDrawdownPct, 5);
   assert.strictEqual(config.strategy.maxHoldMs, 30_000);
-  assert.strictEqual(config.strategy.fdvExitThresholdUsd, 0);
-  assert.strictEqual(config.strategy.ageExitMs, 15 * 60_000);
-  assert.strictEqual(config.strategy.addonDropPct, 15);
-  assert.strictEqual(config.strategy.maxBuysPerMint, 2);
   assert.strictEqual(config.strategy.fixedStopLossPct, 0);
   assert.strictEqual(config.strategy.rsi1sExitEnabled, true);
   assert.strictEqual(config.strategy.rsi1sOverboughtExit, 80);
@@ -232,24 +249,18 @@ function runDefaultsTest() {
 function runDashboardContractTest() {
   for (const filename of ['dashboard.html', 'index.html']) {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'public', filename), 'utf8');
-    assert(html.includes('1s RSI Strategy'));
+    assert(html.includes('1s RSI Pullback V1'));
     assert(html.includes('已收盘 1s K'));
-    assert(html.includes('15s EMA9'));
-    assert(html.includes('15s EMA20'));
-    assert(html.includes('已收盘 15s EMA'));
+    assert(html.includes('上涨均量'));
+    assert(html.includes('回调均量'));
+    assert(html.includes('EMA20 20s斜率'));
+    assert(html.includes('近60s量(仅记录)'));
+    assert(html.includes('回调 ≤ 上涨'));
+    assert(html.includes('仅记录，不过滤'));
     assert(html.includes('预热不足放行'));
-    assert(html.includes('近 60s 真实成交量'));
-    assert(html.includes('FDV退出关闭'));
-    assert(html.includes('AGE ≥'));
-    assert(html.includes('固定止损'));
-    assert(html.includes('最多 ${thresholds.maxBuysPerMint'));
-    assert(html.includes('无卖后冷却'));
-    assert(html.includes('全部平仓后新信号可立即重入'));
-    assert(!html.includes('下一可成交 K 开盘'));
-    assert(html.includes('移动止盈激活后屏蔽'));
-    assert(html.includes('最长持仓'));
-    assert(!html.includes('最大持仓'));
-    assert(!html.includes('stat-hold'));
+    assert(!html.includes('15s EMA9'));
+    assert(!html.includes('15s EMA20'));
+    assert(!html.includes('rsi1sMinVolume60sUsd'));
     const inlineScripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)]
       .map((match) => match[1].trim())
       .filter(Boolean);
@@ -258,8 +269,8 @@ function runDashboardContractTest() {
 }
 
 runClosedCandleSignalTest();
-runEmaGateTests();
-runVolumeGateTests();
+runPullbackVolumeGateTests();
+runEmaSlopeGateTests();
 runDefaultsTest();
 runDashboardContractTest();
-console.log('1s RSI entry/exit strategy tests: PASS');
+console.log('1s RSI pullback V1 strategy tests: PASS');

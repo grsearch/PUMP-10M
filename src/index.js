@@ -69,11 +69,10 @@ async function main() {
   );
   console.log(
     `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
-      `${config.activityFlow.rsi1sEntryThreshold}, closed 15s ` +
-      `EMA${config.activityFlow.ema15sFastPeriod}>EMA${config.activityFlow.ema15sSlowPeriod}` +
-      ` (warmup passes), trailing ` +
-      `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s real volume>=` +
-      `$${config.activityFlow.rsi1sMinVolume60sUsd}, execute immediately after confirmation`,
+      `${config.activityFlow.rsi1sEntryThreshold}, pullback average volume<=up-phase average volume, ` +
+      `EMA${config.activityFlow.ema1sPeriod} ${config.activityFlow.ema1sSlopeLookbackSeconds}s slope>=` +
+      `${config.activityFlow.ema1sMinSlopePct}% (warmup passes); ` +
+      `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s total volume is observation-only`,
   );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
@@ -173,15 +172,15 @@ async function main() {
     period1: config.activityFlow.rsi1sPeriod,
     period5: 7,
     period15: 7,
-    ema15sFastPeriod: config.activityFlow.ema15sFastPeriod,
-    ema15sSlowPeriod: config.activityFlow.ema15sSlowPeriod,
+    ema1sPeriod: config.activityFlow.ema1sPeriod,
+    ema1sSlopeLookbackSeconds: config.activityFlow.ema1sSlopeLookbackSeconds,
     period60: config.activityFlow.rsi1mPeriod,
     priceScaleResetRatio: config.activityFlow.rsiPriceScaleResetRatio,
   });
   if (rsiCalculator) {
     console.log(
-      `[main] RSI calculator enabled for closed 1s entry/exit and closed 15s ` +
-        `EMA(${config.activityFlow.ema15sFastPeriod},${config.activityFlow.ema15sSlowPeriod}) entry filter`,
+      `[main] RSI calculator enabled for closed 1s entry/exit and ` +
+        `EMA${config.activityFlow.ema1sPeriod} ${config.activityFlow.ema1sSlopeLookbackSeconds}s slope`,
     );
     setInterval(() => rsiCalculator.cleanup(), 60_000);
 
@@ -260,7 +259,7 @@ async function main() {
     followSellMinWinRate: parseFloat(process.env.COMPETITOR_FOLLOW_SELL_MIN_WINRATE || '60'),
     followSellMinClosed: parseInt(process.env.COMPETITOR_FOLLOW_SELL_MIN_CLOSED || '10', 10),
   });
-  const activityFlowTracker = new ActivityFlowTracker({ tokenRegistry });
+  const activityFlowTracker = new ActivityFlowTracker({ tokenRegistry, tradeLogger });
   const featureRecorder = new FeatureRecorder({ tradeLogger, tokenRegistry });
   featureRecorder.start();
   const swapSanitizer = dumpDetector.swapEventSanitizer;
@@ -274,8 +273,9 @@ async function main() {
     `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
       `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi1sPeriod}) ` +
       `cross>${activityFlowTracker.rsi1sEntryThreshold} ` +
-      `vol${activityFlowTracker.rsi1sVolumeWindowMs / 1000}s>=` +
-      `$${activityFlowTracker.rsi1sMinVolume60sUsd} immediate-confirmation ` +
+      `pullbackVol<=upVol EMA${activityFlowTracker.ema1sPeriod}Slope` +
+      `${activityFlowTracker.ema1sSlopeLookbackSeconds}s>=${activityFlowTracker.ema1sMinSlopePct}% ` +
+      `vol${activityFlowTracker.rsi1sVolumeWindowMs / 1000}s=observe-only ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(
