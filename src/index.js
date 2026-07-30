@@ -64,15 +64,22 @@ async function main() {
       `cross below ${config.strategy.rsi1sCrossDownExit}; disabled after trailing arms`,
   );
   console.log(
+    config.strategy.noRecoveryExitEnabled
+      ? `No-recovery exit: after ${config.strategy.noRecoveryExitMs / 1000}s, ` +
+        `pnl<=${config.strategy.noRecoveryMaxCurrentPnlPct}%, ` +
+        `peak<=+${config.strategy.noRecoveryMaxPeakPnlPct}%, ` +
+        `live RSI<=${config.strategy.noRecoveryMaxLiveRsi}; one-shot before trailing`
+      : 'No-recovery exit: disabled',
+  );
+  console.log(
     `Forced exits: max hold ${config.strategy.maxHoldMs / 1000}s / ` +
       `migration AGE >= ${config.strategy.ageExitMs / 60_000}min / FDV disabled`,
   );
   console.log(
     `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
-      `${config.activityFlow.rsi1sEntryThreshold}, pullback average volume<=up-phase average volume, ` +
-      `EMA${config.activityFlow.ema1sPeriod} ${config.activityFlow.ema1sSlopeLookbackSeconds}s slope>=` +
-      `${config.activityFlow.ema1sMinSlopePct}% (warmup passes); ` +
-      `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s total volume is observation-only`,
+      `${config.activityFlow.rsi1sEntryThreshold}, live RSI<=${config.activityFlow.rsi1sLiveMax}; ` +
+      `pullback volume, EMA${config.activityFlow.ema1sPeriod}, and ` +
+      `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s total volume are observation-only`,
   );
   console.log(config.strategy.flowReversalExitEnabled
     ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
@@ -94,10 +101,7 @@ async function main() {
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
       `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms`,
   );
-  console.log(
-    `Add-on: one qualifying add-on at -${config.strategy.addonDropPct}% from initial entry; ` +
-      `max ${config.strategy.maxBuysPerMint} concurrent legs per mint; immediate re-entry after full close`,
-  );
+  console.log('Entry frequency: one successful position per mint for its full persisted history');
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
   console.log(`Pump graduation discovery: ${config.pumpDiscovery.enabled ? 'enabled' : 'disabled'}`);
   console.log('================================================');
@@ -272,9 +276,8 @@ async function main() {
   console.log(
     `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
       `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi1sPeriod}) ` +
-      `cross>${activityFlowTracker.rsi1sEntryThreshold} ` +
-      `pullbackVol<=upVol EMA${activityFlowTracker.ema1sPeriod}Slope` +
-      `${activityFlowTracker.ema1sSlopeLookbackSeconds}s>=${activityFlowTracker.ema1sMinSlopePct}% ` +
+      `cross>${activityFlowTracker.rsi1sEntryThreshold} live<=${activityFlowTracker.rsi1sLiveMax} ` +
+      `pullbackVol/EMA${activityFlowTracker.ema1sPeriod}/` +
       `vol${activityFlowTracker.rsi1sVolumeWindowMs / 1000}s=observe-only ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );

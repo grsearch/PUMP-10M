@@ -22,7 +22,7 @@ used to backfill its migration AGE even when that pair does not yet expose compl
 FDV/LP data. Legacy `WATCHDOG_CHECK_INTERVAL_MS` values above one minute are clamped
 to `60000`.
 
-Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 1 秒 RSI(7) 从 ≤30 上穿 >30、动态回调阶段平均成交量不高于此前上涨阶段、且 1 秒 EMA20 在过去 20 秒内下降不超过 0.3%**；EMA 预热不足时放行，60 秒总成交量只记录、不再过滤，默认每笔仓位为 `0.2 SOL`。
+Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收盘 1 秒 RSI(7) 从 ≤30 上穿 >30，并且触发时实时 1 秒 RSI(7) ≤50**。回调/上涨阶段成交量、EMA20 和60秒总成交量只记录、不参与过滤；每个代币只允许成功开仓一次，默认仓位为 `0.2 SOL`。
 
 ## 当前买入策略
 
@@ -30,16 +30,16 @@ Solana / Pump.fun 短线交易机器人。当前默认买入策略是 **已收�
 
 - RSI 周期为 `7`，只用已经收盘的 1 秒 K 线确认信号。
 - 上一根已收盘 RSI `<=30`、最新已收盘 RSI `>30`，构成从下向上突破 30。
-- 在最近最多 60 秒的已收盘 1 秒 K 线里动态识别“最近低点 → 峰值 → 回调”，分别计算上涨阶段与回调阶段的逐秒平均真实成交量，要求 `DownVolume <= UpVolume`；这不是两个固定时间窗的比较。
-- 已预热时，1 秒 EMA20 在过去 20 秒的斜率必须 `>= -0.3%`；历史不足时放行并记录为预热状态。
+- 触发交易到达时，实时 1 秒 RSI(7) 必须 `<=50`；实时 RSI 缺失或超过50时拒绝。
+- 回调/上涨阶段平均成交量和 1 秒 EMA20 最近20秒斜率继续记录，但不参与买入过滤。
 - 信号收盘前 `60 秒`真实买卖总成交量继续记录，但不参与买入过滤。
 - 收盘信号得到确认后立即进入现有实盘下单链路，不增加额外等待。
-- 每次 RSI 上穿买点（包括被两项过滤器拦截的买点）都会写入 `RSI_BUY_POINT` 观测事件，保存回调/上涨量比、EMA20 斜率、60 秒主动买卖比、Holder 及其相对上次买点变化、LP、FDV、AGE 等字段；这些扩展字段不参与 V1 买卖判断。
+- 每次 RSI 上穿买点都会写入 `RSI_BUY_POINT` 观测事件，保存实时RSI、回调/上涨量比、EMA20斜率、60秒主动买卖比、Holder及其相对上次买点变化、LP、FDV、AGE等字段；这些扩展字段除实时RSI上限外均不参与买入判断。
 
 默认入口日志应显示：
 
 ```text
-Entry: closed RSI(7,1s) cross above 30, pullback average volume <= up-phase average volume, EMA20 20s slope >= -0.3% (warmup passes), trailing 60s volume observe-only
+Entry: closed RSI(7,1s) cross above 30, live RSI<=50; pullback volume, EMA20, and 60s volume are observation-only
 Legacy dumpSignal: suppressed
 [main] ActivityFlow enabled: mode=RSI_CROSS_1S ... immediate-confirmation ...
 ```
@@ -52,8 +52,7 @@ Legacy dumpSignal: suppressed
 - FDV 跌破 `$20,000` 的强制卖出关闭。
 - 最长持仓 `30 秒`：每笔仓位到时立即卖出。
 - 代币迁移 AGE 达到 `15 分钟`：全部未平仓仓位逐笔立即卖出，全部确认成交后移出监控。
-- 首仓价格下跌至少 `15%` 且再次出现完整买入信号时，允许加仓一次；首仓与加仓仓位独立管理，同币同时最多两笔持仓。
-- 全部持仓卖出确认后，同币可在下一次完整新信号立即重新买入；没有卖后冷静期，也没有“历史只允许买入一次”的限制。
+- 每个代币只允许一次成功开仓；不加仓，卖出后也不再重新买入。该限制从持久化的 `positions` 记录恢复，服务重启不会重置。
 - 买入处理中仍使用瞬时防重复锁，执行失败保护也继续独立生效；二者都不是卖后冷静期。
 
 ## 监控列表过滤
@@ -70,6 +69,16 @@ TokenWatchdog 默认每 1 分钟巡检一次 FDV 和 LP：
 ## 数据留存
 
 默认开启 `SWAP_EVENT_LOG_ENABLED=true`。程序会把每一笔已解析的监控币实时 swap 写入 SQLite 的 `swap_events` 表，后续可以基于这张表离线重算窗口并回测阈值。
+
+### 10-second failed-bounce exit
+
+Each position is evaluated once on the first fresh live 1-second RSI observation
+after 10 seconds. `NO_RECOVERY_10S` sells only when trailing has not armed,
+current PnL is at or below `-1%`, the post-stabilization maximum favorable
+excursion relative to the real fill never exceeded `+1%`, and live RSI(7) is
+at or below `50`. Ignoring stabilization prices prevents the bot's own AMM
+price impact from creating a false peak. The timer, real fill price, MFE, and
+evaluation state are independent for each same-mint leg.
 
 ## Strategy Lab
 

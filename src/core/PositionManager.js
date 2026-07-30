@@ -224,13 +224,16 @@ class PositionManager extends EventEmitter {
     this._exitForCondition(pos, price, 'FLOW_REVERSAL_EXIT');
   }
 
-  // A second qualifying signal may add one independent leg only after price
-  // has fallen at least 15% from the still-open initial entry.
+  // Kept for compatibility with legacy callers. The current production policy
+  // is one successful entry per mint, so add-ons are always rejected.
   canAddOn(mint, currentPrice) {
+    if (config.strategy.oneBuyPerMint) {
+      return { allowed: false, reason: 'one_buy_per_mint' };
+    }
     const pids = this.byMint.get(mint);
     if (!pids || pids.size === 0) return { allowed: false, reason: 'no_initial_position' };
     if (pids.size >= config.strategy.maxBuysPerMint) {
-      return { allowed: false, reason: 'max_two_buys_reached' };
+      return { allowed: false, reason: 'max_buys_per_mint_reached' };
     }
 
     const active = [...pids]
@@ -308,8 +311,61 @@ class PositionManager extends EventEmitter {
     this._exit(pos, price, reason);
   }
 
+  _maybeNoRecoveryExit(pos, price, liveRsi, now = Date.now()) {
+    const s = config.strategy;
+    if (!s.noRecoveryExitEnabled) return false;
+    if (!pos || pos.exiting || pos.status === 'stuck') return false;
+    if (!pos.reconciled && !pos.dryRun) return false;
+    if (pos.stabilizing || pos.trailingArmed || pos.noRecoveryEvaluated) return false;
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(pos.entryPrice) || pos.entryPrice <= 0) {
+      return false;
+    }
+    if (!Number.isFinite(liveRsi)) return false;
+
+    const holdStart = pos.openedAt || pos.reconciledAt || now;
+    const holdMs = now - holdStart;
+    if (holdMs < s.noRecoveryExitMs) return false;
+
+    const observedPeak = Number(pos.noRecoveryHighWaterMark);
+    const peakPrice = Math.max(
+      pos.entryPrice,
+      Number.isFinite(observedPeak) ? observedPeak : pos.entryPrice,
+      price,
+    );
+    pos.noRecoveryHighWaterMark = peakPrice;
+    pos.noRecoveryEvaluated = true;
+    pos.noRecoveryEvaluatedAt = now;
+
+    const currentPnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+    const peakPnlPct = ((peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const shouldExit =
+      currentPnlPct <= s.noRecoveryMaxCurrentPnlPct &&
+      peakPnlPct <= s.noRecoveryMaxPeakPnlPct &&
+      liveRsi <= s.noRecoveryMaxLiveRsi;
+
+    monitor.inc('PositionManager.noRecoveryEvaluated', 1, 'PositionManager');
+    if (!shouldExit) {
+      monitor.inc('PositionManager.noRecoveryPassed', 1, 'PositionManager');
+      return false;
+    }
+
+    console.log(
+      `[PositionManager] NO_RECOVERY_10S ${pos.symbol || pos.mint.slice(0, 6)} ` +
+        `pnl=${currentPnlPct.toFixed(2)}%<=${s.noRecoveryMaxCurrentPnlPct}% ` +
+        `peak=${peakPnlPct.toFixed(2)}%<=${s.noRecoveryMaxPeakPnlPct}% ` +
+        `RSI1s=${liveRsi.toFixed(2)}<=${s.noRecoveryMaxLiveRsi} ` +
+        `age=${(holdMs / 1000).toFixed(2)}s position=${pos.positionId.slice(0, 8)}`,
+    );
+    monitor.inc('PositionManager.NO_RECOVERY_10S', 1, 'PositionManager');
+    this._exitForCondition(pos, price, 'NO_RECOVERY_10S');
+    return true;
+  }
+
   handleRsiForExit(mint, price, snapshot) {
-    if (!config.strategy.rsi1sExitEnabled) return false;
+    if (
+      !config.strategy.rsi1sExitEnabled &&
+      !config.strategy.noRecoveryExitEnabled
+    ) return false;
     const pids = this.byMint.get(mint);
     if (!pids || pids.size === 0) return false;
 
@@ -329,51 +385,60 @@ class PositionManager extends EventEmitter {
       : latestClosed;
     this._rsi1sLastLiveByMint.set(mint, currentRsi);
 
-    let reason = null;
-    if (currentRsi > config.strategy.rsi1sOverboughtExit) {
-      reason = 'RSI_1S_OVERBOUGHT';
-    } else if (
-      Number.isFinite(previousRsi) &&
-      previousRsi >= config.strategy.rsi1sCrossDownExit &&
-      currentRsi < config.strategy.rsi1sCrossDownExit
-    ) {
-      reason = 'RSI_1S_CROSS_DOWN';
-    }
-    if (!reason) return false;
-
-    const hasRsiEligibleLeg = [...pids].some((pid) => {
-      const pos = this.positions.get(pid);
-      return pos && !pos.exiting && pos.status !== 'stuck' && !pos.trailingArmed;
-    });
-    if (!hasRsiEligibleLeg) return false;
-
     let exited = 0;
     let trailingProtected = 0;
-    for (const pid of pids) {
-      const pos = this.positions.get(pid);
-      if (!pos || pos.exiting || pos.status === 'stuck') continue;
-      if (pos.trailingArmed) {
-        trailingProtected++;
-        continue;
+    let reason = null;
+    if (config.strategy.rsi1sExitEnabled) {
+      if (currentRsi > config.strategy.rsi1sOverboughtExit) {
+        reason = 'RSI_1S_OVERBOUGHT';
+      } else if (
+        Number.isFinite(previousRsi) &&
+        previousRsi >= config.strategy.rsi1sCrossDownExit &&
+        currentRsi < config.strategy.rsi1sCrossDownExit
+      ) {
+        reason = 'RSI_1S_CROSS_DOWN';
       }
-      exited++;
-      this._exitForCondition(pos, price, reason);
+      if (reason) {
+        for (const pid of pids) {
+          const pos = this.positions.get(pid);
+          if (!pos || pos.exiting || pos.status === 'stuck') continue;
+          if (pos.trailingArmed) {
+            trailingProtected++;
+            continue;
+          }
+          exited++;
+          this._exitForCondition(pos, price, reason);
+        }
+      }
     }
 
-    const symbol = [...pids]
-      .map((pid) => this.positions.get(pid)?.symbol)
-      .find(Boolean) || mint.slice(0, 6);
-    console.log(
-      `[PositionManager] ${reason} ${symbol} ` +
-        `RSI1s=${Number.isFinite(previousRsi) ? previousRsi.toFixed(2) : 'n/a'}->` +
-        `${currentRsi.toFixed(2)} ` +
-        `exited=${exited} trailingProtected=${trailingProtected}`,
-    );
-    monitor.inc(`PositionManager.${reason}`, exited, 'PositionManager');
-    if (trailingProtected > 0) {
-      monitor.inc('PositionManager.rsi1sExitSkippedTrailingArmed', trailingProtected, 'PositionManager');
+    if (reason) {
+      const symbol = [...pids]
+        .map((pid) => this.positions.get(pid)?.symbol)
+        .find(Boolean) || mint.slice(0, 6);
+      console.log(
+        `[PositionManager] ${reason} ${symbol} ` +
+          `RSI1s=${Number.isFinite(previousRsi) ? previousRsi.toFixed(2) : 'n/a'}->` +
+          `${currentRsi.toFixed(2)} ` +
+          `exited=${exited} trailingProtected=${trailingProtected}`,
+      );
+      monitor.inc(`PositionManager.${reason}`, exited, 'PositionManager');
+      if (trailingProtected > 0) {
+        monitor.inc('PositionManager.rsi1sExitSkippedTrailingArmed', trailingProtected, 'PositionManager');
+      }
     }
-    return exited > 0;
+
+    let noRecoveryExited = 0;
+    if (config.strategy.noRecoveryExitEnabled) {
+      const now = Date.now();
+      for (const pid of pids) {
+        const pos = this.positions.get(pid);
+        if (this._maybeNoRecoveryExit(pos, price, currentRsi, now)) {
+          noRecoveryExited++;
+        }
+      }
+    }
+    return exited + noRecoveryExited > 0;
   }
 
   openPositionCount() {
@@ -470,6 +535,13 @@ class PositionManager extends EventEmitter {
         // v3.17.21: 从 DB 恢复 peak_price，避免重启丢失高点
         highWaterMark: row.peak_price > 0 ? row.peak_price : row.entry_price,
         highWaterMarkTs: row.peak_ts || Date.now(),
+        // Preserve a separate true-fill MFE for the one-shot 10s
+        // failed-recovery check. Stabilization may reset the trailing HWM.
+        noRecoveryHighWaterMark: Math.max(
+          Number(row.peak_price) || 0,
+          Number(row.entry_price) || 0,
+        ),
+        noRecoveryEvaluated: false,
         // v3.17.27: 有 peak_price 时根据已恢复的 HWM 重新评估 trailingArmed
         //   避免重启后又要重新涨8%才能激活（之前的高点白攒了）
         //   v3.20: 使用 DB 中的 pre_vol_5m_pct 决定 activate 阈值
@@ -568,6 +640,8 @@ class PositionManager extends EventEmitter {
       // v3.17: 移动止盈追踪
       highWaterMark: entryPrice,
       highWaterMarkTs: Date.now(),
+      noRecoveryHighWaterMark: entryPrice,
+      noRecoveryEvaluated: false,
       trailingArmed: false,
       // v3.17.6: stabilization 期
       //   DRY_RUN：开仓即进入 stabilization(用估算价格作起点)
@@ -964,6 +1038,9 @@ class PositionManager extends EventEmitter {
     //              作为 trailing 的新起点。
     pos.highWaterMark = pos.entryPrice;
     pos.highWaterMarkTs = Date.now();
+    pos.noRecoveryHighWaterMark = pos.entryPrice;
+    pos.noRecoveryEvaluated = false;
+    pos.noRecoveryEvaluatedAt = null;
     pos.trailingArmed = false;
     pos._tpConfirmCount = 0;
     pos._tpFirstTriggerTs = null;
@@ -1182,6 +1259,7 @@ class PositionManager extends EventEmitter {
           //   实测：baseline 比 entryPrice 低 2-5% 时，实际需要涨 10-13% 才触发 8% arm
           pos.highWaterMark = Math.max(baseline, pos.entryPrice);
           pos.highWaterMarkTs = Date.now();
+          pos.noRecoveryHighWaterMark = pos.highWaterMark;
           pos.stabilizing = false;
           pos._stabilizeSamples = null;
           pos.baselinePrice = baseline; // v3.17.15: 记录稳定期结束时的实际价格
@@ -1541,6 +1619,18 @@ class PositionManager extends EventEmitter {
     pos._lastTickPrice = price;
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
 
+    // Track failed-bounce MFE independently from the trailing HWM, but start
+    // only after stabilization. The post-buy AMM spot is temporarily lifted
+    // by our own order and must not count as a genuine favorable excursion.
+    if (!pos.stabilizing) {
+      const noRecoveryPeak = Number(pos.noRecoveryHighWaterMark);
+      pos.noRecoveryHighWaterMark = Math.max(
+        pos.entryPrice,
+        Number.isFinite(noRecoveryPeak) ? noRecoveryPeak : pos.entryPrice,
+        price,
+      );
+    }
+
     // Keep the trusted live-FDV path behind an explicit positive threshold.
     // The production threshold is currently zero, so FDV cannot force a sell.
     const solPriceUsd = config.priceFilter.swapSanitizer.solPriceUsd;
@@ -1659,6 +1749,7 @@ class PositionManager extends EventEmitter {
         // v3.17.26: HWM = max(baseline, entryPrice) — 同上 tick-timeout 分支的修复
         pos.highWaterMark = Math.max(baseline, pos.entryPrice);
         pos.highWaterMarkTs = Date.now();
+        pos.noRecoveryHighWaterMark = pos.highWaterMark;
         pos.stabilizing = false;
         pos._stabilizeSamples = null; // 释放内存
         pos.baselinePrice = baseline; // v3.17.15: 记录稳定期结束时的实际价格

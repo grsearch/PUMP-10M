@@ -68,20 +68,38 @@ const config = {
     // Ignore stale server env values that previously added a hidden delay.
     trailingMinHwmAgeMs: 0,
 
-    // Timed/AGE exits and concurrent-leg policy. The cap applies only while
-    // positions are open; after all legs close, a fresh signal may buy again.
+    // Timed/AGE exits and one-buy-per-mint policy. A successful position row
+    // permanently consumes the mint's only entry, including across restarts.
     // FDV and fixed-stop exits are explicitly disabled.
     fdvExitThresholdUsd: 0,
     ageExitMs: 15 * 60 * 1000,
     maxHoldMs: 30_000,
     addonDropPct: 15,
-    maxBuysPerMint: 2,
+    maxBuysPerMint: 1,
+    oneBuyPerMint: true,
 
     // Before trailing is armed, live 1-second RSI can close each leg.
     // Once a leg arms trailing, RSI exits are permanently ignored for that leg.
     rsi1sExitEnabled: true,
     rsi1sOverboughtExit: 80,
     rsi1sCrossDownExit: 70,
+
+    // One-shot failed-bounce exit. At the first fresh RSI observation after
+    // 10 seconds, exit an unarmed leg only when it is still down at least 1%,
+    // never traded more than 1% above its real fill after stabilization, and
+    // live RSI is <= 50.
+    noRecoveryExitEnabled:
+      (process.env.NO_RECOVERY_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
+    noRecoveryExitMs: parseInt(process.env.NO_RECOVERY_EXIT_MS || '10000', 10),
+    noRecoveryMaxCurrentPnlPct: parseFloat(
+      process.env.NO_RECOVERY_MAX_CURRENT_PNL_PCT || '-1',
+    ),
+    noRecoveryMaxPeakPnlPct: parseFloat(
+      process.env.NO_RECOVERY_MAX_PEAK_PNL_PCT || '1',
+    ),
+    noRecoveryMaxLiveRsi: parseFloat(
+      process.env.NO_RECOVERY_MAX_LIVE_RSI || '50',
+    ),
 
     // v3.17.6: Stabilization 期 —— reconcile 完成后等价格稳定，再开始 trailing 追踪
     //   原理：砸盘后 + 我们自买入 → 池子价格剧烈波动 + 虚高 5-10%
@@ -239,8 +257,11 @@ const config = {
     entryMode: 'RSI_CROSS_1S',
     rsi1sPeriod: 7,
     rsi1sEntryThreshold: 30,
+    rsi1sLiveMax: 50,
     // Observational trailing volume only. It is deliberately not an entry threshold.
     rsi1sVolumeWindowMs: 60_000,
+    // Pullback volume and EMA20 remain observational fields for later analysis;
+    // neither is allowed to reject an RSI entry.
     rsi1sPhaseLookbackMs: 60_000,
     ema1sPeriod: 20,
     ema1sSlopeLookbackSeconds: 20,
@@ -603,6 +624,12 @@ function validateConfig() {
   ) {
     errors.push('RSI_1S_ENTRY_THRESHOLD must be between 0 and 100');
   }
+  if (
+    config.activityFlow.rsi1sLiveMax <= config.activityFlow.rsi1sEntryThreshold ||
+    config.activityFlow.rsi1sLiveMax >= 100
+  ) {
+    errors.push('RSI_1S_LIVE_MAX must be above the entry threshold and below 100');
+  }
   if (config.activityFlow.rsi1sVolumeWindowMs <= 0) {
     errors.push('RSI_1S_VOLUME_WINDOW_MS must be > 0');
   }
@@ -622,6 +649,31 @@ function validateConfig() {
     config.strategy.rsi1sOverboughtExit >= 100
   ) {
     errors.push('RSI_1S exit thresholds must satisfy 0 < cross-down < overbought < 100');
+  }
+  if (
+    !Number.isFinite(config.strategy.noRecoveryExitMs) ||
+    config.strategy.noRecoveryExitMs <= 0
+  ) {
+    errors.push('NO_RECOVERY_EXIT_MS must be > 0');
+  }
+  if (
+    !Number.isFinite(config.strategy.noRecoveryMaxCurrentPnlPct) ||
+    config.strategy.noRecoveryMaxCurrentPnlPct >= 0
+  ) {
+    errors.push('NO_RECOVERY_MAX_CURRENT_PNL_PCT must be < 0');
+  }
+  if (
+    !Number.isFinite(config.strategy.noRecoveryMaxPeakPnlPct) ||
+    config.strategy.noRecoveryMaxPeakPnlPct < 0
+  ) {
+    errors.push('NO_RECOVERY_MAX_PEAK_PNL_PCT must be >= 0');
+  }
+  if (
+    !Number.isFinite(config.strategy.noRecoveryMaxLiveRsi) ||
+    config.strategy.noRecoveryMaxLiveRsi <= 0 ||
+    config.strategy.noRecoveryMaxLiveRsi >= 100
+  ) {
+    errors.push('NO_RECOVERY_MAX_LIVE_RSI must be between 0 and 100');
   }
   return errors;
 }

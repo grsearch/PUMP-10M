@@ -66,6 +66,7 @@ class OrderFlowTracker extends EventEmitter {
     this.entryMode = requestedEntryMode === 'ACTIVITY_BURST_V5' ? 'BREADTH_BURST_V6' : requestedEntryMode;
     this.rsi1sPeriod = opts.rsi1sPeriod ?? flowConfig.rsi1sPeriod ?? 7;
     this.rsi1sEntryThreshold = opts.rsi1sEntryThreshold ?? flowConfig.rsi1sEntryThreshold ?? 30;
+    this.rsi1sLiveMax = opts.rsi1sLiveMax ?? flowConfig.rsi1sLiveMax ?? 50;
     this.rsi1sVolumeWindowMs = opts.rsi1sVolumeWindowMs ?? flowConfig.rsi1sVolumeWindowMs ?? 60_000;
     this.rsi1sPhaseLookbackMs =
       opts.rsi1sPhaseLookbackMs ?? flowConfig.rsi1sPhaseLookbackMs ?? 60_000;
@@ -611,8 +612,7 @@ class OrderFlowTracker extends EventEmitter {
       active: 0,
       warming: 0,
       monitoring: 0,
-      pullbackVolumeBlocked: 0,
-      emaSlopeBlocked: 0,
+      liveRsiBlocked: 0,
       signaled: 0,
     };
 
@@ -637,8 +637,7 @@ class OrderFlowTracker extends EventEmitter {
         stage = 'monitoring';
       }
       summary.active++;
-      if (stage === 'pullback-volume-blocked') summary.pullbackVolumeBlocked++;
-      else if (stage === 'ema-slope-blocked') summary.emaSlopeBlocked++;
+      if (stage === 'live-rsi-blocked') summary.liveRsiBlocked++;
       else if (Object.prototype.hasOwnProperty.call(summary, stage)) summary[stage]++;
 
       candidates.push({
@@ -667,8 +666,7 @@ class OrderFlowTracker extends EventEmitter {
 
     const rank = {
       signaled: 5,
-      'pullback-volume-blocked': 4,
-      'ema-slope-blocked': 3,
+      'live-rsi-blocked': 4,
       monitoring: 2,
       warming: 1,
     };
@@ -684,10 +682,13 @@ class OrderFlowTracker extends EventEmitter {
         rsiTimeframeSeconds: 1,
         rsiPeriod: this.rsi1sPeriod,
         entryCross: this.rsi1sEntryThreshold,
+        liveRsiMax: this.rsi1sLiveMax,
         volumeWindowMs: this.rsi1sVolumeWindowMs,
         volume60sFilterEnabled: false,
+        pullbackVolumeFilterEnabled: false,
         pullbackPhaseLookbackMs: this.rsi1sPhaseLookbackMs,
         pullbackVolumeMaxRatio: 1,
+        emaSlopeFilterEnabled: false,
         emaTimeframeSeconds: 1,
         emaPeriod: this.ema1sPeriod,
         emaSlopeLookbackSeconds: this.ema1sSlopeLookbackSeconds,
@@ -702,7 +703,13 @@ class OrderFlowTracker extends EventEmitter {
         maxHoldMs: config.strategy.maxHoldMs,
         addonDropPct: config.strategy.addonDropPct,
         maxBuysPerMint: config.strategy.maxBuysPerMint,
+        oneBuyPerMint: config.strategy.oneBuyPerMint,
         fixedStopLossPct: config.strategy.fixedStopLossPct,
+        noRecoveryExitEnabled: config.strategy.noRecoveryExitEnabled,
+        noRecoveryExitMs: config.strategy.noRecoveryExitMs,
+        noRecoveryMaxCurrentPnlPct: config.strategy.noRecoveryMaxCurrentPnlPct,
+        noRecoveryMaxPeakPnlPct: config.strategy.noRecoveryMaxPeakPnlPct,
+        noRecoveryMaxLiveRsi: config.strategy.noRecoveryMaxLiveRsi,
       },
       summary,
       candidates: candidates.slice(0, safeLimit),
@@ -1135,6 +1142,9 @@ class OrderFlowTracker extends EventEmitter {
     const currentRsi = snapshot.rsi1sClosed == null
       ? NaN
       : Number(snapshot.rsi1sClosed);
+    const liveRsi = snapshot.rsi1sLive == null
+      ? NaN
+      : Number(snapshot.rsi1sLive);
     state.rsi1sPreviousClosed = Number.isFinite(previousRsi) ? previousRsi : null;
     state.rsi1sClosed = Number.isFinite(currentRsi) ? currentRsi : null;
 
@@ -1176,10 +1186,13 @@ class OrderFlowTracker extends EventEmitter {
       period: this.rsi1sPeriod,
       previousRsi: round(previousRsi, 4),
       currentRsi: round(currentRsi, 4),
+      liveRsi: Number.isFinite(liveRsi) ? round(liveRsi, 4) : null,
+      liveRsiMax: this.rsi1sLiveMax,
       threshold: this.rsi1sEntryThreshold,
       volume60sSol: round(volume60sSol, 4),
       volume60sUsd: round(volume60sUsd, 2),
       volume60sFilterEnabled: false,
+      pullbackVolumeFilterEnabled: false,
       pullbackVolumeReady: pullbackVolume.ready,
       pullbackVolumePassed: pullbackVolume.passed,
       upVolumeAvgSol: pullbackVolume.upVolumeAvgSol ?? null,
@@ -1200,24 +1213,19 @@ class OrderFlowTracker extends EventEmitter {
       ema1s20: Number.isFinite(ema1s20) ? ema1s20 : null,
       ema1s20Slope20sPct: Number.isFinite(ema1s20Slope20sPct) ? ema1s20Slope20sPct : null,
       emaSlopePassed,
+      emaSlopeFilterEnabled: false,
       signalCandleTs: signalBucketTs,
       signalCloseTs,
       executionPrice: ev.price,
     };
     this._recordRsiBuyPoint(state, ev, entry, s60);
 
-    if (!pullbackVolume.ready || !pullbackVolume.passed) {
-      state.rsi1sStage = 'pullback-volume-blocked';
-      state.rsi1sWaitReason = pullbackVolume.ready
-        ? `pullback volume ratio ${pullbackVolume.downUpVolumeRatio}>1`
-        : pullbackVolume.reason;
-      return;
-    }
-    if (!emaSlopePassed) {
-      state.rsi1sStage = 'ema-slope-blocked';
+    if (!Number.isFinite(liveRsi) || liveRsi > this.rsi1sLiveMax) {
+      state.rsi1sStage = 'live-rsi-blocked';
       state.rsi1sWaitReason =
-        `1s EMA${this.ema1sPeriod} ${this.ema1sSlopeLookbackSeconds}s slope ` +
-        `${ema1s20Slope20sPct.toFixed(3)}%<${this.ema1sMinSlopePct}%`;
+        Number.isFinite(liveRsi)
+          ? `live RSI ${liveRsi.toFixed(2)}>${this.rsi1sLiveMax}`
+          : 'live RSI unavailable';
       return;
     }
     const signal = {
@@ -1259,12 +1267,9 @@ class OrderFlowTracker extends EventEmitter {
     console.log(
       `[ActivityFlow] BUY_CONFIRM ${signal.symbol || ev.mint.slice(0, 6)} mode=RSI_CROSS_1S ` +
         `RSI(${this.rsi1sPeriod})=${previousRsi.toFixed(2)}->${currentRsi.toFixed(2)} ` +
-        `pullbackVol=${pullbackVolume.downVolumeAvgUsd.toFixed(0)}/` +
-          `${pullbackVolume.upVolumeAvgUsd.toFixed(0)}=${pullbackVolume.downUpVolumeRatio.toFixed(3)} ` +
-        (emaSlopeReady
-          ? `EMA${this.ema1sPeriod}Slope${this.ema1sSlopeLookbackSeconds}s=` +
-            `${ema1s20Slope20sPct.toFixed(3)}% `
-          : `EMA${this.ema1sPeriod}Slope=warmup-pass `) +
+        `liveRSI=${liveRsi.toFixed(2)}<=${this.rsi1sLiveMax} ` +
+        `pullbackVol=${pullbackVolume.ready ? pullbackVolume.downUpVolumeRatio.toFixed(3) : 'n/a'}(observe) ` +
+        `EMA${this.ema1sPeriod}Slope=${emaSlopeReady ? `${ema1s20Slope20sPct.toFixed(3)}%` : 'n/a'}(observe) ` +
         `vol60(observe)=$${volume60sUsd.toFixed(0)} execution=${ev.price}`,
     );
     this.emit('flowReversalSignal', signal);
