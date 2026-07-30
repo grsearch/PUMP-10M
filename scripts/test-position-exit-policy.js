@@ -30,6 +30,8 @@ function position(id, mint, overrides = {}) {
     trailingArmed: false,
     highWaterMark: 1,
     highWaterMarkTs: now - 10_000,
+    noRecoveryHighWaterMark: 1,
+    noRecoveryEvaluated: false,
     exiting: false,
     status: 'open',
     isAddOn: false,
@@ -76,6 +78,11 @@ function run() {
   assert.strictEqual(config.strategy.maxHoldMs, 30_000);
   assert.strictEqual(config.strategy.fdvExitThresholdUsd, 0);
   assert.strictEqual(config.strategy.ageExitMs, 15 * 60_000);
+  assert.strictEqual(config.strategy.noRecoveryExitEnabled, true);
+  assert.strictEqual(config.strategy.noRecoveryExitMs, 10_000);
+  assert.strictEqual(config.strategy.noRecoveryMaxCurrentPnlPct, -1);
+  assert.strictEqual(config.strategy.noRecoveryMaxPeakPnlPct, 1);
+  assert.strictEqual(config.strategy.noRecoveryMaxLiveRsi, 50);
   assert.strictEqual(typeof PositionManager.prototype.handleRsiForExit, 'function');
 
   {
@@ -140,6 +147,109 @@ function run() {
   }
 
   {
+    const failedBounce = position('p1', mint, {
+      openedAt: Date.now() - 10_100,
+      reconciledAt: Date.now() - 9_500,
+      noRecoveryHighWaterMark: 1,
+    });
+    const manager = managerWith(healthyToken, failedBounce);
+    const exited = manager.handleRsiForExit(mint, 0.98, {
+      rsi1sClosed: 40,
+      rsi1sLive: 40,
+    });
+    assert.strictEqual(exited, true);
+    assert.strictEqual(manager._exitCalls.length, 1);
+    assert.strictEqual(manager._exitCalls[0].reason, 'NO_RECOVERY_10S');
+    assert.strictEqual(failedBounce.noRecoveryEvaluated, true);
+  }
+
+  {
+    const recoveredPeak = position('p1', mint, {
+      openedAt: Date.now() - 10_100,
+      reconciledAt: Date.now() - 9_500,
+      noRecoveryHighWaterMark: 1.02,
+    });
+    const manager = managerWith(healthyToken, recoveredPeak);
+    manager.handleRsiForExit(mint, 0.98, {
+      rsi1sClosed: 40,
+      rsi1sLive: 40,
+    });
+    assert.strictEqual(manager._exitCalls.length, 0, 'a leg that reached +2% must pass the 10s check');
+    assert.strictEqual(recoveredPeak.noRecoveryEvaluated, true);
+
+    manager.handleRsiForExit(mint, 0.8, {
+      rsi1sClosed: 30,
+      rsi1sLive: 30,
+    });
+    assert.strictEqual(manager._exitCalls.length, 0, 'the no-recovery decision must be one-shot');
+  }
+
+  {
+    const tooYoung = position('p1', mint, {
+      openedAt: Date.now() - 9_000,
+      reconciledAt: Date.now() - 8_500,
+    });
+    const manager = managerWith(healthyToken, tooYoung);
+    manager.handleRsiForExit(mint, 0.98, {
+      rsi1sClosed: 40,
+      rsi1sLive: 40,
+    });
+    assert.strictEqual(manager._exitCalls.length, 0);
+    assert.strictEqual(tooYoung.noRecoveryEvaluated, false, 'the rule must wait for 10 seconds');
+
+    tooYoung.openedAt = Date.now() - 10_100;
+    manager.handleRsiForExit(mint, 0.98, {
+      rsi1sClosed: 40,
+      rsi1sLive: 40,
+    });
+    assert.strictEqual(manager._exitCalls[0].reason, 'NO_RECOVERY_10S');
+  }
+
+  {
+    const weakRsiButArmed = position('p1', mint, {
+      openedAt: Date.now() - 10_100,
+      trailingArmed: true,
+      noRecoveryHighWaterMark: 1,
+    });
+    const manager = managerWith(healthyToken, weakRsiButArmed);
+    manager.handleRsiForExit(mint, 0.98, {
+      rsi1sClosed: 40,
+      rsi1sLive: 40,
+    });
+    assert.strictEqual(manager._exitCalls.length, 0, 'trailing-armed legs must ignore no-recovery');
+    assert.strictEqual(weakRsiButArmed.noRecoveryEvaluated, false);
+  }
+
+  {
+    const stabilizing = position('p1', mint, {
+      openedAt: Date.now() - 10_100,
+      reconciledAt: Date.now(),
+      stabilizing: true,
+      _stabilizeSamples: [],
+      noRecoveryHighWaterMark: 1,
+    });
+    const manager = managerWith(healthyToken, stabilizing);
+    manager._checkExit('p1', 1.08, { source: 'own_buy_spot_lift' });
+    assert.strictEqual(
+      stabilizing.noRecoveryHighWaterMark,
+      1,
+      'the temporary own-buy spot lift must not count as genuine MFE',
+    );
+    manager._checkExit('p1', 1, { source: 'settled_price_1' });
+    manager._checkExit('p1', 1, { source: 'settled_price_2' });
+    stabilizing.reconciledAt = Date.now() - config.strategy.stabilizationMs;
+    manager._checkExit('p1', 1, { source: 'stabilization_complete' });
+    assert.strictEqual(stabilizing.stabilizing, false);
+    assert.strictEqual(stabilizing.noRecoveryHighWaterMark, 1);
+
+    manager.handleRsiForExit(mint, 0.98, {
+      rsi1sClosed: 40,
+      rsi1sLive: 40,
+    });
+    assert.strictEqual(manager._exitCalls[0].reason, 'NO_RECOVERY_10S');
+  }
+
+  {
     const leg = position('p1', mint);
     const manager = managerWith(healthyToken, leg);
     manager._checkExit('p1', 1.27, { source: 'volatile_single_tick_high' });
@@ -187,43 +297,31 @@ function run() {
     const initial = position('p1', mint);
     const manager = managerWith(healthyToken, initial);
     assert.strictEqual(manager.canAddOn(mint, 0.8501).allowed, false);
-    const allowed = manager.canAddOn(mint, 0.85);
-    assert.strictEqual(allowed.allowed, true);
-    assert.strictEqual(allowed.initialPositionId, 'p1');
-    assert(Math.abs(allowed.dropPct - 15) < 1e-9);
+    assert.strictEqual(manager.canAddOn(mint, 0.85).reason, 'one_buy_per_mint');
   }
 
   {
     const engine = Object.create(SignalEngine.prototype);
-    engine.tradeLogger = { countSuccessfulBuysByMint: () => 999 };
+    let historicalBuys = 0;
+    engine.tradeLogger = { countSuccessfulBuysByMint: () => historicalBuys };
     engine.positionManager = {
-      openPositionCountByMint: () => 1,
-      canAddOn: (_mint, price) => ({
-        allowed: price <= 0.85,
-        dropPct: 15,
-        initialPositionId: 'p1',
-      }),
+      openPositionCountByMint: () => 0,
     };
-    const addOn = engine._getMintBuyAllowance(mint, 0.85);
-    assert.strictEqual(addOn.allowed, true);
-    assert.strictEqual(addOn.isAddOn, true);
-    assert.strictEqual(engine._getMintBuyAllowance(mint, 0.8501).allowed, false);
+    const firstEntry = engine._getMintBuyAllowance(mint, 0.85);
+    assert.strictEqual(firstEntry.allowed, true);
+    assert.strictEqual(firstEntry.isAddOn, false);
 
-    engine.positionManager.openPositionCountByMint = () => 2;
+    historicalBuys = 1;
     assert.strictEqual(
       engine._getMintBuyAllowance(mint, 0.5).allowed,
       false,
-      'two concurrently open legs must block a third leg',
+      'a persisted successful buy must block re-entry after restart',
     );
-
-    engine.positionManager.openPositionCountByMint = () => 0;
-    const reentry = engine._getMintBuyAllowance(mint, 0.5);
-    assert.strictEqual(reentry.allowed, true);
-    assert.strictEqual(reentry.isAddOn, false);
+    historicalBuys = -1;
     assert.strictEqual(
-      engine.tradeLogger.countSuccessfulBuysByMint(),
-      999,
-      'historical buys may exist but must not block a fresh re-entry after full close',
+      engine._getMintBuyAllowance(mint, 0.5).allowed,
+      false,
+      'an unreadable buy history must fail closed',
     );
   }
 
@@ -231,7 +329,7 @@ function run() {
     const initial = position('p1', mint);
     const addOn = position('p2', mint, { isAddOn: true, entryPrice: 0.85 });
     const manager = managerWith(healthyToken, initial, addOn);
-    assert.strictEqual(manager.canAddOn(mint, 0.5).reason, 'max_two_buys_reached');
+    assert.strictEqual(manager.canAddOn(mint, 0.5).reason, 'one_buy_per_mint');
   }
 
   {

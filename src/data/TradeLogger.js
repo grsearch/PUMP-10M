@@ -1361,11 +1361,18 @@ ${snapshotColumnsSql},
   countSuccessfulBuysByMint(mint) {
     try {
       const row = this.db.prepare(
-        'SELECT count(*) as cnt FROM positions WHERE mint = ?'
+        `SELECT count(*) as cnt
+           FROM positions
+          WHERE mint = ?
+            AND (
+              exit_reason IS NULL OR
+              exit_reason NOT IN ('BUY_CHAIN_FAILED', 'BUY_PARSE_FAILED', 'BUY_RECONCILE_TIMEOUT')
+            )`
       ).get(mint);
       return row ? Number(row.cnt) || 0 : 0;
     } catch (_) {
-      return 0;
+      // The one-buy-per-mint guard must fail closed if history cannot be read.
+      return -1;
     }
   }
 

@@ -34,6 +34,7 @@ function makeTracker(overrides = {}) {
     solPriceUsd: 100,
     rsi1sPeriod: 7,
     rsi1sEntryThreshold: 30,
+    rsi1sLiveMax: 50,
     rsi1sVolumeWindowMs: 60_000,
     rsi1sPhaseLookbackMs: 60_000,
     ema1sPeriod: 20,
@@ -72,9 +73,18 @@ function runScenario({
   pullbackVolume = 2,
   emaSlope = 0,
   emaReady = true,
+  liveRsi = 36,
+  pullbackReady = true,
   suffix = '',
 } = {}) {
   const tracker = makeTracker();
+  if (!pullbackReady) {
+    tracker._analyzePullbackVolume = () => ({
+      ready: false,
+      passed: false,
+      reason: 'pullback phase unavailable',
+    });
+  }
   const signals = [];
   tracker.on('flowReversalSignal', (signal) => signals.push(signal));
 
@@ -85,7 +95,7 @@ function runScenario({
   tracker.updateRsiSnapshot(MINT, {
     rsi1sPreviousClosed: 25,
     rsi1sClosed: 35,
-    rsi1sLive: 36,
+    rsi1sLive: liveRsi,
     rsi1sClosedBars: 50,
     rsi1sCurrentBucketTs: BASE + 8 * FRAME_MS,
     rsi1sClosedBucketTs: signalBucketTs,
@@ -114,6 +124,7 @@ function runClosedCandleSignalTest() {
   const entry = signals[0]._flow.entryRsi1s;
   assert(entry.previousRsi <= 30);
   assert(entry.currentRsi > 30);
+  assert(entry.liveRsi <= 50);
   assert.strictEqual(entry.signalCandleTs, BASE + 7 * FRAME_MS);
   assert.strictEqual(entry.signalCloseTs, BASE + 8 * FRAME_MS);
   assert.strictEqual(entry.executionPrice, 106);
@@ -126,6 +137,8 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(entry.emaSlopeLookbackSeconds, 20);
   assert.strictEqual(entry.ema1s20Slope20sPct, -0.1);
   assert.strictEqual(entry.volume60sFilterEnabled, false);
+  assert.strictEqual(entry.pullbackVolumeFilterEnabled, false);
+  assert.strictEqual(entry.emaSlopeFilterEnabled, false);
   assert(
     entry.volume60sUsd < 10_000,
     'a low trailing 60-second total must be recorded without blocking the entry',
@@ -153,12 +166,14 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(view.mode, 'RSI_CROSS_1S');
   assert.strictEqual(view.candidates[0].stage, 'signaled');
   assert.strictEqual(view.thresholds.volume60sFilterEnabled, false);
-  assert.strictEqual(view.thresholds.pullbackVolumeMaxRatio, 1);
+  assert.strictEqual(view.thresholds.pullbackVolumeFilterEnabled, false);
   assert.strictEqual(view.thresholds.emaTimeframeSeconds, 1);
   assert.strictEqual(view.thresholds.emaPeriod, 20);
   assert.strictEqual(view.thresholds.emaSlopeLookbackSeconds, 20);
   assert.strictEqual(view.thresholds.emaMinSlopePct, -0.3);
   assert.strictEqual(view.thresholds.emaWarmupPasses, true);
+  assert.strictEqual(view.thresholds.emaSlopeFilterEnabled, false);
+  assert.strictEqual(view.thresholds.liveRsiMax, 50);
   assert.strictEqual(view.candidates[0].downUpVolumeRatio, 0.2);
   assert.strictEqual(view.candidates[0].ema1s20Slope20sPct, -0.1);
   assert.strictEqual(view.thresholds.trailingActivatePct, 10);
@@ -166,19 +181,18 @@ function runClosedCandleSignalTest() {
   assert.strictEqual(view.thresholds.maxHoldMs, 30_000);
 }
 
-function runPullbackVolumeGateTests() {
-  const blocked = runScenario({
+function runObservationalFilterTests() {
+  const expanded = runScenario({
     upVolume: 2,
     pullbackVolume: 4,
     suffix: 'expanded-pullback',
   });
-  assert.strictEqual(blocked.signals.length, 0);
-  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sStage, 'pullback-volume-blocked');
-  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sPullbackVolume.downUpVolumeRatio, 2);
+  assert.strictEqual(expanded.signals.length, 1, 'expanded pullback volume must be observation-only');
+  assert.strictEqual(expanded.tracker.states.get(MINT).rsi1sPullbackVolume.downUpVolumeRatio, 2);
   assert.strictEqual(
-    blocked.tracker._testObservations.length,
+    expanded.tracker._testObservations.length,
     1,
-    'filtered RSI buy points must still be written to the observation dataset',
+    'RSI buy points must retain pullback metrics for analysis',
   );
 
   const exact = runScenario({
@@ -203,31 +217,44 @@ function runPullbackVolumeGateTests() {
     0.2,
     'database-prewarmed candle volume must protect pullback analysis immediately after restart',
   );
-}
+  const fallingEma = runScenario({ emaSlope: -5, suffix: 'ema-observe-only' });
+  assert.strictEqual(fallingEma.signals.length, 1, 'EMA slope must not filter an RSI entry');
 
-function runEmaSlopeGateTests() {
-  const blocked = runScenario({ emaSlope: -0.301, suffix: 'ema-blocked' });
-  assert.strictEqual(blocked.signals.length, 0);
-  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sStage, 'ema-slope-blocked');
-  assert.match(blocked.tracker.states.get(MINT).rsi1sWaitReason, /-0\.301%<-0\.3%/);
+  const noPullbackPhase = runScenario({ pullbackReady: false, suffix: 'no-pullback-phase' });
+  assert.strictEqual(
+    noPullbackPhase.signals.length,
+    1,
+    'an unavailable pullback phase must not filter an RSI entry',
+  );
 
   const boundary = runScenario({ emaSlope: -0.3, suffix: 'ema-boundary' });
-  assert.strictEqual(boundary.signals.length, 1, 'a 0.3% EMA20 decline is still allowed');
+  assert.strictEqual(boundary.signals.length, 1);
 
   const warming = runScenario({ emaReady: false, suffix: 'ema-warmup' });
   assert.strictEqual(
     warming.signals.length,
     1,
-    'insufficient EMA20 slope history must preserve the existing warmup-pass behavior',
+    'missing EMA history must not affect entry',
   );
   assert.strictEqual(warming.signals[0]._flow.entryRsi1s.emaReady, false);
   assert.strictEqual(warming.signals[0]._flow.entryRsi1s.ema1s20Slope20sPct, null);
+}
+
+function runLiveRsiCapTests() {
+  const boundary = runScenario({ liveRsi: 50, suffix: 'live-rsi-boundary' });
+  assert.strictEqual(boundary.signals.length, 1, 'live RSI exactly 50 must pass');
+
+  const blocked = runScenario({ liveRsi: 50.01, suffix: 'live-rsi-blocked' });
+  assert.strictEqual(blocked.signals.length, 0, 'live RSI above 50 must reject the entry');
+  assert.strictEqual(blocked.tracker.states.get(MINT).rsi1sStage, 'live-rsi-blocked');
+  assert.match(blocked.tracker.states.get(MINT).rsi1sWaitReason, /live RSI 50\.01>50/);
 }
 
 function runDefaultsTest() {
   assert.strictEqual(config.activityFlow.entryMode, 'RSI_CROSS_1S');
   assert.strictEqual(config.activityFlow.rsi1sPeriod, 7);
   assert.strictEqual(config.activityFlow.rsi1sEntryThreshold, 30);
+  assert.strictEqual(config.activityFlow.rsi1sLiveMax, 50);
   assert.strictEqual(config.activityFlow.rsi1sPhaseLookbackMs, 60_000);
   assert.strictEqual(config.activityFlow.ema1sPeriod, 20);
   assert.strictEqual(config.activityFlow.ema1sSlopeLookbackSeconds, 20);
@@ -244,20 +271,20 @@ function runDefaultsTest() {
   assert.strictEqual(config.strategy.rsi1sOverboughtExit, 80);
   assert.strictEqual(config.strategy.rsi1sCrossDownExit, 70);
   assert.strictEqual(config.strategy.rebuyCooldownMs, 0);
+  assert.strictEqual(config.strategy.oneBuyPerMint, true);
+  assert.strictEqual(config.strategy.maxBuysPerMint, 1);
 }
 
 function runDashboardContractTest() {
   for (const filename of ['dashboard.html', 'index.html']) {
     const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'server', 'public', filename), 'utf8');
-    assert(html.includes('1s RSI Pullback V1'));
-    assert(html.includes('已收盘 1s K'));
-    assert(html.includes('上涨均量'));
-    assert(html.includes('回调均量'));
-    assert(html.includes('EMA20 20s斜率'));
-    assert(html.includes('近60s量(仅记录)'));
-    assert(html.includes('回调 ≤ 上涨'));
-    assert(html.includes('仅记录，不过滤'));
-    assert(html.includes('预热不足放行'));
+    assert(html.includes('1s RSI First Entry'));
+    assert(html.includes('thresholds.liveRsiMax ?? 50'));
+    assert(html.includes('summary.liveRsiBlocked'));
+    assert(html.includes('每币只允许成功开仓一次'));
+    assert(html.includes('均只记录，不过滤'));
+    assert(!html.includes('summary.pullbackVolumeBlocked'));
+    assert(!html.includes('summary.emaSlopeBlocked'));
     assert(!html.includes('15s EMA9'));
     assert(!html.includes('15s EMA20'));
     assert(!html.includes('rsi1sMinVolume60sUsd'));
@@ -269,8 +296,8 @@ function runDashboardContractTest() {
 }
 
 runClosedCandleSignalTest();
-runPullbackVolumeGateTests();
-runEmaSlopeGateTests();
+runObservationalFilterTests();
+runLiveRsiCapTests();
 runDefaultsTest();
 runDashboardContractTest();
-console.log('1s RSI pullback V1 strategy tests: PASS');
+console.log('1s RSI first-entry strategy tests: PASS');

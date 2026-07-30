@@ -167,8 +167,27 @@ class SignalEngine extends EventEmitter {
       ? this.positionManager.openPositionCountByMint(mint)
       : (this.positionManager.hasOpenPosition(mint) ? 1 : 0);
 
-    // Limit only concurrently open legs. Historical successful buys must not
-    // turn into a one-buy-per-mint blacklist after the position is closed.
+    // A successful position permanently consumes this mint's only entry.
+    // Query the persisted positions table so a process restart cannot reopen it.
+    if (config.strategy.oneBuyPerMint) {
+      const historicalBuyCount = this.tradeLogger?.countSuccessfulBuysByMint
+        ? this.tradeLogger.countSuccessfulBuysByMint(mint)
+        : openCount;
+      if (!Number.isFinite(historicalBuyCount) || historicalBuyCount < 0) {
+        return {
+          allowed: false,
+          reason: 'one-buy-per-mint: persisted buy history unavailable',
+        };
+      }
+      if (historicalBuyCount > 0 || openCount > 0) {
+        return {
+          allowed: false,
+          reason: `one-buy-per-mint: already opened ${Math.max(historicalBuyCount, openCount)} position(s)`,
+        };
+      }
+      return { allowed: true, isAddOn: false, addOn: null };
+    }
+
     if (openCount >= config.strategy.maxBuysPerMint) {
       return {
         allowed: false,
@@ -754,11 +773,11 @@ class SignalEngine extends EventEmitter {
       activityReason =
         `rsi_1s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
         `${entry.currentRsi.toFixed(2)} cross>${entry.threshold} ` +
-        `pullbackVolRatio=${entry.downUpVolumeRatio?.toFixed(3) ?? 'n/a'} ` +
-        `ema${entry.emaPeriod}Slope${entry.emaSlopeLookbackSeconds}s=` +
-        `${entry.ema1s20Slope20sPct?.toFixed(3) ?? 'warmup-pass'}% ` +
-        `vol60(observe)=$${entry.volume60sUsd.toFixed(0)} execution=${entry.executionPrice}` +
-        `${signal._isAddOn ? ` add_on_drop=${signal._addOn.dropPct.toFixed(2)}%` : ''}`;
+        `live=${entry.liveRsi?.toFixed(2) ?? 'n/a'}<=${entry.liveRsiMax} ` +
+        `pullbackVolRatio(observe)=${entry.downUpVolumeRatio?.toFixed(3) ?? 'n/a'} ` +
+        `ema${entry.emaPeriod}Slope${entry.emaSlopeLookbackSeconds}s(observe)=` +
+        `${entry.ema1s20Slope20sPct?.toFixed(3) ?? 'n/a'}% ` +
+        `vol60(observe)=$${entry.volume60sUsd.toFixed(0)} execution=${entry.executionPrice}`;
     } else if (signal._activityFlow && flow?.entryV6) {
       activityReason =
         `breadth_burst_v6: 1m=${flow.s60.buyCount}buys/${flow.s60.volumeSol.toFixed(2)}SOL ` +
