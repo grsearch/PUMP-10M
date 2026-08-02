@@ -60,6 +60,11 @@ async function main() {
   }
   console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
   console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}%`);
+  console.log(
+    `Fast exit: +${config.strategy.fastTakeProfitPct}% within ` +
+      `${config.strategy.fastTakeProfitWindowMs / 1000}s; loss check at ` +
+      `${config.strategy.lossCheckAtMs / 1000}s`,
+  );
   console.log('Legacy RSI, no-recovery, fixed-stop, FDV, AGE and flow exits: disabled');
   console.log(`Forced exit: max hold ${config.strategy.maxHoldMs / 1000}s`);
   console.log(

@@ -494,7 +494,7 @@ async function refreshStatus() {
   $('stat-trades1m').textContent = `1s 跌 ${r.config.dropMinPct}-${r.config.dropMaxPct}% / 反弹 ${r.config.reboundMinPct}-${r.config.reboundMaxPct}%`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-trailing').textContent = `+${r.config.trailingActivatePct}% / ${r.config.trailingDrawdownPct}%`;
-  $('stat-forced').textContent = `最长持仓 ${Math.round((r.config.maxHoldMs ?? 10000) / 1000)}s / AGE ${Math.round((r.config.maxTokenAgeMs ?? 240000) / 60000)}m移出`;
+  $('stat-forced').textContent = `5s快盈 / 6s亏损检查 / 最长${Math.round((r.config.maxHoldMs ?? 15000) / 1000)}s`;
   const quote = r.quoteAssets;
   $('stat-native-sol').textContent = quote ? Number(quote.nativeSol || 0).toFixed(4) + ' SOL' : '待对账';
   $('stat-wallet-wsol').textContent = quote ? Number(quote.walletWsol || 0).toFixed(4) + ' WSOL' : '待对账';
@@ -756,7 +756,9 @@ async function refreshSignals() {
     `<span>反弹确认 <b>低点反弹 ${thresholds.reboundMinPct ?? 2}%～${thresholds.reboundMaxPct ?? 5}%，须在 ${thresholds.reboundTimeoutMs ?? 1000}ms 内完成</b></span>`,
     `<span>监控 <b>FDV $${Math.round((thresholds.minFdvUsd ?? 10000) / 1000)}k～$${Math.round((thresholds.maxFdvUsd ?? 500000) / 1000)}k / LP ≥ $${Math.round((thresholds.minLiquidityUsd ?? 3000) / 1000)}k / AGE &lt; ${Math.round((thresholds.maxTokenAgeMs ?? 240000) / 60000)}m</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
-    `<span>最长持仓 <b>${Math.round((thresholds.maxHoldMs ?? 10000) / 1000)}s</b></span>`,
+    `<span>快速止盈 <b>买入后 ${Math.round((thresholds.fastTakeProfitWindowMs ?? 5000) / 1000)}s 内达到 +${thresholds.fastTakeProfitPct ?? 8}% 立即卖出</b></span>`,
+    `<span>盈亏检查 <b>第 ${Math.round((thresholds.lossCheckAtMs ?? 6000) / 1000)}s 低于买入价立即止损；不低于则继续持有</b></span>`,
+    `<span>最长持仓 <b>${Math.round((thresholds.maxHoldMs ?? 15000) / 1000)}s</b></span>`,
     `<span>旧策略 <b>RSI、EMA、成交量、固定止损及其他策略退出均关闭</b></span>`,
     `<span>同币开仓 <b>不重叠持仓；平仓后可等待下一次完整信号</b></span>`,
     `<span>活跃 <b>${summary.active || 0}</b></span>`,

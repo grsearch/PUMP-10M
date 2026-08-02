@@ -134,7 +134,10 @@ function run() {
     assert.strictEqual(panel.thresholds.maxTokenAgeMs, 240_000);
     assert.strictEqual(panel.thresholds.trailingActivatePct, 8);
     assert.strictEqual(panel.thresholds.trailingDrawdownPct, 3);
-    assert.strictEqual(panel.thresholds.maxHoldMs, 10_000);
+    assert.strictEqual(panel.thresholds.fastTakeProfitPct, 8);
+    assert.strictEqual(panel.thresholds.fastTakeProfitWindowMs, 5_000);
+    assert.strictEqual(panel.thresholds.lossCheckAtMs, 6_000);
+    assert.strictEqual(panel.thresholds.maxHoldMs, 15_000);
   }
 
   console.log('Drop/rebound 1s strategy tests: PASS');

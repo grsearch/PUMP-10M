@@ -32,6 +32,7 @@ function position(id, mint, overrides = {}) {
     highWaterMarkTs: now - 5_000,
     noRecoveryHighWaterMark: 1,
     noRecoveryEvaluated: false,
+    lossCheckEvaluated: false,
     exiting: false,
     status: 'open',
     ...overrides,
@@ -68,8 +69,11 @@ function run() {
 
   assert.strictEqual(config.strategy.trailingActivatePct, 8);
   assert.strictEqual(config.strategy.trailingDrawdownPct, 3);
+  assert.strictEqual(config.strategy.fastTakeProfitPct, 8);
+  assert.strictEqual(config.strategy.fastTakeProfitWindowMs, 5_000);
+  assert.strictEqual(config.strategy.lossCheckAtMs, 6_000);
   assert.strictEqual(config.strategy.trailingMinHwmAgeMs, 0);
-  assert.strictEqual(config.strategy.maxHoldMs, 10_000);
+  assert.strictEqual(config.strategy.maxHoldMs, 15_000);
   assert.strictEqual(config.strategy.takeProfitPct, 0);
   assert.strictEqual(config.strategy.fixedStopLossPct, 0);
   assert.strictEqual(config.strategy.emergencyStopLossPct, 0);
@@ -80,7 +84,7 @@ function run() {
   assert.strictEqual(config.strategy.ageExitMs, 0);
 
   {
-    const leg = position('p1', mint);
+    const leg = position('p1', mint, { openedAt: Date.now() - 5_100 });
     const manager = managerWith(token, leg);
     manager._checkExit('p1', 1.079, { source: 'below_arm' });
     assert.strictEqual(leg.trailingArmed, false);
@@ -90,6 +94,55 @@ function run() {
     assert.strictEqual(manager._exitCalls.length, 0, 'drawdown below 3% must remain open');
     manager._checkExit('p1', 1.047, { source: 'drawdown' });
     assert.strictEqual(manager._exitCalls[0].reason, 'TRAILING_STOP');
+  }
+
+  {
+    const leg = position('p1', mint, { openedAt: Date.now() - 4_000 });
+    const manager = managerWith(token, leg);
+    manager._checkExit('p1', 1.08, { source: 'fast_profit' });
+    assert.strictEqual(manager._exitCalls.length, 1);
+    assert.strictEqual(manager._exitCalls[0].reason, 'FAST_TP_5S');
+    assert.strictEqual(leg.trailingArmed, false, 'fast TP must sell instead of arming trailing');
+  }
+
+  {
+    const losing = position('p1', mint, {
+      openedAt: Date.now() - 6_100,
+      _lastTickPrice: 0.99,
+      _lastTickAt: Date.now(),
+    });
+    const manager = managerWith(token, losing);
+    manager._tick();
+    assert.strictEqual(manager._exitCalls.length, 1);
+    assert.strictEqual(manager._exitCalls[0].reason, 'LOSS_CHECK_6S');
+    assert.strictEqual(losing.lossCheckEvaluated, true);
+  }
+
+  {
+    const profitable = position('p1', mint, {
+      openedAt: Date.now() - 6_100,
+      _lastTickPrice: 1.01,
+      _lastTickAt: Date.now(),
+    });
+    const manager = managerWith(token, profitable);
+    manager._tick();
+    assert.strictEqual(manager._exitCalls.length, 0);
+    assert.strictEqual(profitable.lossCheckEvaluated, true);
+    profitable._lastTickPrice = 0.99;
+    manager._tick();
+    assert.strictEqual(manager._exitCalls.length, 0, 'six-second loss check must run only once');
+  }
+
+  {
+    const stale = position('p1', mint, {
+      openedAt: Date.now() - 6_100,
+      _lastTickPrice: 0.99,
+      _lastTickAt: Date.now() - 2_000,
+    });
+    const manager = managerWith(token, stale);
+    manager._tick();
+    assert.strictEqual(manager._exitCalls.length, 0, 'a stale price must not decide the sixth-second checkpoint');
+    assert.strictEqual(stale.lossCheckEvaluated, false);
   }
 
   {
@@ -105,12 +158,15 @@ function run() {
   }
 
   {
-    const timedOut = position('p1', mint, { openedAt: Date.now() - 10_100 });
-    const recent = position('p2', 'OtherMint', { openedAt: Date.now() - 9_900 });
+    const timedOut = position('p1', mint, { openedAt: Date.now() - 15_100 });
+    const recent = position('p2', 'OtherMint', {
+      openedAt: Date.now() - 14_900,
+      lossCheckEvaluated: true,
+    });
     const manager = managerWith(token, timedOut, recent);
     manager._tick();
     assert.deepStrictEqual(manager._exitCalls.map((row) => row.id), ['p1']);
-    assert.strictEqual(manager._exitCalls[0].reason, 'HOLD_TIMEOUT_10S');
+    assert.strictEqual(manager._exitCalls[0].reason, 'HOLD_TIMEOUT_15S');
     assert.strictEqual(recent.exiting, false);
   }
 

@@ -546,6 +546,7 @@ class PositionManager extends EventEmitter {
           Number(row.entry_price) || 0,
         ),
         noRecoveryEvaluated: false,
+        lossCheckEvaluated: false,
         // v3.17.27: 有 peak_price 时根据已恢复的 HWM 重新评估 trailingArmed
         //   避免重启后又要重新涨8%才能激活（之前的高点白攒了）
         //   v3.20: 使用 DB 中的 pre_vol_5m_pct 决定 activate 阈值
@@ -646,6 +647,7 @@ class PositionManager extends EventEmitter {
       highWaterMarkTs: Date.now(),
       noRecoveryHighWaterMark: entryPrice,
       noRecoveryEvaluated: false,
+      lossCheckEvaluated: false,
       trailingArmed: false,
       // v3.17.6: stabilization 期
       //   DRY_RUN：开仓即进入 stabilization(用估算价格作起点)
@@ -1182,6 +1184,46 @@ class PositionManager extends EventEmitter {
         continue;
       }
 
+      // One-shot sixth-second loss check. Wait for a trusted post-entry price
+      // instead of treating a missing quote as the entry price. A profitable
+      // or flat sixth-second observation permanently passes this checkpoint.
+      if (
+        !pos.lossCheckEvaluated &&
+        (pos.reconciled || pos.dryRun) &&
+        config.strategy.lossCheckAtMs > 0 &&
+        age >= config.strategy.lossCheckAtMs
+      ) {
+        const checkPrice = Number(pos._lastTickPrice);
+        const checkPriceAt = Number(pos._lastTickAt);
+        const maxCheckPriceAgeMs = Math.max(1_000, (Number(this.poolPollIntervalMs) || 500) * 2);
+        const checkPriceFresh = Number.isFinite(checkPriceAt) && now - checkPriceAt <= maxCheckPriceAgeMs;
+        if (
+          Number.isFinite(checkPrice) &&
+          checkPrice > 0 &&
+          pos.entryPrice > 0 &&
+          checkPriceFresh
+        ) {
+          pos.lossCheckEvaluated = true;
+          pos.lossCheckEvaluatedAt = now;
+          const pnlPct = ((checkPrice - pos.entryPrice) / pos.entryPrice) * 100;
+          if (checkPrice < pos.entryPrice) {
+            console.log(
+              `[PositionManager] LOSS_CHECK_6S ${pos.symbol || pos.mint.slice(0, 6)} ` +
+                `pnl=${pnlPct.toFixed(2)}% price=${checkPrice.toExponential(6)} ` +
+                `entry=${pos.entryPrice.toExponential(6)} age=${(age / 1000).toFixed(2)}s`,
+            );
+            monitor.inc('PositionManager.LOSS_CHECK_6S', 1, 'PositionManager');
+            this._exitForCondition(pos, checkPrice, 'LOSS_CHECK_6S');
+            continue;
+          }
+          console.log(
+            `[PositionManager] LOSS_CHECK_6S_PASS ${pos.symbol || pos.mint.slice(0, 6)} ` +
+              `pnl=${pnlPct.toFixed(2)}%; continue holding for trailing/timeout`,
+          );
+          monitor.inc('PositionManager.lossCheck6sPassed', 1, 'PositionManager');
+        }
+      }
+
       // Peak is retained for optional legacy exits and trailing diagnostics.
       const peakPnlForNoBounce = (pos.highWaterMark && pos.entryPrice > 0)
         ? ((pos.highWaterMark - pos.entryPrice) / pos.entryPrice) * 100
@@ -1621,7 +1663,27 @@ class PositionManager extends EventEmitter {
 
     // v3.17.42: 记录最新tick价格，供前端API使用(priceTracker可能没追踪该mint)
     pos._lastTickPrice = price;
+    pos._lastTickAt = Date.now();
     const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+
+    // During the first five seconds, +8% is an immediate take-profit rather
+    // than merely arming trailing. After this window, +8% arms trailing below.
+    const positionAgeMs = Date.now() - (pos.openedAt || Date.now());
+    if (
+      config.strategy.fastTakeProfitPct > 0 &&
+      config.strategy.fastTakeProfitWindowMs > 0 &&
+      positionAgeMs <= config.strategy.fastTakeProfitWindowMs &&
+      pnlPct >= config.strategy.fastTakeProfitPct
+    ) {
+      console.log(
+        `[PositionManager] FAST_TP_5S ${pos.symbol || pos.mint.slice(0, 6)} ` +
+          `pnl=${pnlPct.toFixed(2)}%>=${config.strategy.fastTakeProfitPct}% ` +
+          `age=${(positionAgeMs / 1000).toFixed(2)}s`,
+      );
+      monitor.inc('PositionManager.FAST_TP_5S', 1, 'PositionManager');
+      this._exitForCondition(pos, price, 'FAST_TP_5S');
+      return;
+    }
 
     // Track failed-bounce MFE independently from the trailing HWM, but start
     // only after stabilization. The post-buy AMM spot is temporarily lifted
