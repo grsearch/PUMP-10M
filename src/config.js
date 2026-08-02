@@ -2,10 +2,6 @@
 
 require('dotenv').config({ override: true });
 
-const activityFlowForceDisabled = ['true', '1', 'yes'].includes(
-  String(process.env.ACTIVITY_FLOW_FORCE_DISABLED || process.env.ORDER_FLOW_FORCE_DISABLED || '').toLowerCase(),
-);
-
 function numberEnv(name, fallback) {
   const raw = process.env[name];
   if (raw == null || raw === '') return fallback;
@@ -13,12 +9,19 @@ function numberEnv(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function flagEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  return ['true', '1', 'yes', 'on'].includes(String(raw).toLowerCase());
+}
+
 const solPriceUsdForConfig = numberEnv('SOL_PRICE_USD', 72);
 const activityFlow1mMinVolumeUsdDefault = numberEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
 const activityFlow1mMinVolumeSolDefault = activityFlow1mMinVolumeUsdDefault / Math.max(solPriceUsdForConfig, 0.001);
-// Keep admission aligned with the forced AGE exit. Older server .env values
-// must not admit a token that the position policy would immediately sell.
-const maxMintAgeHours = 15 / 60;
+// The production universe is limited to the first four minutes after a
+// confirmed Pump migration. Keep this fixed so stale server environment
+// values cannot silently widen the live watchlist.
+const maxMintAgeHours = 4 / 60;
 
 const config = {
   // ============ Mode ============
@@ -51,10 +54,9 @@ const config = {
     // 仓位
     positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.2'),
 
-    // Fixed TP remains configurable but is disabled by default. Core exit
-    // thresholds below are fixed so stale server .env values cannot revive
-    // retired stop-loss or FDV exits.
-    takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || '0'),
+    // The drop/rebound strategy has exactly two market exits: trailing and
+    // the ten-second holding timeout. Legacy fixed exits stay hard-disabled.
+    takeProfitPct: 0,
     tpConfirmCount: parseInt(process.env.TP_CONFIRM_COUNT || '2', 10),
     tpConfirmMinGapMs: parseInt(process.env.TP_CONFIRM_MIN_GAP_MS || '300', 10),
 
@@ -62,25 +64,23 @@ const config = {
     //   trailingActivatePct: HWM 涨过 entryPrice × (1 + 此值/100) 才 arm
     //   trailingDrawdownPct: armed 后，价格从 HWM 回撤此 % 立即 SELL
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
-    trailingActivatePct: 10,
-    trailingDrawdownPct: 5,
-    // Exact production rule: once armed, a 5% drawdown exits immediately.
+    trailingActivatePct: 8,
+    trailingDrawdownPct: 3,
+    // Exact production rule: once armed, a 3% drawdown exits immediately.
     // Ignore stale server env values that previously added a hidden delay.
     trailingMinHwmAgeMs: 0,
 
-    // Timed/AGE exits and one-buy-per-mint policy. A successful position row
-    // permanently consumes the mint's only entry, including across restarts.
-    // FDV and fixed-stop exits are explicitly disabled.
+    // AGE is a watchlist rule, not a position exit. Positions use their own
+    // ten-second timer and a mint may trade again after its prior leg closes.
     fdvExitThresholdUsd: 0,
-    ageExitMs: 15 * 60 * 1000,
-    maxHoldMs: 30_000,
+    ageExitMs: 0,
+    maxHoldMs: 10_000,
     addonDropPct: 15,
     maxBuysPerMint: 1,
-    oneBuyPerMint: true,
+    oneBuyPerMint: false,
 
-    // Before trailing is armed, live 1-second RSI can close each leg.
-    // Once a leg arms trailing, RSI exits are permanently ignored for that leg.
-    rsi1sExitEnabled: true,
+    // RSI exits do not belong to the production drop/rebound policy.
+    rsi1sExitEnabled: false,
     rsi1sOverboughtExit: 80,
     rsi1sCrossDownExit: 70,
 
@@ -88,8 +88,7 @@ const config = {
     // 10 seconds, exit an unarmed leg only when it is still down at least 1%,
     // never traded more than 1% above its real fill after stabilization, and
     // live RSI is <= 50.
-    noRecoveryExitEnabled:
-      (process.env.NO_RECOVERY_EXIT_ENABLED ?? 'true').toLowerCase() === 'true',
+    noRecoveryExitEnabled: false,
     noRecoveryExitMs: parseInt(process.env.NO_RECOVERY_EXIT_MS || '10000', 10),
     noRecoveryMaxCurrentPnlPct: parseFloat(
       process.env.NO_RECOVERY_MAX_CURRENT_PNL_PCT || '-1',
@@ -114,7 +113,7 @@ const config = {
     //     - 5 秒：覆盖砸盘后短暂剧烈波动（实测多数 < 3 秒就稳定）
     //     - 太短（< 3s）：保护不够，自买入虚高没消化完
     //     - 太长（> 10s）：错过早期快速反弹的入场窗口
-    stabilizationMs: parseInt(process.env.STABILIZATION_MS || '5000', 10),
+    stabilizationMs: 0,
 
     // v3.17.7: stabilization 期内 emergency_stop 的阈值
     //   stabilization 期内"相对 entryPrice 的 PnL"不可靠（自买入推高+回归造成假亏损）
@@ -128,27 +127,26 @@ const config = {
     ),
 
     fixedStopLossPct: 0,
-    emergencyStopLossPct: parseFloat(process.env.EMERGENCY_STOP_LOSS_PCT || '0'),
+    emergencyStopLossPct: 0,
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
     // 智能规则: trailing已armed时不触发(trailing自行处理回撤), 只救trailing永远不armed的死扛仓位
     // stabilization期内不触发, 持仓>5min后才触发
     // 0=禁用, 负数=止损百分比(如-25表示跌破-25%止损)
-    volLowEmergencyStopPct: parseFloat(process.env.VOL_LOW_EMERGENCY_STOP_PCT || '0'),
-    volMidEmergencyStopPct: parseFloat(process.env.VOL_MID_EMERGENCY_STOP_PCT || '0'),
-    volHighEmergencyStopPct: parseFloat(process.env.VOL_HIGH_EMERGENCY_STOP_PCT || '0'),
+    volLowEmergencyStopPct: 0,
+    volMidEmergencyStopPct: 0,
+    volHighEmergencyStopPct: 0,
     // 智能止损最小持仓时间(ms) — 避免刚买入就被止损
     smartStopGraceMs: parseInt(process.env.SMART_STOP_GRACE_MS || '300000', 10),  // 默认5min
 
     // Legacy optional exits remain available but are disabled by default.
-    noBounceExitEnabled: (process.env.NO_BOUNCE_EXIT_ENABLED ?? 'false').toLowerCase() === 'true',
+    noBounceExitEnabled: false,
     noBounceExitMs: parseInt(process.env.NO_BOUNCE_EXIT_MS || '90000', 10),
     noBounceMaxPeakPnlPct: parseFloat(process.env.NO_BOUNCE_MAX_PEAK_PNL_PCT || '5'),
     noBounceFlowWindowMs: parseInt(process.env.NO_BOUNCE_FLOW_WINDOW_MS || '30000', 10),
-    lowPeakTimeoutMs: parseInt(process.env.LOW_PEAK_TIMEOUT_MS || '0', 10),
+    lowPeakTimeoutMs: 0,
     // Exit when two closed 15-second net-flow values turn positive to negative.
-    flowReversalExitEnabled:
-      (process.env.FLOW_REVERSAL_EXIT_ENABLED ?? 'false').toLowerCase() === 'true',
+    flowReversalExitEnabled: false,
     flowReversalExitMode: 'FLOW_TURN_15S',
     flowReversalExitRequireSellerBreadth:
       (process.env.FLOW_REVERSAL_EXIT_REQUIRE_SELLER_BREADTH ?? 'true').toLowerCase() === 'true',
@@ -176,10 +174,10 @@ const config = {
     //   defenseActivateMs: 持仓超过此时间后激活防御模式 (默认 20min)
     //   defenseTrailingDrawdownPct: 防御 trailing 回撤阈值 (默认 3%)
     //   defenseStopLossPct: 防御模式止损 (PnL% 低于此值立即卖出, 默认 -10%)
-    defenseActivateMs: parseInt(process.env.DEFENSE_ACTIVATE_MS || '0', 10),
-    defenseTrailingDrawdownPct: parseFloat(process.env.DEFENSE_TRAILING_DRAWDOWN_PCT || '0'),
-    defenseStopLossPct: parseFloat(process.env.DEFENSE_STOP_LOSS_PCT || '0'),
-    defenseProfitActivatePct: parseFloat(process.env.DEFENSE_PROFIT_ACTIVATE_PCT || '0'),
+    defenseActivateMs: 0,
+    defenseTrailingDrawdownPct: 0,
+    defenseStopLossPct: 0,
+    defenseProfitActivatePct: 0,
 
     // 滑点
     // BUY_SLIPPAGE_BPS limits how far the minimum token output may be relaxed.
@@ -235,33 +233,32 @@ const config = {
     maxMintAgeHours,
     maxTokenAgeMs: maxMintAgeHours * 60 * 60 * 1000,
     // v3.17.20: FDV lower bound in USD; refreshed once per minute by TokenWatchdog.
-    minFdVUsd: parseFloat(process.env.MIN_FDV_USD || '20000'),
+    minFdVUsd: 10_000,
     // Birdeye liquidity in USD. Shared by discovery admission and watchdog removal.
-    minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '3000'),
+    minLiquidityUsd: 3_000,
     // v3.17.20: FDV 上限（USD），设 0 禁用（不因 FDV 过大移除监控）
-    maxFdVUsd: parseFloat(process.env.MAX_FDV_USD || '1000000'),
+    maxFdVUsd: 500_000,
   },
 
   // ============ Activity-flow entry ============
   activityFlow: {
-    // Strategy V6: arm on broad buyer participation, then confirm short-window breadth/acceleration.
-    enabled:
-      !activityFlowForceDisabled &&
-      (process.env.ACTIVITY_FLOW_ENABLED ?? process.env.ORDER_FLOW_ENABLED ?? 'true').toLowerCase() === 'true',
-    replaceDumpSignal:
-      !activityFlowForceDisabled &&
-      (process.env.ACTIVITY_FLOW_REPLACE_DUMP_SIGNAL ?? process.env.ORDER_FLOW_REPLACE_DUMP_SIGNAL ?? 'true')
-        .toLowerCase() === 'true',
+    enabled: true,
+    replaceDumpSignal: true,
     // The production entry strategy is fixed. Legacy server environment values
     // are intentionally ignored so stale deployments cannot reactivate removed rules.
-    entryMode: 'RSI_CROSS_1S',
+    entryMode: 'DROP_REBOUND_1S',
+    dropWindowMs: 1_000,
+    dropMinPct: 10,
+    dropMaxPct: 20,
+    reboundMinPct: 2,
+    reboundMaxPct: 5,
+    reboundTimeoutMs: 1_000,
     rsi1sPeriod: 7,
     rsi1sEntryThreshold: 30,
     rsi1sLiveMax: 50,
-    // Observational trailing volume only. It is deliberately not an entry threshold.
+    // Legacy fields below remain only for offline scripts; DropReboundTracker
+    // does not read them and they cannot filter live orders.
     rsi1sVolumeWindowMs: 60_000,
-    // Pullback volume and EMA20 remain observational fields for later analysis;
-    // neither is allowed to reject an RSI entry.
     rsi1sPhaseLookbackMs: 60_000,
     ema1sPeriod: 20,
     ema1sSlopeLookbackSeconds: 20,
@@ -478,6 +475,18 @@ const config = {
     privateKeyBs58: process.env.WALLET_PRIVATE_KEY_BS58,
   },
 
+  // Wallet-owned SOL/WSOL accounting and WSOL cleanup. Only token accounts
+  // controlled by this wallet are assets; external router vaults are excluded.
+  quoteAssetReconciler: {
+    enabled: flagEnv('WSOL_RECONCILE_ENABLED', true),
+    autoUnwrapEnabled: flagEnv('WSOL_AUTO_UNWRAP_ENABLED', true),
+    autoUnwrapMinSol: numberEnv('WSOL_AUTO_UNWRAP_MIN_SOL', 0.01),
+    unknownWsolAlertMinSol: numberEnv('UNKNOWN_WSOL_ALERT_MIN_SOL', 0.01),
+    scheduleHours: [0, 6, 12, 18],
+    utcOffsetMinutes: 8 * 60,
+    busyRetryMs: numberEnv('WSOL_RECONCILE_BUSY_RETRY_MS', 60_000),
+  },
+
   // ============ Programs ============
   programs: {
     pump: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
@@ -530,7 +539,7 @@ const config = {
 
   // Passing this gate only adds a mint to monitoring; it does not buy the token.
   pumpDiscovery: {
-    enabled: (process.env.PUMP_DISCOVERY_ENABLED ?? 'true').toLowerCase() === 'true',
+    enabled: true,
     wsUrl: process.env.PUMP_DISCOVERY_WS_URL || null,
     pollIntervalMs: parseInt(process.env.PUMP_DISCOVERY_POLL_INTERVAL_MS || '5000', 10),
     pollLimit: parseInt(process.env.PUMP_DISCOVERY_POLL_LIMIT || '100', 10),
@@ -539,9 +548,9 @@ const config = {
     marketRetries: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRIES || '8', 10),
     marketRetryMs: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRY_MS || '3000', 10),
     maxConcurrentChecks: parseInt(process.env.PUMP_DISCOVERY_MAX_CONCURRENT_CHECKS || '3', 10),
-    minFdvUsd: parseFloat(process.env.MIN_FDV_USD || '20000'),
-    maxFdvUsd: parseFloat(process.env.MAX_FDV_USD || '1000000'),
-    minLiquidityUsd: parseFloat(process.env.MIN_LIQUIDITY_USD || '3000'),
+    minFdvUsd: 10_000,
+    maxFdvUsd: 500_000,
+    minLiquidityUsd: 3_000,
   },
 
   // ============ Priority fees ============
@@ -604,6 +613,18 @@ function validateConfig() {
   ) {
     errors.push('BUY_MAX_POOL_STATE_AGE_MS must be >= 0');
   }
+  if (
+    !Number.isFinite(config.quoteAssetReconciler.autoUnwrapMinSol) ||
+    config.quoteAssetReconciler.autoUnwrapMinSol < 0
+  ) {
+    errors.push('WSOL_AUTO_UNWRAP_MIN_SOL must be >= 0');
+  }
+  if (
+    !Number.isFinite(config.quoteAssetReconciler.busyRetryMs) ||
+    config.quoteAssetReconciler.busyRetryMs < 1_000
+  ) {
+    errors.push('WSOL_RECONCILE_BUSY_RETRY_MS must be >= 1000');
+  }
   if (!config.helius.apiKey) errors.push('HELIUS_API_KEY missing');
   if (!config.helius.rpcUrl) errors.push('HELIUS_RPC_URL missing');
   // v3.17: laserstreamEndpoints 数组非空（旧 _ENDPOINT 也会被收进数组）
@@ -615,65 +636,30 @@ function validateConfig() {
   if (!config.DRY_RUN && !config.wallet.privateKeyBs58) {
     errors.push('WALLET_PRIVATE_KEY_BS58 required for LIVE mode');
   }
-  if (config.activityFlow.rsi1sPeriod < 1) {
-    errors.push('RSI_1S_PERIOD must be >= 1');
+  if (!Number.isFinite(config.activityFlow.dropWindowMs) || config.activityFlow.dropWindowMs <= 0) {
+    errors.push('dropWindowMs must be > 0');
   }
   if (
-    config.activityFlow.rsi1sEntryThreshold <= 0 ||
-    config.activityFlow.rsi1sEntryThreshold >= 100
+    !Number.isFinite(config.activityFlow.dropMinPct) ||
+    !Number.isFinite(config.activityFlow.dropMaxPct) ||
+    config.activityFlow.dropMinPct <= 0 ||
+    config.activityFlow.dropMaxPct <= config.activityFlow.dropMinPct
   ) {
-    errors.push('RSI_1S_ENTRY_THRESHOLD must be between 0 and 100');
+    errors.push('drop thresholds must satisfy 0 < min < max');
   }
   if (
-    config.activityFlow.rsi1sLiveMax <= config.activityFlow.rsi1sEntryThreshold ||
-    config.activityFlow.rsi1sLiveMax >= 100
+    !Number.isFinite(config.activityFlow.reboundMinPct) ||
+    !Number.isFinite(config.activityFlow.reboundMaxPct) ||
+    config.activityFlow.reboundMinPct <= 0 ||
+    config.activityFlow.reboundMaxPct <= config.activityFlow.reboundMinPct
   ) {
-    errors.push('RSI_1S_LIVE_MAX must be above the entry threshold and below 100');
-  }
-  if (config.activityFlow.rsi1sVolumeWindowMs <= 0) {
-    errors.push('RSI_1S_VOLUME_WINDOW_MS must be > 0');
-  }
-  if (config.activityFlow.rsi1sPhaseLookbackMs < 3_000) {
-    errors.push('RSI_1S_PHASE_LOOKBACK_MS must be >= 3000');
+    errors.push('rebound thresholds must satisfy 0 < min < max');
   }
   if (
-    config.activityFlow.ema1sPeriod < 1 ||
-    config.activityFlow.ema1sSlopeLookbackSeconds < 1 ||
-    config.activityFlow.ema1sMinSlopePct > 0
+    !Number.isFinite(config.activityFlow.reboundTimeoutMs) ||
+    config.activityFlow.reboundTimeoutMs <= 0
   ) {
-    errors.push('1s EMA slope settings must use positive periods and a non-positive minimum slope');
-  }
-  if (
-    config.strategy.rsi1sCrossDownExit <= 0 ||
-    config.strategy.rsi1sOverboughtExit <= config.strategy.rsi1sCrossDownExit ||
-    config.strategy.rsi1sOverboughtExit >= 100
-  ) {
-    errors.push('RSI_1S exit thresholds must satisfy 0 < cross-down < overbought < 100');
-  }
-  if (
-    !Number.isFinite(config.strategy.noRecoveryExitMs) ||
-    config.strategy.noRecoveryExitMs <= 0
-  ) {
-    errors.push('NO_RECOVERY_EXIT_MS must be > 0');
-  }
-  if (
-    !Number.isFinite(config.strategy.noRecoveryMaxCurrentPnlPct) ||
-    config.strategy.noRecoveryMaxCurrentPnlPct >= 0
-  ) {
-    errors.push('NO_RECOVERY_MAX_CURRENT_PNL_PCT must be < 0');
-  }
-  if (
-    !Number.isFinite(config.strategy.noRecoveryMaxPeakPnlPct) ||
-    config.strategy.noRecoveryMaxPeakPnlPct < 0
-  ) {
-    errors.push('NO_RECOVERY_MAX_PEAK_PNL_PCT must be >= 0');
-  }
-  if (
-    !Number.isFinite(config.strategy.noRecoveryMaxLiveRsi) ||
-    config.strategy.noRecoveryMaxLiveRsi <= 0 ||
-    config.strategy.noRecoveryMaxLiveRsi >= 100
-  ) {
-    errors.push('NO_RECOVERY_MAX_LIVE_RSI must be between 0 and 100');
+    errors.push('reboundTimeoutMs must be > 0');
   }
   return errors;
 }

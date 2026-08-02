@@ -51,6 +51,7 @@ const {
   calculateMinBaseAmountOut,
   replaceBuyWithExactQuoteInstruction,
 } = require('../utils/pumpExactQuoteBuy');
+const { quoteAssetDelta, tokenUiAmount } = require('../utils/quoteAssetAccounting');
 
 const REQUIRED_PUMP_SWAP_SDK_VERSION = '1.19.0';
 
@@ -76,6 +77,7 @@ monitor.registerModule('Executor', { staleMs: 24 * 60 * 60_000, label: 'Trade Ex
 class Executor {
   constructor() {
     this.dryRun = config.DRY_RUN;
+    this.tradeLogger = null;
     this._latestBuySlot = 0;  // BUY 提交时的链上 slot
     // v3.15 通道分流（Openclaw 发现：staked RPC 限流严格，70 token 刷新会打爆）
     //   - this.rpc：普通公共 RPC（用于 PoolStateCache 后台刷新 + getTransaction / getSignatureStatuses 等查询）
@@ -532,6 +534,10 @@ class Executor {
     this.poolStateCache = cache;
   }
 
+  setTradeLogger(tradeLogger) {
+    this.tradeLogger = tradeLogger;
+  }
+
   /** v3.17.11: 外部（main）在 BUY 前更新 latestSlot，
    *  Executor.buy() 返回时带上 buySlot 给 PositionManager
    */
@@ -817,17 +823,10 @@ class Executor {
 
       // SOL 净变化
       // accountKeys 顺序与 preBalances/postBalances 一致
-      const keys = tx.transaction.message.accountKeys || tx.transaction.message.staticAccountKeys || [];
-      const ownerIdx = keys.findIndex((k) => {
-        const s = typeof k === 'string' ? k : k.pubkey || k.toString?.();
-        return s === owner;
-      });
-      let realSolDelta = 0;
-      if (ownerIdx >= 0) {
-        const pre = tx.meta.preBalances[ownerIdx] || 0;
-        const post = tx.meta.postBalances[ownerIdx] || 0;
-        realSolDelta = (post - pre) / 1e9; // SOL
-      }
+      const quote = quoteAssetDelta(tx.meta, tx.transaction.message, owner);
+      const realQuoteDelta = Number.isFinite(quote.quoteAssetDelta)
+        ? quote.quoteAssetDelta
+        : 0;
 
       // Token 净变化（对应 mint）
       let realTokenDelta = 0;
@@ -836,8 +835,8 @@ class Executor {
       for (const post of postTok) {
         if (post.owner !== owner || post.mint !== mint) continue;
         const pre = preTok.find((p) => p.accountIndex === post.accountIndex);
-        const preUi = pre?.uiTokenAmount?.uiAmount || 0;
-        const postUi = post.uiTokenAmount?.uiAmount || 0;
+        const preUi = tokenUiAmount(pre);
+        const postUi = tokenUiAmount(post);
         realTokenDelta += postUi - preUi;
       }
       // 也要检查 pre 里有但 post 里没有的（账户被关闭的场景）
@@ -845,18 +844,36 @@ class Executor {
         if (pre.owner !== owner || pre.mint !== mint) continue;
         const inPost = postTok.find((p) => p.accountIndex === pre.accountIndex);
         if (!inPost) {
-          const preUi = pre.uiTokenAmount?.uiAmount || 0;
+          const preUi = tokenUiAmount(pre);
           realTokenDelta -= preUi;
         }
       }
 
-      return {
-        realSolDelta,
+      const result = {
+        // Compatibility alias: callers historically read realSolDelta.
+        // It now represents native SOL + WSOL controlled by this wallet.
+        realSolDelta: realQuoteDelta,
+        realQuoteDelta,
+        nativeSolDelta: quote.nativeSolDelta,
+        wsolDelta: quote.wsolDelta,
+        wsolBefore: quote.wsolBefore,
+        wsolAfter: quote.wsolAfter,
         realTokenDelta,
         fee: tx.meta.fee || 0,
         computeUnitsConsumed: tx.meta.computeUnitsConsumed || 0,
         success: !tx.meta.err,
       };
+      this.tradeLogger?.saveTxQuoteReconciliation?.({
+        signature,
+        mint,
+        nativeSolDelta: result.nativeSolDelta,
+        wsolDelta: result.wsolDelta,
+        quoteAssetDelta: result.realQuoteDelta,
+        tokenDelta: result.realTokenDelta,
+        feeLamports: result.fee,
+        success: result.success,
+      });
+      return result;
     } catch (err) {
       monitor.recordError('Executor', err, { phase: 'fetchTxSwapResult', signature });
       return null;

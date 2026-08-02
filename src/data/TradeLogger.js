@@ -175,8 +175,48 @@ class TradeLogger {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_swap_events_sig_mint_side
         ON swap_events(signature, mint, side)
         WHERE signature IS NOT NULL AND signature != '';
+
+      CREATE TABLE IF NOT EXISTS quote_asset_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        reason TEXT,
+        wallet TEXT NOT NULL,
+        native_sol REAL NOT NULL,
+        wallet_wsol REAL NOT NULL,
+        wallet_quote_sol REAL NOT NULL,
+        wallet_wsol_account_count INTEGER NOT NULL DEFAULT 0,
+        unknown_wallet_wsol_account_count INTEGER NOT NULL DEFAULT 0,
+        unwrap_signatures_json TEXT,
+        details_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_quote_asset_snapshots_ts
+        ON quote_asset_snapshots(ts);
+
+      CREATE TABLE IF NOT EXISTS tx_quote_reconciliations (
+        signature TEXT PRIMARY KEY,
+        parsed_at INTEGER NOT NULL,
+        mint TEXT,
+        native_sol_delta REAL,
+        wsol_delta REAL,
+        quote_asset_delta REAL,
+        token_delta REAL,
+        fee_lamports INTEGER,
+        success INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_tx_quote_reconciliations_parsed_at
+        ON tx_quote_reconciliations(parsed_at);
     `);
 
+    // Compatibility with the first wallet-only telemetry schema. SQLite has
+    // no ADD COLUMN IF NOT EXISTS.
+    for (const column of [
+      'reason TEXT',
+      'unknown_wallet_wsol_account_count INTEGER DEFAULT 0',
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE quote_asset_snapshots ADD COLUMN ${column}`);
+      } catch (_) { /* column already exists */ }
+    }
     // v3.17.19: migrate dump_slot column for upgrading from earlier schemas
     //   SQLite 不支持 ADD COLUMN IF NOT EXISTS,直接尝试,失败就忽略
     try {
@@ -493,6 +533,70 @@ ${snapshotColumnsSql},
   }
 
   _prepareStatements() {
+    const quoteSnapshotColumns = new Set(
+      this.db.prepare('PRAGMA table_info(quote_asset_snapshots)').all().map((row) => row.name),
+    );
+    const quoteInsertColumns = [
+      'ts', 'reason', 'wallet', 'native_sol', 'wallet_wsol', 'wallet_quote_sol',
+      'wallet_wsol_account_count', 'unknown_wallet_wsol_account_count',
+      'unwrap_signatures_json', 'details_json',
+    ];
+    const quoteInsertValues = [
+      '@ts', '@reason', '@wallet', '@nativeSol', '@walletWsol', '@walletQuoteSol',
+      '@walletWsolAccountCount', '@unknownWalletWsolAccountCount',
+      '@unwrapSignaturesJson', '@detailsJson',
+    ];
+    // If a database was briefly created by the incorrect router-vault build,
+    // satisfy its legacy NOT NULL columns with wallet-only values/zeroes.
+    for (const [column, value] of [
+      ['external_escrow_wsol', '0'],
+      ['jupiter_pending_wsol', '0'],
+      ['total_quote_equity_sol', '@walletQuoteSol'],
+      ['external_escrow_account_count', '0'],
+      ['jupiter_escrow_account_count', '0'],
+    ]) {
+      if (quoteSnapshotColumns.has(column)) {
+        quoteInsertColumns.push(column);
+        quoteInsertValues.push(value);
+      }
+    }
+    const quoteAssetInsertSql = `
+      INSERT INTO quote_asset_snapshots (${quoteInsertColumns.join(', ')})
+      VALUES (${quoteInsertValues.join(', ')})
+    `;
+
+    const txQuoteColumns = new Set(
+      this.db.prepare('PRAGMA table_info(tx_quote_reconciliations)').all().map((row) => row.name),
+    );
+    const txInsertColumns = [
+      'signature', 'parsed_at', 'mint', 'native_sol_delta', 'wsol_delta',
+      'quote_asset_delta', 'token_delta', 'fee_lamports', 'success',
+    ];
+    const txInsertValues = [
+      '@signature', '@parsedAt', '@mint', '@nativeSolDelta', '@wsolDelta',
+      '@quoteAssetDelta', '@tokenDelta', '@feeLamports', '@success',
+    ];
+    const txUpdateValues = [
+      'parsed_at = excluded.parsed_at',
+      'mint = excluded.mint',
+      'native_sol_delta = excluded.native_sol_delta',
+      'wsol_delta = excluded.wsol_delta',
+      'quote_asset_delta = excluded.quote_asset_delta',
+      'token_delta = excluded.token_delta',
+      'fee_lamports = excluded.fee_lamports',
+      'success = excluded.success',
+    ];
+    if (txQuoteColumns.has('jupiter_wsol_delta')) {
+      txInsertColumns.push('jupiter_wsol_delta');
+      txInsertValues.push('0');
+      txUpdateValues.push('jupiter_wsol_delta = 0');
+    }
+    const txQuoteUpsertSql = `
+      INSERT INTO tx_quote_reconciliations (${txInsertColumns.join(', ')})
+      VALUES (${txInsertValues.join(', ')})
+      ON CONFLICT(signature) DO UPDATE SET ${txUpdateValues.join(', ')}
+    `;
+
     this.stmts = {
       // ============ signals ============
       insertSignal: this.db.prepare(`
@@ -705,6 +809,10 @@ ${snapshotColumnsSql},
       cleanOldPriceSamples: this.db.prepare(`
         DELETE FROM price_samples WHERE ts < ?
       `),
+
+      insertQuoteAssetSnapshot: this.db.prepare(quoteAssetInsertSql),
+
+      upsertTxQuoteReconciliation: this.db.prepare(txQuoteUpsertSql),
 
       stuckPositions: this.db.prepare(`
         SELECT * FROM positions WHERE status = 'stuck' ORDER BY opened_at DESC
@@ -952,6 +1060,41 @@ ${snapshotColumnsSql},
   _cleanDbValue(value) {
     if (typeof value === 'number' && !Number.isFinite(value)) return null;
     return value ?? null;
+  }
+
+  saveQuoteAssetSnapshot(snapshot) {
+    if (!snapshot?.wallet) return;
+    try {
+      this.stmts.insertQuoteAssetSnapshot.run({
+        ts: snapshot.ts || Date.now(),
+        reason: snapshot.reason || null,
+        wallet: snapshot.wallet,
+        nativeSol: this._cleanDbValue(snapshot.nativeSol) || 0,
+        walletWsol: this._cleanDbValue(snapshot.walletWsol) || 0,
+        walletQuoteSol: this._cleanDbValue(snapshot.walletQuoteSol) || 0,
+        walletWsolAccountCount: snapshot.walletWsolAccountCount || 0,
+        unknownWalletWsolAccountCount: snapshot.unknownWalletWsolAccountCount || 0,
+        unwrapSignaturesJson: JSON.stringify(snapshot.unwrapSignatures || []),
+        detailsJson: snapshot.details == null ? null : JSON.stringify(snapshot.details),
+      });
+    } catch (_) { /* accounting telemetry must not block trading */ }
+  }
+
+  saveTxQuoteReconciliation(row) {
+    if (!row?.signature) return;
+    try {
+      this.stmts.upsertTxQuoteReconciliation.run({
+        signature: row.signature,
+        parsedAt: row.parsedAt || Date.now(),
+        mint: row.mint || null,
+        nativeSolDelta: this._cleanDbValue(row.nativeSolDelta),
+        wsolDelta: this._cleanDbValue(row.wsolDelta),
+        quoteAssetDelta: this._cleanDbValue(row.quoteAssetDelta),
+        tokenDelta: this._cleanDbValue(row.tokenDelta),
+        feeLamports: row.feeLamports || 0,
+        success: row.success ? 1 : 0,
+      });
+    } catch (_) { /* accounting telemetry must not block trading */ }
   }
 
   saveTokenSnapshot(snapshot) {

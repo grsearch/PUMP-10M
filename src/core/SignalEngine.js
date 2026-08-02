@@ -162,6 +162,10 @@ class SignalEngine extends EventEmitter {
     this.inflightBuys.delete(mint);
   }
 
+  hasInflightBuys() {
+    return this.inflightBuys.size > 0;
+  }
+
   _getMintBuyAllowance(mint, currentPrice) {
     const openCount = this.positionManager.openPositionCountByMint
       ? this.positionManager.openPositionCountByMint(mint)
@@ -236,7 +240,10 @@ class SignalEngine extends EventEmitter {
     // v3.17.16: 记录信号到达 SignalEngine 的时间,用于事后分析 emit→BUY 延迟
     const _signalReceivedAt = Date.now();
     const { mint, symbol, sellSol, priceImpactPct, seller, signature, ts, slot } = signal;
-    const isRsi1sSignal = Boolean(signal._activityFlow && signal._flow?.entryRsi1s);
+    const isRsi1sSignal = Boolean(
+      signal._activityFlow &&
+      (signal._flow?.entryRsi1s || signal._flow?.entryDropRebound1s),
+    );
 
 
     // 1. 自触发过滤
@@ -768,7 +775,14 @@ class SignalEngine extends EventEmitter {
     const slotGap = (slot && latestSlot) ? (latestSlot - slot) : null;
     const flow = signal._flow || null;
     let activityReason = null;
-    if (signal._activityFlow && flow?.entryRsi1s) {
+    if (signal._activityFlow && flow?.entryDropRebound1s) {
+      const entry = flow.entryDropRebound1s;
+      activityReason =
+        `drop_rebound_1s: drop=${entry.dropPct.toFixed(2)}% ` +
+        `rebound=+${entry.reboundPct.toFixed(2)}% ` +
+        `elapsed=${entry.reboundElapsedMs}ms<=${entry.reboundTimeoutMs}ms ` +
+        `peak=${entry.peakPrice} low=${entry.lowPrice} execution=${entry.executionPrice}`;
+    } else if (signal._activityFlow && flow?.entryRsi1s) {
       const entry = flow.entryRsi1s;
       activityReason =
         `rsi_1s_cross: RSI(${entry.period})=${entry.previousRsi.toFixed(2)}->` +
@@ -854,7 +868,7 @@ class SignalEngine extends EventEmitter {
           ts,
           mint,
           symbol,
-          kind: 'BUY_SIGNAL',
+          kind: flow?.entryDropRebound1s ? 'DROP_REBOUND_1S' : 'BUY_SIGNAL',
           sellSol,
           priceImpactPct,
           seller,
@@ -1010,7 +1024,9 @@ class SignalEngine extends EventEmitter {
       ts: signal.ts,
       mint: signal.mint,
       symbol: signal.symbol,
-      kind: signal._activityFlow ? 'ACTIVITY_FLOW' : 'DUMP_DETECTED',
+      kind: signal._flow?.entryDropRebound1s
+        ? 'DROP_REBOUND_1S'
+        : (signal._activityFlow ? 'ACTIVITY_FLOW' : 'DUMP_DETECTED'),
       sellSol: signal.sellSol,
       priceImpactPct: signal.priceImpactPct,
       seller: signal.seller,

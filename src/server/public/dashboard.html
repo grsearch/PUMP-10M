@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head><meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"><meta http-equiv="Pragma" content="no-cache"><meta http-equiv="Expires" content="0">
 <meta charset="UTF-8">
-<title>Dump Sniper · 1s RSI First Entry</title>
+<title>Dump Sniper · 1s Drop/Rebound</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
@@ -271,7 +271,7 @@
 <body>
 
 <div class="header">
-  <h1>🎯 Dump Sniper <span class="v">1s RSI First Entry</span></h1>
+  <h1>🎯 Dump Sniper <span class="v">1s Drop/Rebound</span></h1>
   <div class="badges">
     <a href="/reports.html" style="color:var(--accent);text-decoration:none;font-size:12px;font-weight:500;margin-right:8px;">📅 报告</a>
     <span id="modeBadge" class="badge dry">DRY_RUN</span>
@@ -288,11 +288,14 @@
       <div class="status-grid">
         <div class="status-item"><div class="label">监控代币</div><div class="value" id="stat-watched">-</div></div>
         <div class="status-item"><div class="label">当前持仓</div><div class="value" id="stat-open">-</div></div>
-        <div class="status-item"><div class="label">回调/上涨均量（观测）</div><div class="value" id="stat-volume1m">-</div></div>
+        <div class="status-item"><div class="label">监控过滤</div><div class="value" id="stat-volume1m">-</div></div>
         <div class="status-item"><div class="label">入场模式</div><div class="value" id="stat-trades1m">-</div></div>
         <div class="status-item"><div class="label">每笔仓位</div><div class="value" id="stat-size">-</div></div>
         <div class="status-item"><div class="label">移动止盈</div><div class="value" id="stat-trailing">-</div></div>
         <div class="status-item"><div class="label">强制退出</div><div class="value" id="stat-forced">-</div></div>
+        <div class="status-item"><div class="label">钱包 SOL</div><div class="value" id="stat-native-sol">待对账</div></div>
+        <div class="status-item"><div class="label">钱包 WSOL</div><div class="value" id="stat-wallet-wsol">待对账</div></div>
+        <div class="status-item"><div class="label">SOL+WSOL 合计</div><div class="value" id="stat-wallet-quote">待对账</div></div>
       </div>
     </div>
   </div>
@@ -341,7 +344,7 @@
     <div class="panel-head"><h2>📜 实时日志</h2></div>
     <div class="tabs">
       <div class="tab active" data-tab="positions">持仓 / 平仓</div>
-      <div class="tab" data-tab="signals">RSI 信号</div>
+      <div class="tab" data-tab="signals">急跌反弹信号</div>
       <div class="tab" data-tab="trades">交易</div>
     </div>
     <div class="panel-body">
@@ -389,8 +392,8 @@
         <div id="strategySignalMeta" class="strategy-meta"><span>等待实时数据</span></div>
         <div class="table-wrap" style="overflow:auto;">
           <table class="strategy-table">
-            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>上一收盘 RSI(7)</th><th>当前收盘 RSI(7)</th><th>实时 RSI(7)</th><th>已收盘 1s K</th><th>上涨均量(观测)</th><th>回调均量(观测)</th><th>回调/上涨(观测)</th><th>1s EMA20(观测)</th><th>EMA20斜率(观测)</th><th>近60s量(观测)</th><th>信号 K 收盘</th><th>状态说明</th><th>阶段</th></tr></thead>
-            <tbody id="signalsTbody"><tr><td colspan="13" class="empty">暂无活跃成交</td></tr></tbody>
+            <thead><tr><th>更新</th><th>Symbol</th><th>CA</th><th>AGE</th><th>FDV</th><th>LP</th><th>当前价</th><th>1s 高点</th><th>1s 跌幅</th><th>候选低点</th><th>反弹</th><th>等待截止</th><th>最后信号</th><th>状态说明</th><th>阶段</th></tr></thead>
+            <tbody id="signalsTbody"><tr><td colspan="15" class="empty">暂无活跃成交</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -487,11 +490,15 @@ async function refreshStatus() {
   $('modeBadge').className = 'badge ' + (r.dryRun ? 'dry' : 'live');
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
-  $('stat-volume1m').textContent = '仅观测，不过滤';
-  $('stat-trades1m').textContent = `1s RSI(${r.config.rsi1sPeriod}) ↑ ${r.config.rsi1sEntryThreshold} / 实时≤${r.config.rsi1sLiveMax}`;
+  $('stat-volume1m').textContent = 'FDV $10k-$500k / LP≥$3k';
+  $('stat-trades1m').textContent = `1s 跌 ${r.config.dropMinPct}-${r.config.dropMaxPct}% / 反弹 ${r.config.reboundMinPct}-${r.config.reboundMaxPct}%`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-trailing').textContent = `+${r.config.trailingActivatePct}% / ${r.config.trailingDrawdownPct}%`;
-  $('stat-forced').textContent = `最长 ${Math.round((r.config.maxHoldMs ?? 30000) / 1000)}s / AGE ${Math.round(r.config.ageExitMs / 60000)}m`;
+  $('stat-forced').textContent = `最长持仓 ${Math.round((r.config.maxHoldMs ?? 10000) / 1000)}s / AGE ${Math.round((r.config.maxTokenAgeMs ?? 240000) / 60000)}m移出`;
+  const quote = r.quoteAssets;
+  $('stat-native-sol').textContent = quote ? Number(quote.nativeSol || 0).toFixed(4) + ' SOL' : '待对账';
+  $('stat-wallet-wsol').textContent = quote ? Number(quote.walletWsol || 0).toFixed(4) + ' WSOL' : '待对账';
+  $('stat-wallet-quote').textContent = quote ? Number(quote.walletQuoteSol || 0).toFixed(4) + ' SOL' : '待对账';
   $('statusMeta').textContent = new Date().toLocaleTimeString();
 }
 
@@ -716,16 +723,8 @@ function _strategyNumber(value, digits = 2) {
 function _strategyStage(candidate, now) {
   const labels = {
     monitoring: '扫描',
-    warming: 'RSI预热',
-    'live-rsi-blocked': '实时RSI过高',
-    collecting: '累计10m',
-    cancelled: '已取消',
-    ready: '待激活',
-    armed: '已激活',
-    waiting: '等待恢复',
-    confirming: '确认 1/2',
+    waiting: '等待反弹',
     signaled: '入场信号',
-    expired: '已过期',
     ineligible: '不符合',
   };
   const stage = candidate.stage || 'monitoring';
@@ -742,53 +741,51 @@ async function refreshSignals() {
   const meta = $('strategySignalMeta');
   const tbody = $('signalsTbody');
   if (!r.ok) {
-    meta.innerHTML = `<span class="neg">${escapeHtml(r.error || '1s RSI 实时数据不可用')}</span>`;
-    tbody.innerHTML = '<tr><td colspan="16" class="empty">等待 1s RSI 回调数据</td></tr>';
+    meta.innerHTML = `<span class="neg">${escapeHtml(r.error || '急跌反弹实时数据不可用')}</span>`;
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">等待急跌反弹数据</td></tr>';
     return;
   }
 
   const summary = r.summary || {};
   const thresholds = r.thresholds || {};
   const rows = r.candidates || [];
-  const trailingActivate = thresholds.trailingActivatePct ?? 10;
-  const trailingDrawdown = thresholds.trailingDrawdownPct ?? 5;
+  const trailingActivate = thresholds.trailingActivatePct ?? 8;
+  const trailingDrawdown = thresholds.trailingDrawdownPct ?? 3;
   meta.innerHTML = [
-    `<span>买入 <b>已收盘 1s RSI(${thresholds.rsiPeriod || 7}) 从 ≤${thresholds.entryCross ?? 30} 上穿，实时RSI ≤${thresholds.liveRsiMax ?? 50}</b></span>`,
-    `<span>观测指标 <b>回调/上涨量、EMA${thresholds.emaPeriod ?? 20}及近60s真实成交量均只记录，不过滤</b></span>`,
+    `<span>买入 <b>${thresholds.dropWindowMs ?? 1000}ms 内跌 ${thresholds.dropMinPct ?? 10}%～${thresholds.dropMaxPct ?? 20}%</b></span>`,
+    `<span>反弹确认 <b>低点反弹 ${thresholds.reboundMinPct ?? 2}%～${thresholds.reboundMaxPct ?? 5}%，须在 ${thresholds.reboundTimeoutMs ?? 1000}ms 内完成</b></span>`,
+    `<span>监控 <b>FDV $${Math.round((thresholds.minFdvUsd ?? 10000) / 1000)}k～$${Math.round((thresholds.maxFdvUsd ?? 500000) / 1000)}k / LP ≥ $${Math.round((thresholds.minLiquidityUsd ?? 3000) / 1000)}k / AGE &lt; ${Math.round((thresholds.maxTokenAgeMs ?? 240000) / 60000)}m</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
-    `<span>RSI卖出 <b>&gt;${thresholds.exitOverbought ?? 80} 或下穿 ${thresholds.exitCrossDown ?? 70}；移动止盈激活后屏蔽</b></span>`,
-    `<span>10秒反弹失败 <b>${thresholds.noRecoveryExitEnabled === false ? '关闭' : `收益≤${thresholds.noRecoveryMaxCurrentPnlPct ?? -1}% / 峰值≤+${thresholds.noRecoveryMaxPeakPnlPct ?? 1}% / RSI≤${thresholds.noRecoveryMaxLiveRsi ?? 50}`}</b></span>`,
-    `<span>固定止损 <b>${(thresholds.fixedStopLossPct ?? 0) < 0 ? `${thresholds.fixedStopLossPct}%` : '关闭'}</b></span>`,
-    `<span>强制卖出 <b>最长持仓 ${Math.round((thresholds.maxHoldMs ?? 30000) / 1000)}s / AGE ≥ ${Math.round((thresholds.ageExitMs ?? 900000) / 60000)}m；FDV退出关闭</b></span>`,
-    `<span>同币开仓 <b>每币只允许成功开仓一次；不加仓，卖出或重启后也不重入</b></span>`,
+    `<span>最长持仓 <b>${Math.round((thresholds.maxHoldMs ?? 10000) / 1000)}s</b></span>`,
+    `<span>旧策略 <b>RSI、EMA、成交量、固定止损及其他策略退出均关闭</b></span>`,
+    `<span>同币开仓 <b>不重叠持仓；平仓后可等待下一次完整信号</b></span>`,
     `<span>活跃 <b>${summary.active || 0}</b></span>`,
-    `<span>预热 <b>${summary.warming || 0}</b></span>`,
-    `<span>实时RSI过高 <b>${summary.liveRsiBlocked || 0}</b></span>`,
+    `<span>等待反弹 <b>${summary.waiting || 0}</b></span>`,
     `<span>实盘信号 <b>${summary.signaled || 0}</b></span>`,
+    `<span>不符合 <b>${summary.ineligible || 0}</b></span>`,
   ].join('');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="16" class="empty">暂无活跃成交</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" class="empty">暂无活跃成交</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(candidate => {
     const detail = candidate.waitReason ||
-      (candidate.stage === 'signaled' ? '信号确认后已立即触发' : `等待 RSI 上穿且实时 RSI ≤${thresholds.liveRsiMax ?? 50}`);
+      (candidate.stage === 'signaled' ? '急跌与反弹已确认，已立即触发' : '扫描滚动1秒急跌');
     return `
       <tr>
         <td class="mono">${fmtTime(candidate.updatedAt)}</td>
         <td><b>${escapeHtml(candidate.symbol || (candidate.mint || '').slice(0,6))}</b></td>
         ${caCell(candidate.mint)}
-        <td>${_strategyNumber(candidate.rsiPrevious)}</td>
-        <td>${_strategyNumber(candidate.rsiCurrent)}</td>
-        <td>${_strategyNumber(candidate.rsiLive)}</td>
-        <td>${candidate.closedBars || 0}</td>
-        <td>${fmtMoney(candidate.upVolumeAvgUsd)}</td>
-        <td>${fmtMoney(candidate.downVolumeAvgUsd)}</td>
-        <td>${_strategyNumber(candidate.downUpVolumeRatio, 3)}</td>
-        <td>${_strategyNumber(candidate.ema1s20, 8)}</td>
-        <td>${candidate.ema1s20SlopeReady ? `${_strategyNumber(candidate.ema1s20Slope20sPct, 3)}%` : '预热放行'}</td>
-        <td>${fmtMoney(candidate.volume60sUsd)}</td>
-        <td class="mono">${candidate.signalCandleTs ? fmtTime(candidate.signalCandleTs) : '-'}</td>
+        <td>${candidate.ageMs == null ? '-' : `${_strategyNumber(candidate.ageMs / 60000, 2)}m`}</td>
+        <td>${fmtMoney(candidate.fdv)}</td>
+        <td>${fmtMoney(candidate.liquidity)}</td>
+        <td>${_strategyNumber(candidate.latestPrice, 8)}</td>
+        <td>${_strategyNumber(candidate.rollingHigh, 8)}</td>
+        <td>${candidate.rollingDropPct == null ? '-' : `${_strategyNumber(candidate.rollingDropPct, 2)}%`}</td>
+        <td>${_strategyNumber(candidate.lowPrice, 8)}</td>
+        <td>${candidate.reboundPct == null ? '-' : `+${_strategyNumber(candidate.reboundPct, 2)}%`}</td>
+        <td class="mono">${candidate.waitUntil ? fmtTime(candidate.waitUntil) : '-'}</td>
+        <td class="mono">${candidate.lastSignalTs ? fmtTime(candidate.lastSignalTs) : '-'}</td>
         <td style="max-width:260px">${escapeHtml(detail)}</td>
         <td>${_strategyStage(candidate, r.now || Date.now())}</td>
       </tr>`;
