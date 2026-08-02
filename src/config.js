@@ -54,8 +54,9 @@ const config = {
     // 仓位
     positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.2'),
 
-    // The drop/rebound strategy has exactly two market exits: trailing and
-    // the ten-second holding timeout. Legacy fixed exits stay hard-disabled.
+    // Production exits: fast +8% TP in the first five seconds, a one-shot
+    // loss check at six seconds, trailing, and the fifteen-second timeout.
+    // Legacy fixed exits stay hard-disabled.
     takeProfitPct: 0,
     tpConfirmCount: parseInt(process.env.TP_CONFIRM_COUNT || '2', 10),
     tpConfirmMinGapMs: parseInt(process.env.TP_CONFIRM_MIN_GAP_MS || '300', 10),
@@ -66,15 +67,18 @@ const config = {
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
     trailingActivatePct: 8,
     trailingDrawdownPct: 3,
+    fastTakeProfitPct: 8,
+    fastTakeProfitWindowMs: 5_000,
+    lossCheckAtMs: 6_000,
     // Exact production rule: once armed, a 3% drawdown exits immediately.
     // Ignore stale server env values that previously added a hidden delay.
     trailingMinHwmAgeMs: 0,
 
     // AGE is a watchlist rule, not a position exit. Positions use their own
-    // ten-second timer and a mint may trade again after its prior leg closes.
+    // fifteen-second timer and a mint may trade again after its prior leg closes.
     fdvExitThresholdUsd: 0,
     ageExitMs: 0,
-    maxHoldMs: 10_000,
+    maxHoldMs: 15_000,
     addonDropPct: 15,
     maxBuysPerMint: 1,
     oneBuyPerMint: false,
