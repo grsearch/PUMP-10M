@@ -27,40 +27,18 @@ class TokenWatchdog {
     this.fetchMarkets = fetchMarkets || fetchTokenMarketsFromDexScreener;
     this.fetchMarket = fetchMarket || fetchTokenMarketOnly;
 
-    this.maxWatchDurationMs = process.env.MAX_WATCH_DURATION_MS != null
-      ? parseInt(process.env.MAX_WATCH_DURATION_MS, 10)
-      : config.strategy.maxWatchDurationMs;
+    this.maxWatchDurationMs = 0;
     const configuredMaxTokenAgeMs = Number(config.strategy.maxTokenAgeMs) || 0;
-    const forcedAgeExitMs = Number(config.strategy.ageExitMs) || 0;
-    this.maxTokenAgeMs = configuredMaxTokenAgeMs > 0 && forcedAgeExitMs > 0
-      ? Math.min(configuredMaxTokenAgeMs, forcedAgeExitMs)
-      : Math.max(configuredMaxTokenAgeMs, forcedAgeExitMs);
-    const configuredMinFdVUsd = process.env.MIN_FDV_USD != null
-      ? parseFloat(process.env.MIN_FDV_USD)
-      : config.strategy.minFdVUsd;
-    this.minFdVUsd = Math.max(
-      Number.isFinite(configuredMinFdVUsd) ? configuredMinFdVUsd : 0,
-      Number(config.strategy.fdvExitThresholdUsd) || 0,
-    );
-    this.maxFdVUsd = process.env.MAX_FDV_USD != null
-      ? parseFloat(process.env.MAX_FDV_USD)
-      : (config.strategy.maxFdVUsd || 0);
-    this.minLiquidityUsd = process.env.MIN_LIQUIDITY_USD != null
-      ? parseFloat(process.env.MIN_LIQUIDITY_USD)
-      : config.strategy.minLiquidityUsd;
-    this.minVolume24hUsd = parseFloat(process.env.MIN_VOLUME_24H_USD || '20000');
-    this.noBuyRemoveMs = parseInt(process.env.NO_BUY_REMOVE_MS || '86400000', 10);
-    const configuredCheckIntervalMs = Math.max(
-      10_000,
-      parseInt(process.env.WATCHDOG_CHECK_INTERVAL_MS || '60000', 10),
-    );
-    this.checkIntervalMs = Math.min(60_000, configuredCheckIntervalMs);
-    if (configuredCheckIntervalMs > this.checkIntervalMs) {
-      console.warn(
-        `[TokenWatchdog] WATCHDOG_CHECK_INTERVAL_MS=${configuredCheckIntervalMs} is obsolete; ` +
-        'clamped to 60000ms',
-      );
-    }
+    this.maxTokenAgeMs = configuredMaxTokenAgeMs;
+    this.minFdVUsd = Number(config.strategy.minFdVUsd) || 0;
+    this.maxFdVUsd = Number(config.strategy.maxFdVUsd) || 0;
+    this.minLiquidityUsd = Number(config.strategy.minLiquidityUsd) || 0;
+    this.minVolume24hUsd = 0;
+    this.noBuyRemoveMs = 0;
+    // AGE is checked every ten seconds. Market providers are still refreshed
+    // at most once per minute so the tighter AGE rule does not multiply API load.
+    this.checkIntervalMs = 10_000;
+    this.marketRefreshIntervalMs = 60_000;
     this.marketStaleMs = Math.max(
       this.checkIntervalMs * 3,
       parseInt(process.env.WATCHDOG_MARKET_STALE_MS || '180000', 10),
@@ -187,8 +165,8 @@ class TokenWatchdog {
       const lastSuccess = Number(token.market_updated_at) || 0;
       const lastAttempt = this._lastMarketAttemptAt.get(token.mint) || 0;
       return (
-        now - lastSuccess >= this.checkIntervalMs &&
-        now - lastAttempt >= Math.min(this.checkIntervalMs, 10_000)
+        now - lastSuccess >= this.marketRefreshIntervalMs &&
+        now - lastAttempt >= Math.min(this.marketRefreshIntervalMs, 10_000)
       );
     });
     if (due.length === 0) return { refreshed: 0, failed: 0 };
@@ -383,7 +361,7 @@ class TokenWatchdog {
       this._lastMarketAttemptAt.delete(token.mint);
       removed++;
 
-      if (this.onTokenRemoved) this.onTokenRemoved();
+      if (this.onTokenRemoved) this.onTokenRemoved(token.mint);
       monitor.inc('TokenWatchdog.tokensRemoved', 1, 'TokenWatchdog');
     }
 

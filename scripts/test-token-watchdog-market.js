@@ -156,7 +156,7 @@ assert.strictEqual(
       {
         fdv: null,
         liquidity: 4_000,
-        pairCreatedAt: now - 10 * 60_000,
+        pairCreatedAt: now - 60_000,
         marketComplete: false,
         marketSource: 'dexscreener',
         fetchedAt: now,
@@ -175,18 +175,18 @@ assert.strictEqual(
   else process.env.WATCHDOG_CHECK_INTERVAL_MS = previousCheckInterval;
   assert.strictEqual(
     watchdog.checkIntervalMs,
-    60_000,
-    'legacy 15-minute watchdog configuration must be clamped to one minute',
+    10_000,
+    'AGE must be checked every ten seconds',
   );
   assert.strictEqual(
     watchdog.maxTokenAgeMs,
-    15 * 60_000,
-    'watchdog must align removal with the 15-minute forced-exit policy',
+    4 * 60_000,
+    'watchdog must remove migrated tokens at four minutes',
   );
   assert.strictEqual(
     watchdog.minFdVUsd,
-    20_000,
-    'watchdog must align removal with the $20,000 forced-exit policy',
+    10_000,
+    'watchdog must enforce the $10,000 monitoring floor',
   );
   watchdog.minLiquidityUsd = 3_000;
   watchdog.minVolume24hUsd = 0;
@@ -194,13 +194,13 @@ assert.strictEqual(
 
   await watchdog._check();
   assert.strictEqual(token.market_source, 'birdeye');
-  assert.strictEqual(token.migration_time, now - 10 * 60_000);
+  assert.strictEqual(token.migration_time, now - 60_000);
   assert.strictEqual(token.migration_time_source, 'dexscreener_pairCreatedAt');
   assert.strictEqual(removed, true, 'fresh FDV below the threshold must remove the token');
 
   const staleToken = {
     ...token,
-    migration_time: now - 10 * 60_000,
+    migration_time: now - 60_000,
     fdv: 2_000,
     liquidity: 1_000,
     market_updated_at: now - 10 * 60_000,
@@ -239,7 +239,7 @@ assert.strictEqual(
     mint,
     symbol: 'OLDAGE',
     added_at: now - 60_000,
-    migration_time: now - 15 * 60_000,
+    migration_time: now - 4 * 60_000,
     is_active: 1,
   };
   let oldAgeRemoved = false;
@@ -260,7 +260,7 @@ assert.strictEqual(
   oldAgeWatchdog.maxWatchDurationMs = 0;
 
   await oldAgeWatchdog._check();
-  assert.strictEqual(oldAgeRemoved, true, 'migration AGE at 15 minutes must remove the token');
+  assert.strictEqual(oldAgeRemoved, true, 'migration AGE at four minutes must remove the token');
 
   let openAgeRemoved = false;
   const openAgeWatchdog = new TokenWatchdog({

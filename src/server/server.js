@@ -18,6 +18,7 @@ class Server {
     activityFlowTracker,
     dailyReport,
     competitorTracker,
+    quoteAssetReconciler,
     onTokenListChanged,
     onTokenAdded,
   }) {
@@ -28,6 +29,7 @@ class Server {
     this.activityFlowTracker = activityFlowTracker || null;
     this.dailyReport = dailyReport;
     this.competitorTracker = competitorTracker || null;
+    this.quoteAssetReconciler = quoteAssetReconciler || null;
     this.onTokenListChanged = onTokenListChanged;
     this.onTokenAdded = onTokenAdded;
 
@@ -368,42 +370,30 @@ class Server {
         dryRun: config.DRY_RUN,
         watchedTokens: this.tokenRegistry.listActive().length,
         openPositions: this.positionManager.openPositionCount(),
+        quoteAssets: this.quoteAssetReconciler?.getLatestSnapshot?.() || null,
         config: {
           minSellSol: config.strategy.minSellSol,
           minPriceImpactPct: config.strategy.minPriceImpactPct,
           activityVolume1mUsd: config.activityFlow.minVolume1mUsd,
           activityTrades1m: config.activityFlow.minTrades1m,
           activityEntryMode: config.activityFlow.entryMode,
-          rsi1sPeriod: config.activityFlow.rsi1sPeriod,
-          rsi1sEntryThreshold: config.activityFlow.rsi1sEntryThreshold,
-          rsi1sLiveMax: config.activityFlow.rsi1sLiveMax,
-          rsi1sVolumeWindowMs: config.activityFlow.rsi1sVolumeWindowMs,
-          volume60sFilterEnabled: false,
-          pullbackVolumeFilterEnabled: false,
-          rsi1sPhaseLookbackMs: config.activityFlow.rsi1sPhaseLookbackMs,
-          emaSlopeFilterEnabled: false,
-          ema1sPeriod: config.activityFlow.ema1sPeriod,
-          ema1sSlopeLookbackSeconds: config.activityFlow.ema1sSlopeLookbackSeconds,
-          ema1sMinSlopePct: config.activityFlow.ema1sMinSlopePct,
+          dropWindowMs: config.activityFlow.dropWindowMs,
+          dropMinPct: config.activityFlow.dropMinPct,
+          dropMaxPct: config.activityFlow.dropMaxPct,
+          reboundMinPct: config.activityFlow.reboundMinPct,
+          reboundMaxPct: config.activityFlow.reboundMaxPct,
+          reboundTimeoutMs: config.activityFlow.reboundTimeoutMs,
+          minFdvUsd: config.strategy.minFdVUsd,
+          maxFdvUsd: config.strategy.maxFdVUsd,
+          minLiquidityUsd: config.strategy.minLiquidityUsd,
+          maxTokenAgeMs: config.strategy.maxTokenAgeMs,
           positionSizeSol: config.strategy.positionSizeSol,
           takeProfitPct: config.strategy.takeProfitPct,
           trailingActivatePct: config.strategy.trailingActivatePct,
           trailingDrawdownPct: config.strategy.trailingDrawdownPct,
-          fdvExitThresholdUsd: config.strategy.fdvExitThresholdUsd,
-          ageExitMs: config.strategy.ageExitMs,
           maxHoldMs: config.strategy.maxHoldMs,
-          addonDropPct: config.strategy.addonDropPct,
           maxBuysPerMint: config.strategy.maxBuysPerMint,
           oneBuyPerMint: config.strategy.oneBuyPerMint,
-          fixedStopLossPct: config.strategy.fixedStopLossPct,
-          rsi1sExitEnabled: config.strategy.rsi1sExitEnabled,
-          rsi1sOverboughtExit: config.strategy.rsi1sOverboughtExit,
-          rsi1sCrossDownExit: config.strategy.rsi1sCrossDownExit,
-          noRecoveryExitEnabled: config.strategy.noRecoveryExitEnabled,
-          noRecoveryExitMs: config.strategy.noRecoveryExitMs,
-          noRecoveryMaxCurrentPnlPct: config.strategy.noRecoveryMaxCurrentPnlPct,
-          noRecoveryMaxPeakPnlPct: config.strategy.noRecoveryMaxPeakPnlPct,
-          noRecoveryMaxLiveRsi: config.strategy.noRecoveryMaxLiveRsi,
         },
       });
     });

@@ -445,6 +445,10 @@ class PositionManager extends EventEmitter {
     return this.positions.size;
   }
 
+  hasPendingSells() {
+    return this._sellInProgress.size > 0 || this._sellQueues.size > 0;
+  }
+
   /**
    * v3.17.13: 从 PoolStateCache 获取代币当前价格
    *   用于 PriceTracker 没有价格时的 fallback
@@ -1143,7 +1147,7 @@ class PositionManager extends EventEmitter {
         config.strategy.maxHoldMs > 0 &&
         age >= config.strategy.maxHoldMs
       ) {
-        forcedExitReason = 'HOLD_TIMEOUT_30S';
+        forcedExitReason = `HOLD_TIMEOUT_${Math.round(config.strategy.maxHoldMs / 1000)}S`;
       } else if (
         config.strategy.fdvExitThresholdUsd > 0 &&
         Number.isFinite(fdv) &&

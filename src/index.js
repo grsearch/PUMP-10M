@@ -18,14 +18,15 @@ const { getMonitor } = require('./monitor/HealthMonitor');
 const AlertChecker = require('./monitor/AlertChecker');
 const TokenWatchdog = require('./core/TokenWatchdog');
 const CompetitorTracker = require('./core/CompetitorTracker');
-const ActivityFlowTracker = require('./core/OrderFlowTracker');
+const DropReboundTracker = require('./core/DropReboundTracker');
 const PumpGraduationDiscovery = require('./core/PumpGraduationDiscovery');
 const FeatureRecorder = require('./core/FeatureRecorder');
+const QuoteAssetReconciler = require('./core/QuoteAssetReconciler');
 
 const monitor = getMonitor();
 
 async function main() {
-  const watchdogCheckIntervalMs = parseInt(process.env.WATCHDOG_CHECK_INTERVAL_MS || '60000', 10);
+  const watchdogCheckIntervalMs = 10_000;
   const watchdogMinFdvUsd = Math.max(
     Number(config.strategy.minFdVUsd) || 0,
     Number(config.strategy.fdvExitThresholdUsd) || 0,
@@ -59,33 +60,14 @@ async function main() {
   }
   console.log(`TP: ${config.strategy.takeProfitPct > 0 ? `+${config.strategy.takeProfitPct}%` : 'disabled'}`);
   console.log(`Trailing: arm at +${config.strategy.trailingActivatePct}% / drawdown ${config.strategy.trailingDrawdownPct}%`);
+  console.log('Legacy RSI, no-recovery, fixed-stop, FDV, AGE and flow exits: disabled');
+  console.log(`Forced exit: max hold ${config.strategy.maxHoldMs / 1000}s`);
   console.log(
-    `RSI(1s) exit before trailing: >${config.strategy.rsi1sOverboughtExit} or ` +
-      `cross below ${config.strategy.rsi1sCrossDownExit}; disabled after trailing arms`,
+    `Entry: rolling ${config.activityFlow.dropWindowMs}ms drop ` +
+      `${config.activityFlow.dropMinPct}-${config.activityFlow.dropMaxPct}%, ` +
+      `then +${config.activityFlow.reboundMinPct}-${config.activityFlow.reboundMaxPct}% rebound ` +
+      `within ${config.activityFlow.reboundTimeoutMs}ms`,
   );
-  console.log(
-    config.strategy.noRecoveryExitEnabled
-      ? `No-recovery exit: after ${config.strategy.noRecoveryExitMs / 1000}s, ` +
-        `pnl<=${config.strategy.noRecoveryMaxCurrentPnlPct}%, ` +
-        `peak<=+${config.strategy.noRecoveryMaxPeakPnlPct}%, ` +
-        `live RSI<=${config.strategy.noRecoveryMaxLiveRsi}; one-shot before trailing`
-      : 'No-recovery exit: disabled',
-  );
-  console.log(
-    `Forced exits: max hold ${config.strategy.maxHoldMs / 1000}s / ` +
-      `migration AGE >= ${config.strategy.ageExitMs / 60_000}min / FDV disabled`,
-  );
-  console.log(
-    `Entry: closed RSI(${config.activityFlow.rsi1sPeriod},1s) cross above ` +
-      `${config.activityFlow.rsi1sEntryThreshold}, live RSI<=${config.activityFlow.rsi1sLiveMax}; ` +
-      `pullback volume, EMA${config.activityFlow.ema1sPeriod}, and ` +
-      `${config.activityFlow.rsi1sVolumeWindowMs / 1000}s total volume are observation-only`,
-  );
-  console.log(config.strategy.flowReversalExitEnabled
-    ? `Flow exit: ${config.strategy.flowReversalExitMode} ` +
-      `(2 closed 15s net-flow values, + to -` +
-      `${config.strategy.flowReversalExitRequireSellerBreadth ? ', sellers>=buyers' : ''})`
-    : 'Flow exit: disabled');
   console.log(`Legacy dumpSignal: ${config.activityFlow.replaceDumpSignal ? 'suppressed' : 'allowed fallback'}`);
   console.log(`Rebuy cooldown: ${config.strategy.rebuyCooldownMs > 0 ? config.strategy.rebuyCooldownMs / 60_000 + 'min after close' : 'disabled'}`);
   console.log(
@@ -101,8 +83,14 @@ async function main() {
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
       `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms`,
   );
-  console.log('Entry frequency: one successful position per mint for its full persisted history');
+  console.log('Entry frequency: no overlapping position per mint; re-entry is allowed after close');
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
+  console.log(
+    `WSOL reconcile: ${config.quoteAssetReconciler.enabled
+      ? 'read on startup/sell; auto-unwrap at 00:00/06:00/12:00/18:00 BJT'
+      : 'disabled'}; wallet-owned accounts only; ` +
+      `threshold=${config.quoteAssetReconciler.autoUnwrapMinSol} SOL`,
+  );
   console.log(`Pump graduation discovery: ${config.pumpDiscovery.enabled ? 'enabled' : 'disabled'}`);
   console.log('================================================');
 
@@ -124,6 +112,7 @@ async function main() {
   const priceTracker = new PriceTracker();
   const dumpDetector = new DumpDetector(tokenRegistry);
   const executor = new Executor();
+  executor.setTradeLogger(tradeLogger);
 
   // v3.5: PoolStateCache - 后台预热所有监控代币的 Pump pool state
   // BUY 路径不再阻塞 swapSolanaState（80-150ms RPC），从内存读 0ms
@@ -170,67 +159,9 @@ async function main() {
   // v3.17.17: SS pre-warm 需要 tokenRegistry 做 base_vault → mint 反查
   tickStream.setTokenRegistry(tokenRegistry);
 
-  // RsiCalculator supplies the closed 1-second entry/exit signal and price history.
-  const RsiCalculator = require('./core/RsiCalculator');
-  const rsiCalculator = new RsiCalculator({
-    period1: config.activityFlow.rsi1sPeriod,
-    period5: 7,
-    period15: 7,
-    ema1sPeriod: config.activityFlow.ema1sPeriod,
-    ema1sSlopeLookbackSeconds: config.activityFlow.ema1sSlopeLookbackSeconds,
-    period60: config.activityFlow.rsi1mPeriod,
-    priceScaleResetRatio: config.activityFlow.rsiPriceScaleResetRatio,
-  });
-  if (rsiCalculator) {
-    console.log(
-      `[main] RSI calculator enabled for closed 1s entry/exit and ` +
-        `EMA${config.activityFlow.ema1sPeriod} ${config.activityFlow.ema1sSlopeLookbackSeconds}s slope`,
-    );
-    setInterval(() => rsiCalculator.cleanup(), 60_000);
-
-    // Rebuild RSI from captured swaps. The lookback is a maximum, not a token-age
-    // requirement: a newly migrated token uses every minute that actually exists.
-    try {
-      const warmupMinutes = Math.max(
-        config.activityFlow.rsi1mPeriod + 1,
-        config.activityFlow.rsi1mWarmupMaxMinutes,
-      );
-      const warmupStart = Date.now() - warmupMinutes * 60_000;
-      const warmupRows = tradeLogger.db.prepare(`
-        SELECT mint, ts, price, sol_volume, side, pool_quote_after
-        FROM swap_events
-        WHERE ts > ? AND price > 0
-        ORDER BY ts ASC, id ASC
-      `).all(warmupStart);
-      let fed = 0;
-      for (const r of warmupRows) {
-        const solVolume = Number(r.sol_volume);
-        const side = String(r.side || '').toLowerCase();
-        if (solVolume > 0 && (side === 'buy' || side === 'sell')) {
-          rsiCalculator.feedTrade(
-            r.mint,
-            Number(r.price),
-            solVolume,
-            side,
-            Number(r.ts),
-            Number(r.pool_quote_after) || null,
-          );
-        } else {
-          rsiCalculator.feedTick(r.mint, Number(r.price), Number(r.ts));
-        }
-        fed++;
-      }
-      console.log(
-        `[main] RSI warmup: fed ${fed} swap events from up to ${warmupMinutes}min ` +
-          '(new tokens use available history only)',
-      );
-    } catch (e) {
-      console.warn('[main] RSI warmup failed:', e.message);
-    }
-  }
-
-  // ============ EMA Service（EMA 砸单买入策略） ============
-      // EMA watch removed
+  // Retained as an explicit null for compatibility with SignalEngine's
+  // constructor. The live path has no RSI/EMA calculator or warmup work.
+  const rsiCalculator = null;
 
   // ============ Competitor Tracker（竞争对手钱包分析） ============
   //   v3.17.32: 移到 DailyReport 之前，以便注入 competitorTracker
@@ -259,11 +190,11 @@ async function main() {
     },
     enrichEntry: (process.env.COMPETITOR_ENRICH ?? 'true').toLowerCase() === 'true',
     // 跟卖默认关闭（用户选择"只记录分析"）。看完数据后设 COMPETITOR_FOLLOW_SELL=true 即启用。
-    followSell: (process.env.COMPETITOR_FOLLOW_SELL ?? 'false').toLowerCase() === 'true',
+    followSell: false,
     followSellMinWinRate: parseFloat(process.env.COMPETITOR_FOLLOW_SELL_MIN_WINRATE || '60'),
     followSellMinClosed: parseInt(process.env.COMPETITOR_FOLLOW_SELL_MIN_CLOSED || '10', 10),
   });
-  const activityFlowTracker = new ActivityFlowTracker({ tokenRegistry, tradeLogger });
+  const activityFlowTracker = new DropReboundTracker({ tokenRegistry, tradeLogger });
   const featureRecorder = new FeatureRecorder({ tradeLogger, tokenRegistry });
   featureRecorder.start();
   const swapSanitizer = dumpDetector.swapEventSanitizer;
@@ -274,11 +205,11 @@ async function main() {
       `independentSources>=${swapSanitizer.confirmMinIndependentSources}`,
   );
   console.log(
-    `[main] ActivityFlow ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
-      `mode=${activityFlowTracker.entryMode} RSI(${activityFlowTracker.rsi1sPeriod}) ` +
-      `cross>${activityFlowTracker.rsi1sEntryThreshold} live<=${activityFlowTracker.rsi1sLiveMax} ` +
-      `pullbackVol/EMA${activityFlowTracker.ema1sPeriod}/` +
-      `vol${activityFlowTracker.rsi1sVolumeWindowMs / 1000}s=observe-only ` +
+    `[main] DropRebound ${activityFlowTracker.enabled ? 'enabled' : 'disabled'}: ` +
+      `drop=${activityFlowTracker.dropMinPct}-${activityFlowTracker.dropMaxPct}%/` +
+      `${activityFlowTracker.dropWindowMs}ms ` +
+      `rebound=${activityFlowTracker.reboundMinPct}-${activityFlowTracker.reboundMaxPct}% ` +
+      `within=${activityFlowTracker.reboundTimeoutMs}ms ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(
@@ -303,7 +234,7 @@ async function main() {
       }
     } else {
       // Price-ineligible sanitized events still retain valid volume, so count
-      // them for the RSI volume gate without accepting the untrusted price.
+      // them for analytics without accepting the untrusted price.
       try { activityFlowTracker.handleVolumeSwap(swap); } catch (err) {
         console.warn(`[ActivityFlow] handleVolumeSwap failed: ${err.message}`);
       }
@@ -341,7 +272,7 @@ async function main() {
     positionManager,
     tickStream,
     dumpDetector,
-    rsiCalculator,  // v3.17.17: 可为 null,SignalEngine 内部会跳过 RSI 过滤
+    rsiCalculator,
     poolStateCache: executor.poolStateCache || null,  // v3.17.21: 信号触发时 addHot
     tokenRegistry,  // v3.26: 新币策略 — 按 token age 区分过滤逻辑
   });
@@ -353,14 +284,21 @@ async function main() {
         // Rejected signals never reach the buyOrder listener, so release the
         // source-level lock here. Accepted signals stay locked until the
         // complete buy/register flow finishes.
-        if (accepted !== true) activityFlowTracker.clearRsi1sInflight(signal.mint);
+        if (accepted !== true) activityFlowTracker.clearInflight(signal.mint);
       })
       .catch((err) => {
-        activityFlowTracker.clearRsi1sInflight(signal.mint);
+        activityFlowTracker.clearInflight(signal.mint);
         console.error(`[ActivityFlow] SignalEngine error: ${err.message}`);
       });
   });
   // ============ 服务器 ============
+  const quoteAssetReconciler = new QuoteAssetReconciler({
+    executor,
+    tradeLogger,
+    isTradingBusy: () =>
+      signalEngine.hasInflightBuys() || positionManager.hasPendingSells(),
+  });
+
   const server = new Server({
     tokenRegistry,
     tradeLogger,
@@ -369,10 +307,10 @@ async function main() {
     activityFlowTracker,
     dailyReport,
     competitorTracker,
+    quoteAssetReconciler,
     onTokenListChanged: () => {
       const mints = tokenRegistry.listActive().map((t) => t.mint);
       tickStream.updateSubscription(mints);
-      // v2: 同步 EMA 监控列表
     },
     onTokenAdded: async (token) => {
       const prewarmTokenPool = () => {
@@ -390,7 +328,6 @@ async function main() {
             console.warn(`[onTokenAdded] fillPool failed for ${token.symbol || token.mint.slice(0,8)}: ${err.message}`);
           });
       }
-      // v2: 新币加入 EMA 监控
     },
   });
 
@@ -398,7 +335,7 @@ async function main() {
     tokenRegistry,
     onBeforeAdd: (mint) => server._evictIfNeeded(mint),
     onMigrationDetected: (migration) => {
-      if (rsiCalculator) rsiCalculator.reset(migration.mint, 'pump_migration');
+      activityFlowTracker.removeMint(migration.mint);
     },
     onTokenAdded: async ({ token, migration, screening, evicted }) => {
       const mints = tokenRegistry.listActive().map((t) => t.mint);
@@ -436,10 +373,10 @@ async function main() {
     positionManager,
     poolStateCache: executor.poolStateCache || null,
     tradeLogger: tradeLogger, // v3.17.41: 24h no-buy filter
-    onTokenRemoved: () => {
+    onTokenRemoved: (mint) => {
+      if (mint) activityFlowTracker.removeMint(mint);
       const mints = tokenRegistry.listActive().map((t) => t.mint);
       tickStream.updateSubscription(mints);
-      // v2: 同步 EMA 监控列表
     },
   });
   tokenWatchdog.start();
@@ -741,33 +678,7 @@ async function main() {
     });
     // v3.17.41: 采样价格到长窗口缓存 (比 handleDumpSignal 更频繁，覆盖所有 priceTick)
     signalEngine._sampleLongPrice(mint, priceTracker.getPrice(mint));
-    // v3.17.17: 喂 RSI - 用 feedTrade 带上 volume,RSI 能做 volume-weighted aggregation
-    if (rsiCalculator) {
-      // v3.17.38-fix: poolQuoteAfter=0 时用 tokenRegistry.liquidity 推算
-      //   CPI/balanceOnly 路径算不出 poolQuoteAfter → 0
-      //   导致 RSI 的 lastPoolQuoteSol 永远为 null → rsi_pre_dump 不缓存
-      let effectivePoolQuoteSol = poolQuoteAfter;
-      if ((!effectivePoolQuoteSol || effectivePoolQuoteSol <= 0) && tokenRegistry) {
-        const ti = tokenRegistry.getToken(mint);
-        if (ti && ti.liquidity) {
-          effectivePoolQuoteSol = ti.liquidity / 170; // USD → SOL
-        }
-      }
-      if (side && solVolume > 0) {
-        rsiCalculator.feedTrade(mint, price, solVolume, side.toLowerCase(), ts, effectivePoolQuoteSol);
-      } else {
-        rsiCalculator.feedTick(mint, price, ts);
-      }
-      const rsiSnapshot = rsiCalculator.snapshot(mint);
-      if (rsiSnapshot) {
-        activityFlowTracker.updateRsiSnapshot(mint, rsiSnapshot);
-        positionManager.handleRsiForExit(mint, price, rsiSnapshot);
-      }
-    }
   });
-
-  // v3.17.17: 旧 sellAnalyzed → feedTrade 接线已经合并到 priceTick 路径(priceTick 包含所有 swap)
-  // 不需要单独的 sellAnalyzed → RSI 监听
 
   // sellAnalyzed: 只记录"接近触发"的（半阈值），避免写入风暴
   dumpDetector.on('sellAnalyzed', (info) => {
@@ -1015,7 +926,7 @@ async function main() {
     if (buyResult.signature) signalEngine.registerOurSignature(buyResult.signature);
     } finally {
       signalEngine.markBuyDone(order.mint);
-      activityFlowTracker.clearRsi1sInflight(order.mint);
+      activityFlowTracker.clearInflight(order.mint);
     }
   });
 
@@ -1038,10 +949,14 @@ async function main() {
       );
     }
     server.broadcast({ type: 'positionClosed', position: pos });
+    // Read-only refresh after a confirmed sell. Automatic CloseAccount remains
+    // restricted to the scheduled six-hour maintenance windows.
+    quoteAssetReconciler.requestRefresh('sell_confirmed');
   });
 
   // ============ 启动服务器 ============
   server.start();
+  quoteAssetReconciler.start();
 
   // ============ 启动前补充 pool 信息（异步后台） ============
   if (config.autoFillPoolsOnStart) {
@@ -1065,6 +980,7 @@ async function main() {
       postExitTracker.shutdown();
       positionManager.stop();
       tokenWatchdog.stop();
+      quoteAssetReconciler.stop();
       dumpDetector.shutdown && dumpDetector.shutdown();
       alertChecker.stop();
       monitor.stop();
