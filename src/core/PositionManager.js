@@ -33,6 +33,8 @@ const { evaluateFlowTurnExit } = require('./FlowCandleStrategy');
 const { priceDetailsFromRawState } = require('../utils/pumpSwapPricing');
 const { normalizeUnixMs } = require('../utils/migrationTime');
 const {
+  calculateBuyFailurePnlPct,
+  isBuySlippageError,
   isExceededSlippageError,
   resolveSellSlippageBps,
 } = require('../utils/executionSlippagePolicy');
@@ -797,6 +799,7 @@ class PositionManager extends EventEmitter {
           );
           monitor.inc('PositionManager.reconcileWatchdog', 1, 'PositionManager');
           const feeSol = ((p.buyFeeLamports || 0) + 5000) / 1e9;
+          const feePnlPct = calculateBuyFailurePnlPct(feeSol, p.entrySol);
           try {
             if (this.tradeLogger?.markBuyChainFailed) {
               this.tradeLogger.markBuyChainFailed(pid, 'BUY_RECONCILE_TIMEOUT', p.buyDiagnostics);
@@ -806,7 +809,7 @@ class PositionManager extends EventEmitter {
               exitPrice: p.entryPrice,
               exitSol: 0,
               pnlSol: -feeSol,
-              pnlPct: -100,
+              pnlPct: feePnlPct,
               exitReason: 'BUY_RECONCILE_TIMEOUT',
               sellSignature: null,
             });
@@ -830,8 +833,8 @@ class PositionManager extends EventEmitter {
     return pos;
   }
 
-  /** Rebuild one BUY after a confirmed Pump 6004 without relaxing the signal-price cap. */
-  async _retryBuyAfter6004(pos, positionId, mint, failedSignature, error) {
+  /** Rebuild one BUY after confirmed Pump slippage without relaxing the signal-price cap. */
+  async _retryBuyAfterSlippage(pos, positionId, mint, failedSignature, error) {
     const maxRetries = Math.max(0, config.strategy.buy6004RequoteRetries || 0);
     if ((pos.buy6004RetryCount || 0) >= maxRetries || pos._buy6004RetryInProgress) {
       return false;
@@ -863,7 +866,7 @@ class PositionManager extends EventEmitter {
       pos._buyFailureFeeAlreadyAccounted = true;
 
       console.warn(
-        `[PositionManager] BUY 6004 re-quote ${pos.symbol || mint.slice(0, 6)} ` +
+        `[PositionManager] BUY slippage re-quote ${pos.symbol || mint.slice(0, 6)} ` +
           `(${retryNumber}/${maxRetries}): forcing fresh pool state; ` +
           `signal cap remains +${config.strategy.buyMaxPriceDeviationPct}%`,
       );
@@ -895,7 +898,7 @@ class PositionManager extends EventEmitter {
         signature: retryResult.signature,
         success: retryResult.success,
         dryRun: pos.dryRun,
-        reason: `BUY_6004_REQUOTE_${retryNumber}`,
+        reason: `BUY_SLIPPAGE_REQUOTE_${retryNumber}`,
         latencyMs: retryResult.latencyMs,
         error: retryResult.error,
         details: retryDiagnostics,
@@ -928,7 +931,7 @@ class PositionManager extends EventEmitter {
 
       this._reconcileBuyAsync(positionId, mint, retryResult.signature).catch((retryErr) => {
         monitor.recordError('PositionManager', retryErr, {
-          phase: 'reconcile_buy_6004_retry',
+          phase: 'reconcile_buy_slippage_retry',
           mint,
           signature: retryResult.signature,
         });
@@ -986,8 +989,8 @@ class PositionManager extends EventEmitter {
         (pos._buyFailureFeeAlreadyAccounted ? 0 : (pos.buyFeeLamports || 0) + 5000)
       ) / 1e9;
 
-      if (isExceededSlippageError(errMsg)) {
-        const retried = await this._retryBuyAfter6004(pos, positionId, mint, signature, errMsg);
+      if (isBuySlippageError(errMsg)) {
+        const retried = await this._retryBuyAfterSlippage(pos, positionId, mint, signature, errMsg);
         if (retried) return;
       }
 
@@ -1003,17 +1006,18 @@ class PositionManager extends EventEmitter {
 
       // The BUY row was initially recorded when the transaction was submitted.
       // Correct it once confirmation proves the chain execution failed, while
-      // preserving the quote/cache diagnostics needed to diagnose 6004 errors.
+      // preserving the quote/cache diagnostics needed to diagnose slippage errors.
       if (this.tradeLogger?.markBuyChainFailed) {
         this.tradeLogger.markBuyChainFailed(positionId, errMsg, pos.buyDiagnostics);
       }
 
+      const feePnlPct = calculateBuyFailurePnlPct(feeSol, pos.entrySol);
       this.tradeLogger.closePosition(positionId, {
         closedAt: Date.now(),
         exitPrice: pos.entryPrice,
         exitSol: 0,
         pnlSol: -feeSol, // 仅损失 fee
-        pnlPct: -100,
+        pnlPct: feePnlPct,
         exitReason: 'BUY_CHAIN_FAILED',
         sellSignature: null,
       });
@@ -1054,7 +1058,7 @@ class PositionManager extends EventEmitter {
         symbol: pos.symbol,
         exitReason: 'BUY_CHAIN_FAILED',
         pnlSol: -feeSol,
-        pnlPct: -100,
+        pnlPct: feePnlPct,
       });
       return;
     }
@@ -1094,6 +1098,7 @@ class PositionManager extends EventEmitter {
         (pos.failedBuyFeeLamports || 0) +
         (pos._buyFailureFeeAlreadyAccounted ? 0 : (pos.buyFeeLamports || 0) + 5000)
       ) / 1e9;
+      const feePnlPct = calculateBuyFailurePnlPct(feeSol, pos.entrySol);
       if (this.signalEngine?.setBuyFailureCooldown) {
         const cooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
         this.signalEngine.setBuyFailureCooldown(mint, cooldownMs, 'BUY_PARSE_FAILED');
@@ -1106,7 +1111,7 @@ class PositionManager extends EventEmitter {
         exitPrice: pos.entryPrice,
         exitSol: 0,
         pnlSol: -feeSol,
-        pnlPct: -100,
+        pnlPct: feePnlPct,
         exitReason: 'BUY_PARSE_FAILED',
         sellSignature: null,
       });

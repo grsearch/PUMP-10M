@@ -87,7 +87,7 @@ async function main() {
     `Buy guard: chain ceiling=${(config.strategy.buySlippageBps / 100).toFixed(1)}%, ` +
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
       `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms, ` +
-      `6004 requote=${config.strategy.buy6004RequoteRetries}x`,
+      `slippage requote=${config.strategy.buy6004RequoteRetries}x`,
   );
   console.log(
     `Sell guard: normal=${(config.strategy.sellSlippageBps / 100).toFixed(1)}%, ` +

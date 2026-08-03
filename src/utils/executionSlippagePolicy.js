@@ -17,6 +17,29 @@ function isExceededSlippageError(error) {
     /"Custom"\s*:\s*6004/i.test(text);
 }
 
+/**
+ * PumpSwap has used two different errors for a BUY whose minimum output can
+ * no longer be satisfied. Keep the SELL-only 6004 classifier above narrow,
+ * while allowing the BUY path to re-quote both the legacy and current error.
+ */
+function isBuySlippageError(error) {
+  const text = String(error || '');
+  return isExceededSlippageError(text) ||
+    /BuySlippageBelowMinBaseAmountOut/i.test(text) ||
+    /Buy\s+Slippage\s+Below\s+Min\s+Base\s+Amount\s+Out/i.test(text) ||
+    /0x1798/i.test(text) ||
+    /Custom(?::|"\s*:|\}\s*,?\s*)6040/i.test(text) ||
+    /"Custom"\s*:\s*6040/i.test(text);
+}
+
+/** A failed BUY loses fees, not the entire planned position size. */
+function calculateBuyFailurePnlPct(feeSol, plannedEntrySol) {
+  const fee = Number(feeSol);
+  const entry = Number(plannedEntrySol);
+  if (!Number.isFinite(fee) || fee <= 0 || !Number.isFinite(entry) || entry <= 0) return 0;
+  return Math.max(-100, -(fee / entry) * 100);
+}
+
 function isEmergencySellReason(reason) {
   const value = String(reason || '');
   return EMERGENCY_SELL_REASONS.has(value) ||
@@ -62,6 +85,8 @@ function resolveSellSlippageBps({
 
 module.exports = {
   EMERGENCY_SELL_REASONS,
+  calculateBuyFailurePnlPct,
+  isBuySlippageError,
   isEmergencySellReason,
   isExceededSlippageError,
   resolveSellSlippageBps,
