@@ -32,6 +32,10 @@ const { getMonitor } = require('../monitor/HealthMonitor');
 const { evaluateFlowTurnExit } = require('./FlowCandleStrategy');
 const { priceDetailsFromRawState } = require('../utils/pumpSwapPricing');
 const { normalizeUnixMs } = require('../utils/migrationTime');
+const {
+  isExceededSlippageError,
+  resolveSellSlippageBps,
+} = require('../utils/executionSlippagePolicy');
 
 const monitor = getMonitor();
 monitor.registerModule('PositionManager', { staleMs: 10_000, label: 'Position Manager' });
@@ -634,6 +638,8 @@ class PositionManager extends EventEmitter {
       sellFeeLamports: 0,                    // 卖出时累加（包括所有重试的 fee）
       buySlot: buySlot || 0,                // v3.17.11: BUY 时的链上 slot
       buyDiagnostics: buyDiagnostics ? { ...buyDiagnostics } : null,
+      buy6004RetryCount: 0,
+      failedBuyFeeLamports: 0,
       dumpSlot: dumpSlot || 0,              // v3.17.19: 砸单的链上 slot (用于计算 BUY 落链领先几个 slot)
       exiting: false,
       sellAttempts: 0,
@@ -824,9 +830,117 @@ class PositionManager extends EventEmitter {
     return pos;
   }
 
+  /** Rebuild one BUY after a confirmed Pump 6004 without relaxing the signal-price cap. */
+  async _retryBuyAfter6004(pos, positionId, mint, failedSignature, error) {
+    const maxRetries = Math.max(0, config.strategy.buy6004RequoteRetries || 0);
+    if ((pos.buy6004RetryCount || 0) >= maxRetries || pos._buy6004RetryInProgress) {
+      return false;
+    }
+
+    const tokenInfo = this.tokenRegistry.getToken(mint);
+    if (!tokenInfo?.pool_address || !pos.buyDiagnostics?.signalPrice) return false;
+
+    pos._buy6004RetryInProgress = true;
+    const retryNumber = (pos.buy6004RetryCount || 0) + 1;
+    const failedDiagnostics = {
+      ...(pos.buyDiagnostics || {}),
+      chainError: error,
+      buy6004RetryNumber: retryNumber,
+    };
+    try {
+      if (this.tradeLogger?.markBuyAttemptChainFailed) {
+        this.tradeLogger.markBuyAttemptChainFailed(
+          positionId,
+          failedSignature,
+          error,
+          failedDiagnostics,
+        );
+      }
+
+      pos.failedBuyFeeLamports = (pos.failedBuyFeeLamports || 0) +
+        (pos.buyFeeLamports || 0) + 5000;
+      pos.buyFeeLamports = 0;
+      pos._buyFailureFeeAlreadyAccounted = true;
+
+      console.warn(
+        `[PositionManager] BUY 6004 re-quote ${pos.symbol || mint.slice(0, 6)} ` +
+          `(${retryNumber}/${maxRetries}): forcing fresh pool state; ` +
+          `signal cap remains +${config.strategy.buyMaxPriceDeviationPct}%`,
+      );
+
+      const retryResult = await this.executor.buy({
+        mint,
+        symbol: pos.symbol,
+        sizeSol: pos.buyDiagnostics.spendableQuoteSol || pos.entrySol,
+        signalPrice: pos.buyDiagnostics.signalPrice,
+        priceAfter: pos.buyDiagnostics.signalPrice,
+        baseDecimals: tokenInfo.decimals ?? 6,
+        poolAddress: tokenInfo.pool_address,
+      });
+      const retryDiagnostics = {
+        ...(retryResult.buyDiagnostics || {}),
+        buy6004RetryNumber: retryNumber,
+        previousSignature: failedSignature,
+        previousError: error,
+      };
+      this.tradeLogger.logTrade({
+        positionId,
+        ts: Date.now(),
+        mint,
+        symbol: pos.symbol,
+        side: 'BUY',
+        solAmount: retryResult.solIn ?? pos.entrySol,
+        tokenAmount: retryResult.tokenAmount,
+        price: retryResult.price,
+        signature: retryResult.signature,
+        success: retryResult.success,
+        dryRun: pos.dryRun,
+        reason: `BUY_6004_REQUOTE_${retryNumber}`,
+        latencyMs: retryResult.latencyMs,
+        error: retryResult.error,
+        details: retryDiagnostics,
+      });
+
+      pos.buy6004RetryCount = retryNumber;
+      if (!retryResult.success || !retryResult.signature) return false;
+
+      pos.buySignature = retryResult.signature;
+      pos.entrySol = retryResult.solIn ?? pos.entrySol;
+      pos.entryPrice = retryResult.price ?? pos.entryPrice;
+      pos.tokenAmount = retryResult.tokenAmount ?? pos.tokenAmount;
+      pos.buyFeeLamports = retryResult.priorityFeeLamports || 0;
+      pos._buyFailureFeeAlreadyAccounted = false;
+      pos.buySlot = retryResult.buySlot || pos.buySlot;
+      pos.buyDiagnostics = retryDiagnostics;
+      pos.highWaterMark = pos.entryPrice;
+      pos.highWaterMarkTs = Date.now();
+
+      if (this.tradeLogger?.updatePositionBuySubmission) {
+        this.tradeLogger.updatePositionBuySubmission(positionId, {
+          entrySol: pos.entrySol,
+          entryPrice: pos.entryPrice,
+          tokenAmount: pos.tokenAmount,
+          buySignature: pos.buySignature,
+          buyFeeLamports: pos.buyFeeLamports + pos.failedBuyFeeLamports,
+          buySlot: pos.buySlot,
+        });
+      }
+
+      this._reconcileBuyAsync(positionId, mint, retryResult.signature).catch((retryErr) => {
+        monitor.recordError('PositionManager', retryErr, {
+          phase: 'reconcile_buy_6004_retry',
+          mint,
+          signature: retryResult.signature,
+        });
+      });
+      return true;
+    } finally {
+      pos._buy6004RetryInProgress = false;
+    }
+  }
+
   /**
-   * v3.6: BUY 提交后异步等链上确认，用真实 SOL 出账 / 真实 token 入账 修正 position
-   * 解决 BUY 实际花费 ≠ 配置 sizeSol 的问题（典型偏差 5-15%）
+   * BUY 提交后异步等链上确认，用真实 SOL 出账 / 真实 token 入账修正 position。
    */
   async _reconcileBuyAsync(positionId, mint, signature) {
     // v3.7: 等 1 秒让 tx 落链（BUY 通常 400-800ms 落链，1s 是合理初始延迟）
@@ -867,7 +981,15 @@ class PositionManager extends EventEmitter {
 
       // 真实损失 = 已付 priority fee + base fee（链上 tx 失败也扣 fee）
       // 没买到 token，所以 exitSol = 0, tokenAmount 应该是 0
-      const feeSol = ((pos.buyFeeLamports || 0) + 5000) / 1e9;
+      const feeSol = (
+        (pos.failedBuyFeeLamports || 0) +
+        (pos._buyFailureFeeAlreadyAccounted ? 0 : (pos.buyFeeLamports || 0) + 5000)
+      ) / 1e9;
+
+      if (isExceededSlippageError(errMsg)) {
+        const retried = await this._retryBuyAfter6004(pos, positionId, mint, signature, errMsg);
+        if (retried) return;
+      }
 
       // Arm protection before any DB/event work so a logging failure cannot
       // reopen the fee-burning retry window.
@@ -968,7 +1090,10 @@ class PositionManager extends EventEmitter {
           `sig=${signature.slice(0, 8)}..`,
       );
       // 同样按链上失败处理（保险起见）
-      const feeSol = ((pos.buyFeeLamports || 0) + 5000) / 1e9;
+      const feeSol = (
+        (pos.failedBuyFeeLamports || 0) +
+        (pos._buyFailureFeeAlreadyAccounted ? 0 : (pos.buyFeeLamports || 0) + 5000)
+      ) / 1e9;
       if (this.signalEngine?.setBuyFailureCooldown) {
         const cooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
         this.signalEngine.setBuyFailureCooldown(mint, cooldownMs, 'BUY_PARSE_FAILED');
@@ -1002,6 +1127,7 @@ class PositionManager extends EventEmitter {
     // ============ 分支 C: BUY 成功，回写真实数据 ============
     // realSolDelta 是负数（出账）。priority fee + base fee 也含在内
     const realSolSpent = -swap.realSolDelta;
+    const totalRealSolSpent = realSolSpent + (pos.failedBuyFeeLamports || 0) / 1e9;
     const realTokenReceived = swap.realTokenDelta;
 
     if (realSolSpent <= 0 || realTokenReceived <= 0) {
@@ -1019,9 +1145,9 @@ class PositionManager extends EventEmitter {
 
     // 修正：扣掉 priority fee + base fee，剩下的才是真正花在 swap 上
     // 但对策略判断来说，"我亏了多少 SOL" 用 realSolSpent 全口径比较合理
-    pos.entrySol = realSolSpent;
+    pos.entrySol = totalRealSolSpent;
     pos.tokenAmount = realTokenReceived;
-    pos.entryPrice = realSolSpent / realTokenReceived;
+    pos.entryPrice = totalRealSolSpent / realTokenReceived;
     // realSolSpent 已含 priority fee 与 base fee；为避免双重扣减，把 buyFeeLamports 清零
     pos.buyFeeLamports = 0;
 
@@ -1053,13 +1179,13 @@ class PositionManager extends EventEmitter {
 
     // v3.17.13: reconcile 后 drift 检查 — 防止 RUG 后继续持有
     //   drift 必须在这里先算（原来在后面 console.log 那行定义的）
-    const drift = ((realSolSpent - oldEntrySol) / oldEntrySol) * 100;
+    const drift = ((totalRealSolSpent - oldEntrySol) / oldEntrySol) * 100;
     const maxReconcileDriftPct = parseFloat(process.env.MAX_RECONCILE_DRIFT_PCT || '-40');
     if (maxReconcileDriftPct < 0 && drift < maxReconcileDriftPct) {
       console.warn(
         `[PositionManager] 🚨 RECONCILE_RUG ${pos.symbol || mint.slice(0, 6)}: ` +
           `drift=${drift.toFixed(2)}% < ${maxReconcileDriftPct}%, ` +
-          `entrySol ${oldEntrySol.toFixed(4)}→${realSolSpent.toFixed(4)}, ` +
+          `entrySol ${oldEntrySol.toFixed(4)}→${totalRealSolSpent.toFixed(4)}, ` +
           `immediate sell`,
       );
       monitor.inc('PositionManager.reconcileRug', 1, 'PositionManager');
@@ -1110,7 +1236,7 @@ class PositionManager extends EventEmitter {
     monitor.inc('PositionManager.buyReconciled', 1, 'PositionManager');
     console.log(
       `[PositionManager] 🔧 BUY reconciled ${pos.symbol || mint.slice(0, 6)}: ` +
-        `entrySol ${oldEntrySol.toFixed(4)}→${realSolSpent.toFixed(4)} (${drift.toFixed(2)}%), ` +
+        `entrySol ${oldEntrySol.toFixed(4)}→${totalRealSolSpent.toFixed(4)} (${drift.toFixed(2)}%), ` +
         `tokens ${oldTokenAmount.toFixed(2)}→${realTokenReceived.toFixed(2)}, ` +
         `entryPrice ${oldEntryPrice.toExponential(4)}→${pos.entryPrice.toExponential(4)}`,
     );
@@ -2360,6 +2486,16 @@ class PositionManager extends EventEmitter {
 
   async _attemptSell(pos, triggerPrice) {
     const tokenInfo = this.tokenRegistry.getToken(pos.mint);
+    const sellAttempt = (pos.sellAttempts || 0) + 1;
+    const sellSlippageBps = resolveSellSlippageBps({
+      reason: pos.exitReason,
+      attempt: sellAttempt,
+      lastError: pos._lastSellError,
+      baseBps: config.strategy.sellSlippageBps,
+      emergencyBps: config.strategy.sellEmergencySlippageBps,
+      retryStepBps: config.strategy.sellRetrySlippageStepBps,
+      maxBps: config.strategy.sellMaxSlippageBps,
+    });
 
     // v3.17.40: 卖出时用最新实时价格，不用触发时的价格
     //   触发到执行之间价格可能已暴跌，用旧价格会导致 slippage 计算不准
@@ -2385,6 +2521,9 @@ class PositionManager extends EventEmitter {
         tokenAmount: pos.tokenAmount,
         baseDecimals: tokenInfo?.decimals ?? 6,
         currentPrice: latestPrice,
+        exitReason: pos.exitReason,
+        sellAttempt,
+        slippageBps: sellSlippageBps,
       });
     } catch (err) {
       monitor.recordError('PositionManager', err, {
@@ -2423,6 +2562,7 @@ class PositionManager extends EventEmitter {
       reason: pos.exitReason + (pos.sellAttempts > 1 ? `_retry_${pos.sellAttempts}` : ''),
       latencyMs: sellResult.latencyMs,
       error: sellResult.error,
+      details: sellResult.sellDiagnostics || null,
     });
 
     // ============ 分支 A：提交本身失败（拿不到 signature） ============
@@ -2456,6 +2596,7 @@ class PositionManager extends EventEmitter {
         return;
       }
 
+      pos._lastSellError = sellResult.error || null;
       this._scheduleRetryOrStuck(pos, triggerPrice, sellResult.error);
       return;
     }
@@ -2496,7 +2637,15 @@ class PositionManager extends EventEmitter {
     }
 
     // 异步确认（不 await，避免阻塞下一笔操作；失败会自己触发 retry）
-    this._confirmSellAsync(pos, sellResult.signature, realExitPrice, realSolOut, triggerPrice, actualSellAmount).catch(
+    this._confirmSellAsync(
+      pos,
+      sellResult.signature,
+      realExitPrice,
+      realSolOut,
+      triggerPrice,
+      actualSellAmount,
+      sellResult.sellDiagnostics || null,
+    ).catch(
       (err) => {
         monitor.recordError('PositionManager', err, {
           phase: 'confirm_async_crash',
@@ -2520,7 +2669,7 @@ class PositionManager extends EventEmitter {
    *   - 实测：DB 记录 -0.012 SOL 亏损，链上真实 +0.091 SOL 盈利
    *   - 修复：落链确认后，调 fetchTxSwapResult 拿真实 realSolDelta，覆盖 SDK 估算
    */
-  async _confirmSellAsync(pos, signature, exitPrice, solOut, triggerPrice, actualSellAmount) {
+  async _confirmSellAsync(pos, signature, exitPrice, solOut, triggerPrice, actualSellAmount, sellDiagnostics = null) {
     const result = await this.executor.confirmTx(signature, { timeoutMs: 15_000 });
 
     if (!this.positions.has(pos.positionId)) return; // 期间被其他流程关掉
@@ -2601,6 +2750,10 @@ class PositionManager extends EventEmitter {
       });
     }
 
+    if (this.tradeLogger?.markSellChainFailed) {
+      this.tradeLogger.markSellChainFailed(signature, errMsg, sellDiagnostics);
+    }
+    pos._lastSellError = errMsg;
     this._scheduleRetryOrStuck(pos, triggerPrice, errMsg);
   }
 
@@ -2719,6 +2872,7 @@ class PositionManager extends EventEmitter {
 
   _scheduleRetryOrStuck(pos, triggerPrice, errMsg) {
     monitor.inc('PositionManager.sellRetries', 1, 'PositionManager');
+    pos._lastSellError = errMsg || pos._lastSellError || null;
 
     // v3.17.40: 如果错误是 Custom:6053 或 Custom:1 (Insufficient tokens)，说明代币已被其他仓位卖光
     //   不再 retry，直接关闭避免空转 12 次
@@ -2777,7 +2931,9 @@ class PositionManager extends EventEmitter {
     }
 
     const delayIdx = Math.min(pos.sellAttempts - 1, SELL_RETRY_DELAYS_MS.length - 1);
-    const delay = SELL_RETRY_DELAYS_MS[delayIdx] || 30_000;
+    const delay = isExceededSlippageError(errMsg)
+      ? config.strategy.sell6004RetryDelayMs
+      : (SELL_RETRY_DELAYS_MS[delayIdx] || 30_000);
     const nextRetryAt = Date.now() + delay;
 
     // 持久化下次重试时间，重启后 reconciler 会按时唤醒

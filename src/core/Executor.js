@@ -1345,6 +1345,30 @@ class Executor {
     const baseDecimals = order.baseDecimals ?? 6;
     const tokenAmount = order.tokenAmount;
     const currentPrice = order.currentPrice;
+    const configuredSlippageBps = config.strategy.sellSlippageBps;
+    const requestedSlippageBps = Number.isFinite(Number(order.slippageBps))
+      ? Math.max(0, Math.round(Number(order.slippageBps)))
+      : configuredSlippageBps;
+    const effectiveSlippageBps = Math.min(
+      config.strategy.sellMaxSlippageBps,
+      requestedSlippageBps,
+    );
+    const sellDiagnostics = {
+      configuredSlippagePct: configuredSlippageBps / 100,
+      requestedSlippagePct: requestedSlippageBps / 100,
+      effectiveSlippagePct: effectiveSlippageBps / 100,
+      exitReason: order.exitReason || null,
+      sellAttempt: Math.max(1, Number(order.sellAttempt) || 1),
+      expectedSolOut: null,
+      expectedPrice: null,
+      cacheAgeBeforeMs: null,
+      cacheAgeAtBuildMs: null,
+      stateSource: null,
+    };
+    const finishSell = (result) => ({
+      ...result,
+      sellDiagnostics: { ...sellDiagnostics },
+    });
 
     if (!Number.isFinite(tokenAmount) || tokenAmount <= 0) {
       monitor.inc('Executor.sellFail', 1, 'Executor');
@@ -1353,7 +1377,7 @@ class Executor {
         mint: order.mint,
         tokenAmount,
       });
-      return { success: false, error: 'invalid tokenAmount', latencyMs: Date.now() - t0 };
+      return finishSell({ success: false, error: 'invalid tokenAmount', latencyMs: Date.now() - t0 });
     }
 
     // ============ DRY_RUN ============
@@ -1365,53 +1389,64 @@ class Executor {
           `${tokenAmount.toFixed(2)} tokens → ${solOut.toFixed(4)} SOL @ ${fillPrice.toExponential(4)}`,
       );
       monitor.inc('Executor.sellSuccess', 1, 'Executor');
-      return {
+      sellDiagnostics.stateSource = 'dry_run';
+      sellDiagnostics.expectedSolOut = solOut;
+      sellDiagnostics.expectedPrice = fillPrice;
+      return finishSell({
         success: true,
         signature: `DRYRUN_SELL_${Date.now()}`,
         solOut,
         price: fillPrice,
         latencyMs: Date.now() - t0,
         dryRun: true,
-      };
+      });
     }
 
     // ============ LIVE ============
     if (!this.keypair) {
       monitor.inc('Executor.sellFail', 1, 'Executor');
-      return { success: false, error: 'wallet not loaded', latencyMs: Date.now() - t0 };
+      return finishSell({ success: false, error: 'wallet not loaded', latencyMs: Date.now() - t0 });
     }
     if (!this.pumpSdk || !this.onlineSdk) {
       monitor.inc('Executor.sellFail', 1, 'Executor');
-      return {
+      return finishSell({
         success: false,
         error: '@pump-fun/pump-swap-sdk not loaded',
         latencyMs: Date.now() - t0,
-      };
+      });
     }
     if (!order.poolAddress) {
       monitor.inc('Executor.sellFail', 1, 'Executor');
-      return {
+      return finishSell({
         success: false,
         error: 'poolAddress missing',
         latencyMs: Date.now() - t0,
-      };
+      });
     }
 
     try {
       const poolKey = new PublicKey(order.poolAddress);
 
-      // 1. pool state — 优先读 PoolStateCache（持仓币 500ms 后台刷新），cache miss 才走 RPC。
-      // v3.31: 卖出热路径不再串两发 RPC（链上余额 + swapState），卖出从 ~1-2s 降到几十 ms。
+      // A cached holding state can already be stale enough to produce Pump
+      // 6004. Force one synchronous refresh before every SELL quote/build.
       const tS0 = Date.now();
       let swapState = null;
-      if (this.poolStateCache) {
-        swapState = this.poolStateCache.get(order.poolAddress);
+      sellDiagnostics.cacheAgeBeforeMs = this.poolStateCache?.getAge
+        ? this.poolStateCache.getAge(order.poolAddress)
+        : null;
+      if (this.poolStateCache?.refreshOne) {
+        swapState = await this.poolStateCache.refreshOne(order.poolAddress, {
+          maxAgeMs: config.strategy.sellMaxPoolStateAgeMs,
+          force: true,
+        });
+        if (swapState) sellDiagnostics.stateSource = 'rpc_forced';
       }
       if (!swapState) {
         swapState = await this.onlineSdk.swapSolanaState(poolKey, this.keypair.publicKey);
+        sellDiagnostics.stateSource = 'rpc_direct';
         monitor.inc('Executor.sellCacheMiss', 1, 'Executor');
       } else {
-        monitor.inc('Executor.sellCacheHit', 1, 'Executor');
+        monitor.inc('Executor.sellCacheRefresh', 1, 'Executor');
       }
       const stateLatencyMs = Date.now() - tS0;
       monitor.inc('Executor.stateOk', 1, 'Executor');
@@ -1426,15 +1461,15 @@ class Executor {
       const sellAmountRaw = Math.floor(sellAmount * Math.pow(10, baseDecimals));
       if (sellAmountRaw <= 0) {
         monitor.inc('Executor.sellFail', 1, 'Executor');
-        return {
+        return finishSell({
           success: false,
           error: 'no on-chain balance to sell',
           latencyMs: Date.now() - t0,
-        };
+        });
       }
 
       const sellAmountBN = new BN(sellAmountRaw);
-      const slippagePct = config.strategy.sellSlippageBps / 100;
+      const slippagePct = effectiveSlippageBps / 100;
 
       // 2. 构造 sell 指令（base→quote 方向）
       const tB0 = Date.now();
@@ -1450,6 +1485,23 @@ class Executor {
       const quoteRaw = this._extractQuoteAmount(sellResult, swapState, sellAmountBN, 'sell');
       const expectedSolOut = Number(quoteRaw) / 1e9;
       const realPrice = sellAmount > 0 ? expectedSolOut / sellAmount : 0;
+      sellDiagnostics.expectedSolOut = expectedSolOut;
+      sellDiagnostics.expectedPrice = realPrice;
+      sellDiagnostics.cacheAgeAtBuildMs = this.poolStateCache?.getAge &&
+        sellDiagnostics.stateSource === 'rpc_forced'
+        ? this.poolStateCache.getAge(order.poolAddress)
+        : Date.now() - tS0;
+
+      const fmtAge = (value) => Number.isFinite(value) ? `${Math.round(value)}ms` : 'miss';
+      console.log(
+        `[Executor:LIVE] SELL quote: reason=${sellDiagnostics.exitReason || 'unknown'} ` +
+          `attempt=${sellDiagnostics.sellAttempt} ` +
+          `slippage=${sellDiagnostics.configuredSlippagePct.toFixed(2)}%` +
+          `->${sellDiagnostics.effectiveSlippagePct.toFixed(2)}% ` +
+          `expected=${expectedSolOut.toFixed(9)}SOL ` +
+          `cache=${fmtAge(sellDiagnostics.cacheAgeBeforeMs)}` +
+          `->${fmtAge(sellDiagnostics.cacheAgeAtBuildMs)}[${sellDiagnostics.stateSource}]`,
+      );
 
       // 3. 构造、签名、提交
       const { serialized, feeInfo } = await this._buildAndSignTx(swapIxs, 'SELL', order.mint);
@@ -1472,7 +1524,7 @@ class Executor {
           }ms, fee=${feeInfo.totalLamports}L ${feeInfo.source})`,
       );
 
-      return {
+      return finishSell({
         success: true,
         signature: sig,
         solOut: expectedSolOut,
@@ -1484,7 +1536,7 @@ class Executor {
         sendLatencyMs,
         priorityFeeLamports: feeInfo.totalLamports,
         priorityFeeSource: feeInfo.source,
-      };
+      });
     } catch (err) {
       monitor.inc('Executor.sellFail', 1, 'Executor');
       monitor.recordError('Executor', err, {
@@ -1492,9 +1544,10 @@ class Executor {
         mint: order.mint,
         symbol: order.symbol,
         tokenAmount,
+        ...sellDiagnostics,
       });
       console.error(`[Executor:LIVE] SELL failed: ${err.message}`);
-      return { success: false, error: err.message, latencyMs: Date.now() - t0 };
+      return finishSell({ success: false, error: err.message, latencyMs: Date.now() - t0 });
     }
   }
 

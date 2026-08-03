@@ -191,7 +191,15 @@ const config = {
     buyMaxPriceDeviationPct: parseFloat(process.env.BUY_MAX_PRICE_DEVIATION_PCT || '15'),
     buyMaxPoolStateAgeMs: parseInt(process.env.BUY_MAX_POOL_STATE_AGE_MS || '500', 10),
     buyMaxEstimatedSlippagePct: parseFloat(process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT || '5'),
-    sellSlippageBps: parseInt(process.env.SELL_SLIPPAGE_BPS || '2000', 10), // 20%
+    // SELL has no signal-price ceiling like BUY. Profit exits start at 30%;
+    // urgent loss/time exits and retries after Pump 6004 may use up to 50%.
+    sellSlippageBps: Math.min(5000, Math.max(3000, parseInt(process.env.SELL_SLIPPAGE_BPS || '3000', 10))),
+    sellEmergencySlippageBps: Math.min(5000, Math.max(3000, parseInt(process.env.SELL_EMERGENCY_SLIPPAGE_BPS || '5000', 10))),
+    sellRetrySlippageStepBps: parseInt(process.env.SELL_RETRY_SLIPPAGE_STEP_BPS || '1000', 10),
+    sellMaxSlippageBps: Math.min(5000, Math.max(0, parseInt(process.env.SELL_MAX_SLIPPAGE_BPS || '5000', 10))),
+    sellMaxPoolStateAgeMs: parseInt(process.env.SELL_MAX_POOL_STATE_AGE_MS || '0', 10),
+    sell6004RetryDelayMs: parseInt(process.env.SELL_6004_RETRY_DELAY_MS || '100', 10),
+    buy6004RequoteRetries: Math.min(1, Math.max(0, parseInt(process.env.BUY_6004_REQUOTE_RETRIES || '1', 10))),
 
     // 风控（v3.17 默认 maxConcurrent 5）
     cooldownMsPerToken: parseInt(process.env.COOLDOWN_MS_PER_TOKEN || '0', 10),
@@ -616,6 +624,23 @@ function validateConfig() {
     config.strategy.buyMaxPoolStateAgeMs < 0
   ) {
     errors.push('BUY_MAX_POOL_STATE_AGE_MS must be >= 0');
+  }
+  for (const [name, value] of [
+    ['SELL_SLIPPAGE_BPS', config.strategy.sellSlippageBps],
+    ['SELL_EMERGENCY_SLIPPAGE_BPS', config.strategy.sellEmergencySlippageBps],
+    ['SELL_RETRY_SLIPPAGE_STEP_BPS', config.strategy.sellRetrySlippageStepBps],
+    ['SELL_MAX_SLIPPAGE_BPS', config.strategy.sellMaxSlippageBps],
+    ['SELL_MAX_POOL_STATE_AGE_MS', config.strategy.sellMaxPoolStateAgeMs],
+    ['SELL_6004_RETRY_DELAY_MS', config.strategy.sell6004RetryDelayMs],
+    ['BUY_6004_REQUOTE_RETRIES', config.strategy.buy6004RequoteRetries],
+  ]) {
+    if (!Number.isFinite(value) || value < 0) errors.push(`${name} must be >= 0`);
+  }
+  if (config.strategy.sellSlippageBps > config.strategy.sellMaxSlippageBps) {
+    errors.push('SELL_SLIPPAGE_BPS must be <= SELL_MAX_SLIPPAGE_BPS');
+  }
+  if (config.strategy.sellEmergencySlippageBps > config.strategy.sellMaxSlippageBps) {
+    errors.push('SELL_EMERGENCY_SLIPPAGE_BPS must be <= SELL_MAX_SLIPPAGE_BPS');
   }
   if (
     !Number.isFinite(config.quoteAssetReconciler.autoUnwrapMinSol) ||
