@@ -35,15 +35,42 @@ async function run() {
   assert.strictEqual(rejected.allowed, false);
   assert.strictEqual(rejected.error, 'buy_price_guard: expected price above signal cap');
 
-  const productionCap = calculateBuyPriceGuard({
+  const productionRejected = calculateBuyPriceGuard({
     signalPrice: 1,
-    expectedPrice: 1.1,
+    expectedPrice: 1.0001,
     configuredSlippagePct: 50,
-    maxPriceDeviationPct: 15,
+    maxPriceDeviationPct: 0,
     inputSol: 1,
   });
-  assert.strictEqual(productionCap.allowed, true);
-  approx(productionCap.expectedPrice * (1 + productionCap.effectiveSlippagePct / 100), 1.15);
+  assert.strictEqual(productionRejected.allowed, false);
+  assert.strictEqual(
+    productionRejected.error,
+    'buy_price_guard: expected price above signal cap',
+  );
+
+  const productionAtSignal = calculateBuyPriceGuard({
+    signalPrice: 1,
+    expectedPrice: 1,
+    configuredSlippagePct: 50,
+    maxPriceDeviationPct: 0,
+    inputSol: 1,
+  });
+  assert.strictEqual(productionAtSignal.allowed, true);
+  assert.strictEqual(productionAtSignal.effectiveSlippagePct, 0);
+
+  const productionBelowSignal = calculateBuyPriceGuard({
+    signalPrice: 1,
+    expectedPrice: 0.95,
+    configuredSlippagePct: 50,
+    maxPriceDeviationPct: 0,
+    inputSol: 1,
+  });
+  assert.strictEqual(productionBelowSignal.allowed, true);
+  approx(
+    productionBelowSignal.expectedPrice *
+      (1 + productionBelowSignal.effectiveSlippagePct / 100),
+    1,
+  );
 
   // 2. +3% expected price leaves about 1.94% before a +5% signal cap.
   const narrowed = calculateBuyPriceGuard({

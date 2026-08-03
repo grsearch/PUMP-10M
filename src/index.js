@@ -97,6 +97,15 @@ async function main() {
   if (Number(process.env.SELL_SLIPPAGE_BPS) > 0 && Number(process.env.SELL_SLIPPAGE_BPS) < 3000) {
     console.warn('Legacy SELL_SLIPPAGE_BPS below 3000 is clamped to 30% to prevent Pump 6004 loops.');
   }
+  if (
+    process.env.BUY_MAX_PRICE_DEVIATION_PCT != null &&
+    Number(process.env.BUY_MAX_PRICE_DEVIATION_PCT) !== 0
+  ) {
+    console.warn(
+      'BUY_MAX_PRICE_DEVIATION_PCT is ignored; the production BUY price ' +
+        'cannot exceed the signal price.',
+    );
+  }
   console.log('Entry frequency: no overlapping position per mint; re-entry is allowed after close');
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
   console.log(

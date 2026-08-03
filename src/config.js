@@ -130,10 +130,10 @@ const config = {
       process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '0',
     ),
 
-    fixedStopLossPct: Math.min(
-      0,
-      parseFloat(process.env.FIXED_STOP_LOSS_PCT || '-10'),
-    ),
+    // Production policy: fixed stop is disabled. Keep this hard-coded so a
+    // stale server environment cannot silently re-enable the rejected -10%
+    // rule; the one-shot sixth-second loss check remains active above.
+    fixedStopLossPct: 0,
     emergencyStopLossPct: 0,
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
@@ -191,7 +191,10 @@ const config = {
     // BUYs use buy_exact_quote_in, so the SOL input is always fixed. Executor
     // narrows this tolerance per order to stay inside the signal-price cap.
     buySlippageBps: Math.min(5000, parseInt(process.env.BUY_SLIPPAGE_BPS || '5000', 10)), // hard-capped at 50%
-    buyMaxPriceDeviationPct: parseFloat(process.env.BUY_MAX_PRICE_DEVIATION_PCT || '15'),
+    // Production entry policy: the forced-fresh expected BUY price must not
+    // exceed the signal price. Keep this hard-coded so a stale server env
+    // cannot silently restore the rejected +15% chase allowance.
+    buyMaxPriceDeviationPct: 0,
     buyMaxPoolStateAgeMs: parseInt(process.env.BUY_MAX_POOL_STATE_AGE_MS || '500', 10),
     buyMaxEstimatedSlippagePct: parseFloat(process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT || '5'),
     // SELL has no signal-price ceiling like BUY. Profit exits start at 30%;

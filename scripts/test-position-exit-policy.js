@@ -75,7 +75,8 @@ function run() {
   assert.strictEqual(config.strategy.trailingMinHwmAgeMs, 0);
   assert.strictEqual(config.strategy.maxHoldMs, 15_000);
   assert.strictEqual(config.strategy.takeProfitPct, 0);
-  assert.strictEqual(config.strategy.fixedStopLossPct, -10);
+  assert.strictEqual(config.strategy.fixedStopLossPct, 0);
+  assert.strictEqual(config.strategy.buyMaxPriceDeviationPct, 0);
   assert.strictEqual(config.strategy.emergencyStopLossPct, 0);
   assert.strictEqual(config.strategy.rsi1sExitEnabled, false);
   assert.strictEqual(config.strategy.noRecoveryExitEnabled, false);
@@ -148,11 +149,12 @@ function run() {
   {
     const leg = position('p1', mint, { openedAt: Date.now() - 1_000 });
     const manager = managerWith(token, leg);
-    manager._checkExit('p1', 0.901, { source: 'above_fixed_stop' });
-    assert.strictEqual(manager._exitCalls.length, 0, 'price above -10% must remain open');
-    manager._checkExit('p1', 0.9, { source: 'fixed_stop' });
-    assert.strictEqual(manager._exitCalls.length, 1);
-    assert.strictEqual(manager._exitCalls[0].reason, 'FIXED_STOP_LOSS');
+    manager._checkExit('p1', 0.5, { source: 'fixed_stop_disabled' });
+    assert.strictEqual(
+      manager._exitCalls.length,
+      0,
+      'fixed stop must remain disabled even when a stale server env is present',
+    );
   }
 
   {
