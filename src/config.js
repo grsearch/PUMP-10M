@@ -18,10 +18,10 @@ function flagEnv(name, fallback = false) {
 const solPriceUsdForConfig = numberEnv('SOL_PRICE_USD', 72);
 const activityFlow1mMinVolumeUsdDefault = numberEnv('ACTIVITY_FLOW_1M_MIN_VOLUME_USD', 3000);
 const activityFlow1mMinVolumeSolDefault = activityFlow1mMinVolumeUsdDefault / Math.max(solPriceUsdForConfig, 0.001);
-// The production universe is limited to the first four minutes after a
+// The production universe is limited to the first five minutes after a
 // confirmed Pump migration. Keep this fixed so stale server environment
 // values cannot silently widen the live watchlist.
-const maxMintAgeHours = 4 / 60;
+const maxMintAgeHours = 5 / 60;
 
 const config = {
   // ============ Mode ============
@@ -191,10 +191,10 @@ const config = {
     // BUYs use buy_exact_quote_in, so the SOL input is always fixed. Executor
     // narrows this tolerance per order to stay inside the signal-price cap.
     buySlippageBps: Math.min(5000, parseInt(process.env.BUY_SLIPPAGE_BPS || '5000', 10)), // hard-capped at 50%
-    // Production entry policy: the forced-fresh expected BUY price must not
-    // exceed the signal price. Keep this hard-coded so a stale server env
-    // cannot silently restore the rejected +15% chase allowance.
-    buyMaxPriceDeviationPct: 0,
+    // Production entry policy: allow at most +3% above the signal price so a
+    // fresh exact-quote BUY has enough landing room without restoring the old
+    // +15% chase allowance. Keep this hard-coded against stale server envs.
+    buyMaxPriceDeviationPct: 3,
     buyMaxPoolStateAgeMs: parseInt(process.env.BUY_MAX_POOL_STATE_AGE_MS || '500', 10),
     buyMaxEstimatedSlippagePct: parseFloat(process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT || '5'),
     // SELL has no signal-price ceiling like BUY. Profit exits start at 30%;
@@ -253,8 +253,8 @@ const config = {
     maxTokenAgeMs: maxMintAgeHours * 60 * 60 * 1000,
     // v3.17.20: FDV lower bound in USD; refreshed once per minute by TokenWatchdog.
     minFdVUsd: 10_000,
-    // Birdeye liquidity in USD. Shared by discovery admission and watchdog removal.
-    minLiquidityUsd: 3_000,
+    // LP remains telemetry only; it must not reject or remove a monitored mint.
+    minLiquidityUsd: 0,
     // v3.17.20: FDV 上限（USD），设 0 禁用（不因 FDV 过大移除监控）
     maxFdVUsd: 500_000,
   },
@@ -577,7 +577,8 @@ const config = {
     maxConcurrentChecks: parseInt(process.env.PUMP_DISCOVERY_MAX_CONCURRENT_CHECKS || '3', 10),
     minFdvUsd: 10_000,
     maxFdvUsd: 500_000,
-    minLiquidityUsd: 3_000,
+    // LP remains telemetry only; admission is based on FDV, not liquidity.
+    minLiquidityUsd: 0,
   },
 
   // ============ Priority fees ============

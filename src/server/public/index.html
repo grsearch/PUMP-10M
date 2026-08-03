@@ -752,10 +752,13 @@ async function refreshSignals() {
   const rows = r.candidates || [];
   const trailingActivate = thresholds.trailingActivatePct ?? 8;
   const trailingDrawdown = thresholds.trailingDrawdownPct ?? 3;
+  const liquidityFilter = (thresholds.minLiquidityUsd ?? 0) > 0
+    ? `LP ≥ $${Math.round(thresholds.minLiquidityUsd / 1000)}k`
+    : 'LP 过滤关闭';
   meta.innerHTML = [
     `<span>买入 <b>${thresholds.dropWindowMs ?? 1000}ms 内跌 ${thresholds.dropMinPct ?? 10}%～${thresholds.dropMaxPct ?? 20}%</b></span>`,
     `<span>反弹确认 <b>低点反弹 ${thresholds.reboundMinPct ?? 2}%～${thresholds.reboundMaxPct ?? 5}%，须在 ${thresholds.reboundTimeoutMs ?? 1000}ms 内完成</b></span>`,
-    `<span>监控 <b>FDV $${Math.round((thresholds.minFdvUsd ?? 10000) / 1000)}k～$${Math.round((thresholds.maxFdvUsd ?? 500000) / 1000)}k / LP ≥ $${Math.round((thresholds.minLiquidityUsd ?? 3000) / 1000)}k / AGE &lt; ${Math.round((thresholds.maxTokenAgeMs ?? 240000) / 60000)}m</b></span>`,
+    `<span>监控 <b>FDV $${Math.round((thresholds.minFdvUsd ?? 10000) / 1000)}k～$${Math.round((thresholds.maxFdvUsd ?? 500000) / 1000)}k / ${liquidityFilter} / AGE &lt; ${Math.round((thresholds.maxTokenAgeMs ?? 300000) / 60000)}m</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
     `<span>快速止盈 <b>买入后 ${Math.round((thresholds.fastTakeProfitWindowMs ?? 5000) / 1000)}s 内达到 +${thresholds.fastTakeProfitPct ?? 8}% 立即卖出</b></span>`,
     `<span>盈亏检查 <b>第 ${Math.round((thresholds.lossCheckAtMs ?? 6000) / 1000)}s 低于买入价立即止损；不低于则继续持有</b></span>`,
