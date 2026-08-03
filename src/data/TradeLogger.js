@@ -810,6 +810,22 @@ ${snapshotColumnsSql},
         DELETE FROM price_samples WHERE ts < ?
       `),
 
+      markBuyAttemptChainFailed: this.db.prepare(`
+        UPDATE trades
+        SET success = 0,
+            error = @error,
+            details_json = COALESCE(@detailsJson, details_json)
+        WHERE position_id = @positionId AND side = 'BUY' AND signature = @signature
+      `),
+
+      markSellChainFailed: this.db.prepare(`
+        UPDATE trades
+        SET success = 0,
+            error = @error,
+            details_json = COALESCE(@detailsJson, details_json)
+        WHERE side = 'SELL' AND signature = @signature
+      `),
+
       insertQuoteAssetSnapshot: this.db.prepare(quoteAssetInsertSql),
 
       upsertTxQuoteReconciliation: this.db.prepare(txQuoteUpsertSql),
@@ -1060,6 +1076,25 @@ ${snapshotColumnsSql},
   _cleanDbValue(value) {
     if (typeof value === 'number' && !Number.isFinite(value)) return null;
     return value ?? null;
+  }
+
+  markBuyAttemptChainFailed(positionId, signature, error, details = null) {
+    if (!positionId || !signature) return;
+    this.stmts.markBuyAttemptChainFailed.run({
+      positionId,
+      signature,
+      error: error || 'BUY_CHAIN_FAILED',
+      detailsJson: details == null ? null : JSON.stringify(details),
+    });
+  }
+
+  markSellChainFailed(signature, error, details = null) {
+    if (!signature) return;
+    this.stmts.markSellChainFailed.run({
+      signature,
+      error: error || 'SELL_CHAIN_FAILED',
+      detailsJson: details == null ? null : JSON.stringify(details),
+    });
   }
 
   saveQuoteAssetSnapshot(snapshot) {
@@ -1347,6 +1382,34 @@ ${snapshotColumnsSql},
         buyFeeLamports: buyFeeLamports ?? 0,
       });
     }
+  }
+
+  updatePositionBuySubmission(positionId, {
+    entrySol,
+    entryPrice,
+    tokenAmount,
+    buySignature,
+    buyFeeLamports,
+    buySlot,
+  }) {
+    this.db.prepare(`
+      UPDATE positions SET
+        entry_sol = @entrySol,
+        entry_price = @entryPrice,
+        token_amount = @tokenAmount,
+        buy_signature = @buySignature,
+        buy_fee_lamports = @buyFeeLamports,
+        buy_slot = COALESCE(@buySlot, buy_slot)
+      WHERE position_id = @positionId
+    `).run({
+      positionId,
+      entrySol: entrySol ?? null,
+      entryPrice: entryPrice ?? null,
+      tokenAmount: tokenAmount ?? null,
+      buySignature: buySignature || null,
+      buyFeeLamports: buyFeeLamports ?? 0,
+      buySlot: buySlot ?? null,
+    });
   }
 
   closePosition(positionId, { closedAt, exitPrice, exitSol, pnlSol, pnlPct, exitReason, sellSignature, peakPnlPct, peakPrice, peakTs, timeToPeakMs, priceTickCount }) {

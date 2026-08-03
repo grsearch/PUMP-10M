@@ -86,8 +86,17 @@ async function main() {
   console.log(
     `Buy guard: chain ceiling=${(config.strategy.buySlippageBps / 100).toFixed(1)}%, ` +
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
-      `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms`,
+      `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms, ` +
+      `6004 requote=${config.strategy.buy6004RequoteRetries}x`,
   );
+  console.log(
+    `Sell guard: normal=${(config.strategy.sellSlippageBps / 100).toFixed(1)}%, ` +
+      `emergency=${(config.strategy.sellEmergencySlippageBps / 100).toFixed(1)}%, ` +
+      `hard cap=${(config.strategy.sellMaxSlippageBps / 100).toFixed(1)}%, forced fresh RPC`,
+  );
+  if (Number(process.env.SELL_SLIPPAGE_BPS) > 0 && Number(process.env.SELL_SLIPPAGE_BPS) < 3000) {
+    console.warn('Legacy SELL_SLIPPAGE_BPS below 3000 is clamped to 30% to prevent Pump 6004 loops.');
+  }
   console.log('Entry frequency: no overlapping position per mint; re-entry is allowed after close');
   console.log(`Executor: Pump AMM SDK direct (no Jupiter)`);
   console.log(

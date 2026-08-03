@@ -28,6 +28,7 @@
     "test:swap-sanitizer": "node scripts/test-swap-event-sanitizer.js",
     "test:buy-guard": "node scripts/test-buy-execution-guard.js",
     "test:buy-exact-quote": "node scripts/test-pump-exact-quote-buy.js",
+    "test:execution-slippage": "node scripts/test-execution-slippage-policy.js",
     "test:compute-unit-limit": "node scripts/test-compute-unit-limit.js",
     "test:pricing": "node scripts/test-pump-swap-pricing.js",
     "test:pool-cache": "node scripts/test-pool-state-cache-foundation.js",
