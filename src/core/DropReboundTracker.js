@@ -105,10 +105,12 @@ class DropReboundTracker extends EventEmitter {
       return `FDV $${Math.round(fdv)}>$${this.maxFdvUsd}`;
     }
 
-    const liquidity = finite(token.liquidity);
-    if (liquidity == null) return 'LP unavailable';
-    if (liquidity < this.minLiquidityUsd) {
-      return `LP $${Math.round(liquidity)}<$${this.minLiquidityUsd}`;
+    if (this.minLiquidityUsd > 0) {
+      const liquidity = finite(token.liquidity);
+      if (liquidity == null) return 'LP unavailable';
+      if (liquidity < this.minLiquidityUsd) {
+        return `LP $${Math.round(liquidity)}<$${this.minLiquidityUsd}`;
+      }
     }
 
     const migrationTime = normalizeUnixMs(token.migration_time);

@@ -197,7 +197,7 @@ class TokenWatchdog {
         if (market) this._backfillMigrationTime(token, market);
         const marketComplete = (
           Number(market?.fdv) > 0 &&
-          Number(market?.liquidity) > 0
+          (this.minLiquidityUsd <= 0 || Number(market?.liquidity) > 0)
         );
         if (!marketComplete) {
           fallback.push(token);
@@ -223,8 +223,10 @@ class TokenWatchdog {
         const hasMarket = (
           Number.isFinite(fallbackFdv) &&
           fallbackFdv > 0 &&
-          Number.isFinite(fallbackLiquidity) &&
-          fallbackLiquidity > 0
+          (
+            this.minLiquidityUsd <= 0 ||
+            (Number.isFinite(fallbackLiquidity) && fallbackLiquidity > 0)
+          )
         );
         if (!hasMarket) throw new Error('Birdeye returned no market fields');
         this.tokenRegistry.updateMarket(token.mint, {

@@ -76,7 +76,7 @@ function run() {
   assert.strictEqual(config.strategy.maxHoldMs, 15_000);
   assert.strictEqual(config.strategy.takeProfitPct, 0);
   assert.strictEqual(config.strategy.fixedStopLossPct, 0);
-  assert.strictEqual(config.strategy.buyMaxPriceDeviationPct, 0);
+  assert.strictEqual(config.strategy.buyMaxPriceDeviationPct, 3);
   assert.strictEqual(config.strategy.emergencyStopLossPct, 0);
   assert.strictEqual(config.strategy.rsi1sExitEnabled, false);
   assert.strictEqual(config.strategy.noRecoveryExitEnabled, false);

@@ -75,8 +75,11 @@ async function main() {
   );
   console.log(`Legacy dumpSignal: ${config.activityFlow.replaceDumpSignal ? 'suppressed' : 'allowed fallback'}`);
   console.log(`Rebuy cooldown: ${config.strategy.rebuyCooldownMs > 0 ? config.strategy.rebuyCooldownMs / 60_000 + 'min after close' : 'disabled'}`);
+  const watchdogLiquidityPolicy = config.strategy.minLiquidityUsd > 0
+    ? `liquidity>=$${config.strategy.minLiquidityUsd}`
+    : 'liquidity filter=disabled';
   console.log(
-    `Watchdog: FDV=${watchdogFdvRange}, liquidity>=$${config.strategy.minLiquidityUsd}, ` +
+    `Watchdog: FDV=${watchdogFdvRange}, ${watchdogLiquidityPolicy}, ` +
       `migrationAge<=${watchdogMaxAgeMs / 60_000}min ` +
       `(check every ${watchdogCheckIntervalMs / 60_000}min)`,
   );
@@ -99,11 +102,11 @@ async function main() {
   }
   if (
     process.env.BUY_MAX_PRICE_DEVIATION_PCT != null &&
-    Number(process.env.BUY_MAX_PRICE_DEVIATION_PCT) !== 0
+    Number(process.env.BUY_MAX_PRICE_DEVIATION_PCT) !== config.strategy.buyMaxPriceDeviationPct
   ) {
     console.warn(
-      'BUY_MAX_PRICE_DEVIATION_PCT is ignored; the production BUY price ' +
-        'cannot exceed the signal price.',
+      `BUY_MAX_PRICE_DEVIATION_PCT is ignored; the production BUY price cap ` +
+        `is fixed at signal +${config.strategy.buyMaxPriceDeviationPct}%.`,
     );
   }
   console.log('Entry frequency: no overlapping position per mint; re-entry is allowed after close');

@@ -53,10 +53,10 @@ function run() {
   assert.strictEqual(config.activityFlow.reboundMinPct, 2);
   assert.strictEqual(config.activityFlow.reboundMaxPct, 5);
   assert.strictEqual(config.activityFlow.reboundTimeoutMs, 1_000);
-  assert.strictEqual(config.strategy.maxTokenAgeMs, 4 * 60_000);
+  assert.strictEqual(config.strategy.maxTokenAgeMs, 5 * 60_000);
   assert.strictEqual(config.strategy.minFdVUsd, 10_000);
   assert.strictEqual(config.strategy.maxFdVUsd, 500_000);
-  assert.strictEqual(config.strategy.minLiquidityUsd, 3_000);
+  assert.strictEqual(config.strategy.minLiquidityUsd, 0);
   assert.strictEqual(config.pumpDiscovery.enabled, true);
 
   const base = Date.now() - 2_000;
@@ -112,8 +112,7 @@ function run() {
   for (const [name, overrides] of [
     ['low fdv', { fdv: 9_999 }],
     ['high fdv', { fdv: 500_001 }],
-    ['low liquidity', { liquidity: 2_999 }],
-    ['age four minutes', { migration_time: base - 4 * 60_000 }],
+    ['age five minutes', { migration_time: base - 5 * 60_000 }],
   ]) {
     const t = tracker(base, overrides);
     let signals = 0;
@@ -126,12 +125,23 @@ function run() {
   }
 
   {
+    const t = tracker(base, { liquidity: null });
+    let signals = 0;
+    t.on('flowReversalSignal', () => signals++);
+    t.handleSwap(swap(mint, 1, base, 'no-lp-peak'));
+    t.handleSwap(swap(mint, 0.85, base + 100, 'no-lp-drop'));
+    t.handleSwap(swap(mint, 0.87, base + 300, 'no-lp-rebound'));
+    assert.strictEqual(signals, 1, 'missing LP telemetry must not block an entry signal');
+  }
+
+  {
     const t = tracker(base);
     t.handleSwap(swap(mint, 1, base, 'panel'));
     const panel = t.getStrategyCandidates(10, base + 100);
     assert.strictEqual(panel.mode, 'DROP_REBOUND_1S');
     assert.strictEqual(panel.thresholds.reboundTimeoutMs, 1_000);
-    assert.strictEqual(panel.thresholds.maxTokenAgeMs, 240_000);
+    assert.strictEqual(panel.thresholds.maxTokenAgeMs, 300_000);
+    assert.strictEqual(panel.thresholds.minLiquidityUsd, 0);
     assert.strictEqual(panel.thresholds.trailingActivatePct, 8);
     assert.strictEqual(panel.thresholds.trailingDrawdownPct, 3);
     assert.strictEqual(panel.thresholds.fastTakeProfitPct, 8);

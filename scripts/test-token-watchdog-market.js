@@ -180,14 +180,42 @@ assert.strictEqual(
   );
   assert.strictEqual(
     watchdog.maxTokenAgeMs,
-    4 * 60_000,
-    'watchdog must remove migrated tokens at four minutes',
+    5 * 60_000,
+    'watchdog must remove migrated tokens at five minutes',
   );
   assert.strictEqual(
     watchdog.minFdVUsd,
     10_000,
     'watchdog must enforce the $10,000 monitoring floor',
   );
+  assert.strictEqual(watchdog.minLiquidityUsd, 0, 'production LP removal must be disabled');
+
+  let noLpMarketUpdated = false;
+  const noLpToken = {
+    mint: `${mint}-no-lp`,
+    symbol: 'NOLP',
+    migration_time: now - 60_000,
+    market_updated_at: now - 10 * 60_000,
+    is_active: 1,
+  };
+  const noLpWatchdog = new TokenWatchdog({
+    tokenRegistry: {
+      updateMarket: (_mint, market) => {
+        noLpMarketUpdated = market.fdv === 20_000 && market.liquidity == null;
+      },
+    },
+    positionManager: { hasOpenPosition: () => false },
+    tradeLogger: null,
+    fetchMarkets: async () => new Map([[
+      noLpToken.mint,
+      { fdv: 20_000, liquidity: null, fetchedAt: now, marketSource: 'dexscreener' },
+    ]]),
+    fetchMarket: async () => assert.fail('LP-disabled market refresh must not require fallback'),
+  });
+  const noLpStats = await noLpWatchdog._refreshMarkets([noLpToken], now);
+  assert.deepStrictEqual(noLpStats, { refreshed: 1, failed: 0 });
+  assert.strictEqual(noLpMarketUpdated, true, 'FDV refresh must succeed without LP telemetry');
+
   watchdog.minLiquidityUsd = 3_000;
   watchdog.minVolume24hUsd = 0;
   watchdog.noBuyRemoveMs = 0;
@@ -239,7 +267,7 @@ assert.strictEqual(
     mint,
     symbol: 'OLDAGE',
     added_at: now - 60_000,
-    migration_time: now - 4 * 60_000,
+    migration_time: now - 5 * 60_000,
     is_active: 1,
   };
   let oldAgeRemoved = false;
@@ -260,7 +288,7 @@ assert.strictEqual(
   oldAgeWatchdog.maxWatchDurationMs = 0;
 
   await oldAgeWatchdog._check();
-  assert.strictEqual(oldAgeRemoved, true, 'migration AGE at four minutes must remove the token');
+  assert.strictEqual(oldAgeRemoved, true, 'migration AGE at five minutes must remove the token');
 
   let openAgeRemoved = false;
   const openAgeWatchdog = new TokenWatchdog({

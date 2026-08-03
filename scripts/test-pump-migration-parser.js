@@ -266,6 +266,20 @@ assert.strictEqual(
   'liquidity_low',
 );
 
+const noLpDiscovery = Object.create(PumpGraduationDiscovery.prototype);
+noLpDiscovery.settings = {
+  minFdvUsd: 10_000,
+  maxFdvUsd: 500_000,
+  minLiquidityUsd: 0,
+  marketRetries: 1,
+  marketRetryMs: 1,
+};
+assert.strictEqual(
+  noLpDiscovery._getRejection({ market: { fdv: 20_000, liquidity: null } }),
+  null,
+  'disabled LP admission must accept missing liquidity telemetry',
+);
+
 const watchdog = Object.create(TokenWatchdog.prototype);
 const now = 1_800_000_000_000;
 assert.strictEqual(
@@ -288,6 +302,10 @@ assert.strictEqual(
   const screening = await discovery._fetchScreeningData(key('M'));
   assert.deepStrictEqual(screening, { market: { fdv: 20_000, liquidity: 3_500 } });
   assert.strictEqual(marketCalls, 1);
+
+  noLpDiscovery.fetchMarket = async () => ({ fdv: 20_000, liquidity: null });
+  const noLpScreening = await noLpDiscovery._fetchScreeningData(key('N'));
+  assert.deepStrictEqual(noLpScreening, { market: { fdv: 20_000, liquidity: null } });
 
   const migration = {
     mint: key('R'),

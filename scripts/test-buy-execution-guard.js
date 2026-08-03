@@ -37,9 +37,9 @@ async function run() {
 
   const productionRejected = calculateBuyPriceGuard({
     signalPrice: 1,
-    expectedPrice: 1.0001,
+    expectedPrice: 1.0301,
     configuredSlippagePct: 50,
-    maxPriceDeviationPct: 0,
+    maxPriceDeviationPct: 3,
     inputSol: 1,
   });
   assert.strictEqual(productionRejected.allowed, false);
@@ -50,9 +50,9 @@ async function run() {
 
   const productionAtSignal = calculateBuyPriceGuard({
     signalPrice: 1,
-    expectedPrice: 1,
+    expectedPrice: 1.03,
     configuredSlippagePct: 50,
-    maxPriceDeviationPct: 0,
+    maxPriceDeviationPct: 3,
     inputSol: 1,
   });
   assert.strictEqual(productionAtSignal.allowed, true);
@@ -62,15 +62,27 @@ async function run() {
     signalPrice: 1,
     expectedPrice: 0.95,
     configuredSlippagePct: 50,
-    maxPriceDeviationPct: 0,
+    maxPriceDeviationPct: 3,
     inputSol: 1,
   });
   assert.strictEqual(productionBelowSignal.allowed, true);
   approx(
     productionBelowSignal.expectedPrice *
       (1 + productionBelowSignal.effectiveSlippagePct / 100),
-    1,
+    1.03,
   );
+
+  // TCAT regression: a 1.883% price move fits inside the production +3% cap.
+  const tcat = calculateBuyPriceGuard({
+    signalPrice: 1,
+    expectedPrice: 1,
+    configuredSlippagePct: 50,
+    maxPriceDeviationPct: 3,
+    inputSol: 0.2,
+  });
+  assert.strictEqual(tcat.allowed, true);
+  approx(tcat.effectiveSlippagePct, 3);
+  assert.ok(tcat.effectiveSlippagePct > 1.883);
 
   // 2. +3% expected price leaves about 1.94% before a +5% signal cap.
   const narrowed = calculateBuyPriceGuard({

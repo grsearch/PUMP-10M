@@ -93,10 +93,13 @@ class PumpGraduationDiscovery extends EventEmitter {
       staleMs: Math.max(30_000, this.settings.pollIntervalMs * 4),
       label: 'Pump.fun Graduation Discovery',
     });
+    const liquidityPolicy = this.settings.minLiquidityUsd > 0
+      ? `liquidity >= $${this.settings.minLiquidityUsd}, ` +
+        `LP recheck=${this.settings.liquidityRechecks}x/${this.settings.liquidityRecheckMs}ms`
+      : 'liquidity filter disabled';
     console.log(
       `[PumpDiscovery] enabled: FDV $${this.settings.minFdvUsd}-${this.settings.maxFdvUsd}, ` +
-        `liquidity >= $${this.settings.minLiquidityUsd}, ` +
-        `LP recheck=${this.settings.liquidityRechecks}x/${this.settings.liquidityRecheckMs}ms`,
+        liquidityPolicy,
     );
 
     this._connectWebSocket();
@@ -416,9 +419,13 @@ class PumpGraduationDiscovery extends EventEmitter {
     });
 
     monitor.inc(`${MODULE}.tokensAdded`, 1, MODULE);
+    const addedLiquidity = screening.market.liquidity == null
+      ? null
+      : finiteNumber(screening.market.liquidity);
     console.log(
       `[PumpDiscovery] added ${token?.symbol || migration.mint.slice(0, 8)} ` +
-        `FDV=$${Math.round(screening.market.fdv)} LP=$${Math.round(screening.market.liquidity)} ` +
+        `FDV=$${Math.round(screening.market.fdv)} ` +
+        `LP=${addedLiquidity == null ? 'n/a' : `$${Math.round(addedLiquidity)}`} ` +
         `slot=${migration.slot} via=${migration.detectionPath}`,
     );
     const event = { token, migration, screening, evicted: evicted || [] };
@@ -439,7 +446,10 @@ class PumpGraduationDiscovery extends EventEmitter {
         lastMarketError = err;
       }
 
-      const hasMarket = finiteNumber(market?.fdv) > 0 && finiteNumber(market?.liquidity) > 0;
+      const hasFdv = finiteNumber(market?.fdv) > 0;
+      const hasRequiredLiquidity = this.settings.minLiquidityUsd <= 0 ||
+        finiteNumber(market?.liquidity) > 0;
+      const hasMarket = hasFdv && hasRequiredLiquidity;
       if (hasMarket) return { market };
       if (attempt < attempts) await sleep(Math.max(250, this.settings.marketRetryMs));
     }
@@ -458,7 +468,10 @@ class PumpGraduationDiscovery extends EventEmitter {
     if (this.settings.maxFdvUsd > 0 && fdv > this.settings.maxFdvUsd) {
       return { code: 'fdv_high', message: `FDV $${Math.round(fdv)} > $${this.settings.maxFdvUsd}` };
     }
-    if (liquidity == null || liquidity < this.settings.minLiquidityUsd) {
+    if (
+      this.settings.minLiquidityUsd > 0 &&
+      (liquidity == null || liquidity < this.settings.minLiquidityUsd)
+    ) {
       return {
         code: 'liquidity_low',
         message: `liquidity $${Math.round(liquidity || 0)} < $${this.settings.minLiquidityUsd}`,
