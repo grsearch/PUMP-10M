@@ -74,6 +74,14 @@ const DEDUP_TTL_MS = 5 * 60_000;
 const DEDUP_MAX = 2000;
 const STREAM_PING_INTERVAL_MS = 30_000;
 const STREAM_PONG_TIMEOUT_MS = 90_000;
+const SLOT_SUBSCRIBER_STALE_MS = Math.max(
+  5_000,
+  parseInt(process.env.SLOT_SUBSCRIBER_STALE_MS || '15000', 10),
+);
+const TX_SUBSCRIPTION_SILENCE_MS = Math.max(
+  60_000,
+  parseInt(process.env.TX_SUBSCRIPTION_SILENCE_MS || '120000', 10),
+);
 
 class SignatureDedup {
   constructor() {
@@ -116,13 +124,26 @@ class SignatureDedup {
  * 内部管理重连、订阅、生命周期。tx 来了上抛给 TickStream 由 dedup 统一过滤。
  */
 class RegionStream {
-  constructor({ endpoint, token, label, onTx, onConnected, onSlot, filterMode = 'pumpAmm' }) {
+  constructor({
+    endpoint,
+    token,
+    label,
+    onTx,
+    onConnected,
+    onSlot,
+    getCurrentSlot,
+    filterMode = 'pumpAmm',
+  }) {
     this.endpoint = endpoint;
     this.token = token;
     this.label = label;
     this.onTx = onTx;
     this.onConnected = onConnected;
     this.onSlot = onSlot; // v3.17.29: slot update 回调(从 SubscribeRequest slots filter 来)
+    // RegionStream owns the reconnect cursor, while TickStream owns the
+    // independent SlotSub/current-chain slot. Keep that boundary explicit so
+    // replay never reads undefined parent fields from the child instance.
+    this.getCurrentSlot = typeof getCurrentSlot === 'function' ? getCurrentSlot : () => 0;
     // v3.17.24: filterMode
     //   'pumpAmm'  — accountInclude=mints, accountRequired=PUMP_AMM (default, current behavior)
     //   'jupiter'  — accountInclude=JUP_programs, accountRequired=[] (Jupiter route trades)
@@ -335,7 +356,10 @@ class RegionStream {
     // 原 bug:优先 _latestSlotFromTx,若 tx 流已延迟它也是旧值 → gap 算偏小 →
     // 不触发 cap → 走正常 replay → 拉一堆旧数据 → off-heap 内存暴涨 + tx 积压
     // 修复:用 _latestSlotFromSlotUpdate(SlotSub 独立连接,不被 tx 延迟污染)算 gap 才准
-    const currentSlot = this._latestSlotFromSlotUpdate || this._latestSlotFromTx || this._latestSlot || 0;
+    const currentSlotRaw = this.getCurrentSlot();
+    const currentSlot = Number.isFinite(Number(currentSlotRaw))
+      ? Number(currentSlotRaw)
+      : 0;
     if (this._lastReceivedSlot > 0 && currentSlot > 0) {
       const gap = currentSlot - this._lastReceivedSlot;
       if (gap > maxReplaySlots) {
@@ -584,6 +608,60 @@ function extractSignature(txMessage) {
   }
 }
 
+/**
+ * Wait for a SlotSub stream to finish without leaving its reconnect loop
+ * blocked. In particular, a gRPC `error` is terminal for this subscription:
+ * clean up the old stream and resolve so the outer loop can reconnect.
+ */
+function waitForSlotStreamTermination(
+  stream,
+  { onData, onError, isRunning = () => true, checkIntervalMs = 1000 } = {},
+) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stopTimer = null;
+
+    const cleanup = () => {
+      if (stopTimer) clearInterval(stopTimer);
+      stream.removeListener('data', handleData);
+      stream.removeListener('error', handleError);
+      stream.removeListener('end', handleEnd);
+      stream.removeListener('close', handleClose);
+    };
+    const finish = (reason, error = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (reason === 'error' || reason === 'stopped') {
+        try { stream.destroy(); } catch (_) {}
+      }
+      resolve({ reason, error });
+    };
+    const handleData = (message) => {
+      if (!isRunning()) {
+        finish('stopped');
+        return;
+      }
+      if (onData) onData(message);
+    };
+    const handleError = (error) => {
+      if (onError) onError(error);
+      finish('error', error);
+    };
+    const handleEnd = () => finish('end');
+    const handleClose = () => finish('close');
+
+    stream.on('data', handleData);
+    stream.once('error', handleError);
+    stream.once('end', handleEnd);
+    stream.once('close', handleClose);
+    stopTimer = setInterval(() => {
+      if (!isRunning()) finish('stopped');
+    }, checkIntervalMs);
+    if (typeof stopTimer.unref === 'function') stopTimer.unref();
+  });
+}
+
 class TickStream extends EventEmitter {
   constructor() {
     super();
@@ -600,6 +678,7 @@ class TickStream extends EventEmitter {
     // v3.17.29: 区分 tx-driven slot vs slot-update-driven slot(诊断用)
     this._latestSlotFromSlotUpdate = 0;
     this._latestSlotFromTx = 0;
+    this._lastSlotUpdateAt = 0;
     // v3.17.41: LS-only slot (不被 SS 数据污染), 用于 laggyReconnect 检测
     this._latestLsSlot = 0;
 
@@ -609,6 +688,9 @@ class TickStream extends EventEmitter {
     this._rebuildTimer = null;
     this._rebuildInProgress = false;
     this._rebuildQueued = false;
+    this._streamWatchdogTimer = null;
+    this._lastSilenceRebuildAt = 0;
+    this._silenceRebuildStreak = 0;
 
     // v3.17.25: Reader-Worker 分离 — reader 回调只入队，worker 异步消费
     //   目的：让 gRPC reader 永不阻塞，避免突破 Helius 450-slot 阈值被切流
@@ -647,6 +729,7 @@ class TickStream extends EventEmitter {
           onConnected: (region) => this.emit('regionConnected', region),
           // v3.17.29: LS 同时推 slot update,用于维护真实当下 slot
           onSlot: (slot, region) => this._onLsSlot(slot, region),
+          getCurrentSlot: () => this._getCurrentSlotForReplay(),
         }),
       );
     });
@@ -664,6 +747,7 @@ class TickStream extends EventEmitter {
           label,
           onTx: (txMessage, region) => this._enqueue(txMessage, region),
           onConnected: (region) => this.emit('regionConnected', region),
+          getCurrentSlot: () => this._getCurrentSlotForReplay(),
         }),
       );
     });
@@ -685,6 +769,7 @@ class TickStream extends EventEmitter {
             filterMode: 'jupiter',
             onTx: (txMessage, region) => this._enqueueJupiter(txMessage, region),
             onConnected: (region) => this.emit('regionConnected', region),
+            getCurrentSlot: () => this._getCurrentSlotForReplay(),
           }),
         );
       });
@@ -740,6 +825,106 @@ class TickStream extends EventEmitter {
     } catch (_) {
       return (prefix ? prefix + '-' : '') + `R${idx}`;
     }
+  }
+
+  _getCurrentSlotForReplay(now = Date.now()) {
+    const slotSubFresh =
+      this._latestSlotFromSlotUpdate > 0 &&
+      this._lastSlotUpdateAt > 0 &&
+      now - this._lastSlotUpdateAt <= SLOT_SUBSCRIBER_STALE_MS;
+    if (slotSubFresh) return this._latestSlotFromSlotUpdate;
+    return Math.max(this._latestSlotFromTx || 0, this._latestSlot || 0);
+  }
+
+  _checkStreamWatchdog(now = Date.now()) {
+    // SlotSub should advance several times per second. If the transport becomes
+    // silently wedged (no error/end/close), destroy only that stream; its own
+    // loop will reconnect it without restarting the trading process.
+    const slotActivityAt = Math.max(
+      this._slotSubscriberConnectedAt || 0,
+      this._lastSlotUpdateAt || 0,
+    );
+    if (
+      this.shouldRun &&
+      this._slotSubscriber &&
+      slotActivityAt > 0 &&
+      now - slotActivityAt > SLOT_SUBSCRIBER_STALE_MS
+    ) {
+      const staleStream = this._slotSubscriber;
+      this._slotSubscriber = null;
+      monitor.inc('TickStream.SlotSub.staleReconnect', 1, 'TickStream');
+      console.warn(
+        `[TickStream:SlotSub] no slot update for ${Math.round((now - slotActivityAt) / 1000)}s; reconnecting`,
+      );
+      try { staleStream.destroy(); } catch (_) {}
+    }
+
+    const activeLsRegions = this.regions.filter(
+      (region) =>
+        region.label?.startsWith('LS-') &&
+        region.shouldRun &&
+        region._currentMints.length > 0,
+    );
+    if (this.watchedMints.size === 0 || activeLsRegions.length === 0) {
+      this._silenceRebuildStreak = 0;
+      monitor.clearAlert('tickstream.transaction_subscription_silent');
+      return false;
+    }
+
+    // If the control plane itself is unhealthy, RegionStream/AlertChecker owns
+    // that reconnect. This watchdog covers the subtler case where ping/pong is
+    // healthy but the transaction filter has stopped producing data.
+    const allControlPlanesHealthy = activeLsRegions.every(
+      (region) => typeof region.getHealth !== 'function' || region.getHealth(now).healthy,
+    );
+    const slotIsAdvancing =
+      this._lastSlotUpdateAt > 0 &&
+      now - this._lastSlotUpdateAt <= SLOT_SUBSCRIBER_STALE_MS;
+    if (!allControlPlanesHealthy || !slotIsAdvancing) return false;
+
+    const lastMatchingTxAt = activeLsRegions.reduce(
+      (latest, region) => Math.max(latest, region._lastTxAt || 0),
+      0,
+    );
+    const newestConnectionAt = activeLsRegions.reduce(
+      (latest, region) => Math.max(latest, region._connectedAt || 0),
+      0,
+    );
+    const silenceStartedAt = Math.max(lastMatchingTxAt, newestConnectionAt);
+    if (silenceStartedAt <= 0 || now - silenceStartedAt < TX_SUBSCRIPTION_SILENCE_MS) {
+      if (lastMatchingTxAt > this._lastSilenceRebuildAt) {
+        this._silenceRebuildStreak = 0;
+        monitor.clearAlert('tickstream.transaction_subscription_silent');
+      }
+      return false;
+    }
+    if (now - this._lastSilenceRebuildAt < TX_SUBSCRIPTION_SILENCE_MS) return false;
+
+    this._lastSilenceRebuildAt = now;
+    this._silenceRebuildStreak += 1;
+    monitor.inc('TickStream.transactionSilenceRebuild', 1, 'TickStream');
+    console.warn(
+      `[TickStream] ${activeLsRegions.length} healthy LS transaction stream(s) received no ` +
+        `matching tx for ${Math.round((now - silenceStartedAt) / 1000)}s while slots advanced; ` +
+        `rebuilding subscriptions (attempt ${this._silenceRebuildStreak})`,
+    );
+    if (this._silenceRebuildStreak >= 3) {
+      monitor.fireAlert(
+        'tickstream.transaction_subscription_silent',
+        'warn',
+        'LaserStream transaction subscriptions remain silent after repeated in-process rebuilds',
+        {
+          watching: this.watchedMints.size,
+          rebuild_attempts: this._silenceRebuildStreak,
+          silence_seconds: Math.round((now - silenceStartedAt) / 1000),
+        },
+      );
+    }
+    this._performRebuild().catch((err) => {
+      monitor.recordError('TickStream', err, { phase: 'silenceRebuild' });
+      console.error(`[TickStream] silent subscription rebuild failed: ${err.message}`);
+    });
+    return true;
   }
 
   async start(initialMints = []) {
@@ -813,11 +998,20 @@ class TickStream extends EventEmitter {
         this._laggySec = 0;
       }
     }, 5000);
+    this._streamWatchdogTimer = setInterval(() => this._checkStreamWatchdog(), 5000);
+    if (typeof this._streamWatchdogTimer.unref === 'function') {
+      this._streamWatchdogTimer.unref();
+    }
   }
 
   async stop() {
     this.shouldRun = false;
     this._slotSubscriberRunning = false; // v3.17.29: 停 SlotSubscriber
+    if (this._slotSubscriber) {
+      const slotStream = this._slotSubscriber;
+      this._slotSubscriber = null;
+      try { slotStream.destroy(); } catch (_) {}
+    }
     this._stopShredStream();
     if (this._ssLeadStatsTimer) {
       clearInterval(this._ssLeadStatsTimer);
@@ -826,6 +1020,10 @@ class TickStream extends EventEmitter {
     if (this._laggyReconnectTimer) {
       clearInterval(this._laggyReconnectTimer);
       this._laggyReconnectTimer = null;
+    }
+    if (this._streamWatchdogTimer) {
+      clearInterval(this._streamWatchdogTimer);
+      this._streamWatchdogTimer = null;
     }
     await Promise.all(this.regions.map((r) => r.stop()));
   }
@@ -970,6 +1168,7 @@ class TickStream extends EventEmitter {
    */
   _onLsSlot(slot, region) {
     if (!Number.isFinite(slot) || slot <= 0) return;
+    this._lastSlotUpdateAt = Date.now();
 
     if (slot > this._latestSlotFromSlotUpdate) {
       this._latestSlotFromSlotUpdate = slot;
@@ -1026,6 +1225,8 @@ class TickStream extends EventEmitter {
           );
           if (typeof client.connect === 'function') await client.connect();
           const stream = await client.subscribe();
+          this._slotSubscriber = stream;
+          this._slotSubscriberConnectedAt = Date.now();
 
           // 只订阅 slots，不订阅 transactions
           const requestPlain = {
@@ -1083,39 +1284,29 @@ class TickStream extends EventEmitter {
             }
           };
 
-          const onError = (err) => {
-            if (!this._slotSubscriberRunning) return;
-            monitor.recordError('TickStream', err, { phase: 'slotSubscriber' });
-            console.error(`[TickStream:${label}] stream error: ${err.message || err}`);
-            stream.removeAllListeners();
-          };
-
-          const onEnd = () => {
-            if (!this._slotSubscriberRunning) return;
-            console.warn(`[TickStream:${label}] stream ended, reconnecting in 5s...`);
-            stream.removeAllListeners();
-          };
-
-          stream.on('data', onMessage);
-          stream.on('error', onError);
-          stream.on('end', onEnd);
-          stream.on('close', onEnd);
-
-          // 等待 stream 结束或 _slotSubscriberRunning 变 false
-          await new Promise((resolve) => {
-            const check = setInterval(() => {
-              if (!this._slotSubscriberRunning) {
-                clearInterval(check);
-                stream.destroy();
-                resolve();
-              }
-            }, 1000);
-            stream.on('close', () => { clearInterval(check); resolve(); });
-            stream.on('end', () => { clearInterval(check); resolve(); });
+          const outcome = await waitForSlotStreamTermination(stream, {
+            onData: onMessage,
+            onError: (err) => {
+              if (!this._slotSubscriberRunning) return;
+              monitor.recordError('TickStream', err, { phase: 'slotSubscriber' });
+              console.error(`[TickStream:${label}] stream error: ${err.message || err}`);
+            },
+            isRunning: () =>
+              this._slotSubscriberRunning &&
+              this.shouldRun &&
+              this._slotSubscriber === stream,
           });
+          if (this._slotSubscriber === stream) this._slotSubscriber = null;
 
-          if (this._slotSubscriberRunning) {
-            console.warn(`[TickStream:${label}] reconnecting in 5s...`);
+          try {
+            if (typeof client.close === 'function') client.close();
+            else if (client._connectedGrpcClient) client._connectedGrpcClient.close();
+          } catch (_) {}
+
+          if (this._slotSubscriberRunning && this.shouldRun) {
+            console.warn(
+              `[TickStream:${label}] stream ${outcome.reason}, reconnecting in 5s...`,
+            );
           }
         } catch (err) {
           if (!this._slotSubscriberRunning) break;
@@ -1666,3 +1857,4 @@ class TickStream extends EventEmitter {
 module.exports = TickStream;
 module.exports.RegionStream = RegionStream;
 module.exports.SignatureDedup = SignatureDedup;
+module.exports.waitForSlotStreamTermination = waitForSlotStreamTermination;

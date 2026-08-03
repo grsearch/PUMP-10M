@@ -95,7 +95,8 @@ class PumpGraduationDiscovery extends EventEmitter {
     });
     console.log(
       `[PumpDiscovery] enabled: FDV $${this.settings.minFdvUsd}-${this.settings.maxFdvUsd}, ` +
-        `liquidity >= $${this.settings.minLiquidityUsd}, market-only screening`,
+        `liquidity >= $${this.settings.minLiquidityUsd}, ` +
+        `LP recheck=${this.settings.liquidityRechecks}x/${this.settings.liquidityRecheckMs}ms`,
     );
 
     this._connectWebSocket();
@@ -334,8 +335,57 @@ class PumpGraduationDiscovery extends EventEmitter {
     }
 
     if (this.settings.marketInitialDelayMs > 0) await sleep(this.settings.marketInitialDelayMs);
-    const screening = await this._fetchScreeningData(migration.mint);
-    const rejection = this._getRejection(screening);
+    let screening = await this._fetchScreeningData(migration.mint);
+    let rejection = this._getRejection(screening);
+
+    // A just-created PumpSwap pool can be visible to Birdeye before its USD
+    // liquidity snapshot has caught up. Recheck only this transient gate; FDV
+    // failures remain final and the retry count is strictly bounded.
+    const liquidityRechecks = Math.max(0, Number(this.settings.liquidityRechecks) || 0);
+    const liquidityRecheckMs = Math.max(
+      250,
+      Number(this.settings.liquidityRecheckMs) || 5_000,
+    );
+    for (
+      let attempt = 1;
+      rejection?.code === 'liquidity_low' && attempt <= liquidityRechecks;
+      attempt++
+    ) {
+      monitor.inc(`${MODULE}.liquidityRecheckScheduled`, 1, MODULE);
+      console.log(
+        `[PumpDiscovery] defer ${migration.mint.slice(0, 8)}..: ${rejection.message}; ` +
+          `LP recheck ${attempt}/${liquidityRechecks} in ${liquidityRecheckMs}ms`,
+      );
+      await sleep(liquidityRecheckMs);
+
+      try {
+        const refreshed = await this._fetchScreeningData(migration.mint);
+        screening = refreshed;
+        rejection = this._getRejection(screening);
+        monitor.inc(`${MODULE}.liquidityRecheckCompleted`, 1, MODULE);
+        if (!rejection) {
+          monitor.inc(`${MODULE}.liquidityRecheckRecovered`, 1, MODULE);
+          console.log(
+            `[PumpDiscovery] LP recovered ${migration.mint.slice(0, 8)}..: ` +
+              `$${Math.round(screening.market.liquidity)} >= $${this.settings.minLiquidityUsd}`,
+          );
+        }
+      } catch (err) {
+        // Keep the last valid low-liquidity snapshot as the final rejection.
+        // A failed refresh must not create an unbounded retry path.
+        monitor.inc(`${MODULE}.liquidityRecheckFailed`, 1, MODULE);
+        monitor.recordError(MODULE, err, {
+          phase: 'liquidity_recheck',
+          mint: migration.mint,
+          attempt,
+        });
+        console.warn(
+          `[PumpDiscovery] LP recheck failed ${migration.mint.slice(0, 8)}..: ${err.message}`,
+        );
+        break;
+      }
+    }
+
     if (rejection) {
       monitor.inc(`${MODULE}.rejected`, 1, MODULE);
       monitor.inc(`${MODULE}.rejected.${rejection.code}`, 1, MODULE);

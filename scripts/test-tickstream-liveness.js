@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const Module = require('module');
+const EventEmitter = require('events');
 
 const originalLoad = Module._load;
 Module._load = function loadWithDotenvStub(request, parent, isMain) {
@@ -17,9 +18,9 @@ Module._load = function loadWithDotenvStub(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 const TickStream = require('../src/core/TickStream');
-const { RegionStream } = TickStream;
+const { RegionStream, waitForSlotStreamTermination } = TickStream;
 const AlertChecker = require('../src/monitor/AlertChecker');
-const { getMonitor } = require('../src/monitor/HealthMonitor');
+const { HealthMonitor, getMonitor } = require('../src/monitor/HealthMonitor');
 Module._load = originalLoad;
 
 const MINT = 'TickStreamLiveness1111111111111111111111111';
@@ -72,6 +73,7 @@ async function testColdStartLifecycle() {
 
   clearInterval(tickStream._ssLeadStatsTimer);
   clearInterval(tickStream._laggyReconnectTimer);
+  clearInterval(tickStream._streamWatchdogTimer);
   tickStream.shouldRun = false;
 }
 
@@ -114,6 +116,109 @@ async function testRegionIdleLiveness() {
   region._lastMessageAt = staleNow - 100_000;
   region._lastPongAt = staleNow - 100_000;
   assert.strictEqual(region.getHealth(staleNow).healthy, false);
+}
+
+async function testReplayUsesParentCurrentSlot() {
+  const region = new RegionStream({
+    endpoint: 'https://example.invalid',
+    token: 'test',
+    label: 'LS-REPLAY',
+    onTx() {},
+    getCurrentSlot: () => 1_250,
+  });
+  region._currentMints = [MINT];
+  region._lastReceivedSlot = 1_200;
+  let request = null;
+  region.stream = {
+    write(value, callback) {
+      request = value;
+      callback(null);
+    },
+  };
+
+  await region._sendSubscribeRequest();
+  assert.strictEqual(request.fromSlot, 1_200, 'replay must use the parent current slot');
+}
+
+async function testSlotSubscriberErrorTerminatesWait() {
+  const stream = new EventEmitter();
+  let destroyed = 0;
+  let errors = 0;
+  stream.destroy = () => { destroyed++; };
+
+  const waiting = waitForSlotStreamTermination(stream, {
+    onError: () => { errors++; },
+    isRunning: () => true,
+    checkIntervalMs: 10,
+  });
+  stream.emit('error', new Error('silent grpc failure'));
+  const outcome = await waiting;
+
+  assert.strictEqual(outcome.reason, 'error');
+  assert.strictEqual(errors, 1);
+  assert.strictEqual(destroyed, 1, 'terminal error must destroy the stale stream');
+  assert.strictEqual(stream.listenerCount('data'), 0);
+  assert.strictEqual(stream.listenerCount('close'), 0);
+}
+
+function testTransactionSilenceRebuild() {
+  const now = Date.now();
+  let rebuilds = 0;
+  const tickStream = Object.create(TickStream.prototype);
+  tickStream.shouldRun = true;
+  tickStream.watchedMints = new Set([MINT]);
+  tickStream._slotSubscriber = null;
+  tickStream._slotSubscriberConnectedAt = now;
+  tickStream._lastSlotUpdateAt = now;
+  tickStream._lastSilenceRebuildAt = 0;
+  tickStream._silenceRebuildStreak = 0;
+  tickStream.regions = [{
+    label: 'LS-TEST',
+    shouldRun: true,
+    _currentMints: [MINT],
+    _connectedAt: now - 180_000,
+    _lastTxAt: now - 180_000,
+    getHealth: () => ({ healthy: true }),
+  }];
+  tickStream._performRebuild = async () => { rebuilds++; };
+
+  assert.strictEqual(tickStream._checkStreamWatchdog(now), true);
+  assert.strictEqual(rebuilds, 1, 'healthy-but-silent subscriptions must rebuild in-process');
+}
+
+function testSilentSlotSubscriberIsDestroyed() {
+  const now = Date.now();
+  let destroyed = 0;
+  const tickStream = Object.create(TickStream.prototype);
+  tickStream.shouldRun = true;
+  tickStream.watchedMints = new Set();
+  tickStream.regions = [];
+  tickStream._slotSubscriberConnectedAt = now - 60_000;
+  tickStream._lastSlotUpdateAt = now - 60_000;
+  tickStream._slotSubscriber = {
+    destroy() { destroyed++; },
+  };
+  tickStream._silenceRebuildStreak = 0;
+
+  assert.strictEqual(tickStream._checkStreamWatchdog(now), false);
+  assert.strictEqual(destroyed, 1, 'silent SlotSub must be destroyed for reconnect');
+  assert.strictEqual(tickStream._slotSubscriber, null);
+}
+
+function testEventDrivenHeartbeatDoesNotAlert() {
+  const monitor = new HealthMonitor();
+  monitor.stop();
+  monitor.registerModule('EventModule', {
+    staleMs: 10,
+    alertOnStale: false,
+  });
+  monitor.beat('EventModule', 'event');
+  monitor.heartbeats.get('EventModule').lastBeatAt = Date.now() - 60_000;
+  monitor._checkHeartbeats();
+
+  assert.strictEqual(monitor.alerts.has('heartbeat.EventModule'), false);
+  assert.strictEqual(monitor.report().heartbeats.EventModule.status, 'OK');
+  assert.strictEqual(monitor.report().heartbeats.EventModule.mode, 'EVENT_DRIVEN');
 }
 
 async function testIdleRegionCanConnectLater() {
@@ -212,7 +317,12 @@ function testAlertUsesStreamHealthNotTraffic() {
 async function run() {
   await testColdStartLifecycle();
   await testRegionIdleLiveness();
+  await testReplayUsesParentCurrentSlot();
+  await testSlotSubscriberErrorTerminatesWait();
   await testIdleRegionCanConnectLater();
+  testTransactionSilenceRebuild();
+  testSilentSlotSubscriberIsDestroyed();
+  testEventDrivenHeartbeatDoesNotAlert();
   testAlertUsesStreamHealthNotTraffic();
   getMonitor().stop();
   console.log('TickStream cold-start and liveness tests: PASS');
