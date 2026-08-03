@@ -63,11 +63,12 @@ class HealthMonitor extends EventEmitter {
   /**
    * 注册模块心跳。staleMs 后未再次 beat → 触发告警。
    */
-  registerModule(name, { staleMs = 30_000, label = name } = {}) {
+  registerModule(name, { staleMs = 30_000, label = name, alertOnStale = true } = {}) {
     this.heartbeats.set(name, {
       lastBeatAt: Date.now(),
       staleMs,
       label,
+      alertOnStale,
       everBeat: false,
     });
   }
@@ -198,10 +199,17 @@ class HealthMonitor extends EventEmitter {
   _checkHeartbeats() {
     const now = Date.now();
     for (const [name, h] of this.heartbeats.entries()) {
+      const alertName = `heartbeat.${name}`;
+      // Event-driven modules report last business activity, not a periodic
+      // liveness tick. Their silence is valid when no matching market event
+      // exists, so connection/pipeline watchdogs own the actual stale alert.
+      if (h.alertOnStale === false) {
+        this.clearAlert(alertName);
+        continue;
+      }
       // 还没第一次 beat 的不算 STALE（启动初期）
       if (!h.everBeat) continue;
       const elapsed = now - h.lastBeatAt;
-      const alertName = `heartbeat.${name}`;
       if (elapsed > h.staleMs) {
         this.fireAlert(alertName, 'error', `module ${name} stale for ${Math.round(elapsed / 1000)}s`, {
           module: name,
@@ -257,8 +265,12 @@ class HealthMonitor extends EventEmitter {
         last_beat_at: h.everBeat ? h.lastBeatAt : null,
         elapsed_ms: elapsed,
         stale_threshold_ms: h.staleMs,
+        alert_on_stale: h.alertOnStale !== false,
+        mode: h.alertOnStale === false ? 'EVENT_DRIVEN' : 'PERIODIC',
         status: !h.everBeat
           ? 'NEVER_BEAT'
+          : h.alertOnStale === false
+            ? 'OK'
           : elapsed > h.staleMs
             ? 'STALE'
             : 'OK',

@@ -38,7 +38,11 @@ const {
 } = require('../utils/pumpSwapPricing');
 
 const monitor = getMonitor();
-monitor.registerModule('DumpDetector', { staleMs: 120_000, label: 'Dump Detector' });
+monitor.registerModule('DumpDetector', {
+  staleMs: 120_000,
+  label: 'Dump Detector',
+  alertOnStale: false,
+});
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const PUMP_AMM_PROGRAM_ID = config.programs.pumpAmm;

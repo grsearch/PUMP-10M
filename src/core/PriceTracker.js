@@ -25,7 +25,11 @@ const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
 
 const monitor = getMonitor();
-monitor.registerModule('PriceTracker', { staleMs: 600_000, label: 'Price Tracker' });
+monitor.registerModule('PriceTracker', {
+  staleMs: 600_000,
+  label: 'Price Tracker',
+  alertOnStale: false,
+});
 
 class PriceTracker extends EventEmitter {
   constructor() {

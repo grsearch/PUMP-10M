@@ -130,7 +130,10 @@ const config = {
       process.env.STABILIZATION_EMERGENCY_DRAWDOWN_PCT || '0',
     ),
 
-    fixedStopLossPct: 0,
+    fixedStopLossPct: Math.min(
+      0,
+      parseFloat(process.env.FIXED_STOP_LOSS_PCT || '-10'),
+    ),
     emergencyStopLossPct: 0,
 
     // v3.17.42: 智能止损 — 分波动率止损阈值
@@ -559,6 +562,14 @@ const config = {
     marketInitialDelayMs: parseInt(process.env.PUMP_DISCOVERY_MARKET_INITIAL_DELAY_MS || '2000', 10),
     marketRetries: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRIES || '8', 10),
     marketRetryMs: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRY_MS || '3000', 10),
+    liquidityRechecks: Math.max(
+      0,
+      parseInt(process.env.PUMP_DISCOVERY_LIQUIDITY_RECHECKS || '1', 10),
+    ),
+    liquidityRecheckMs: Math.max(
+      250,
+      parseInt(process.env.PUMP_DISCOVERY_LIQUIDITY_RECHECK_MS || '5000', 10),
+    ),
     maxConcurrentChecks: parseInt(process.env.PUMP_DISCOVERY_MAX_CONCURRENT_CHECKS || '3', 10),
     minFdvUsd: 10_000,
     maxFdvUsd: 500_000,

@@ -289,6 +289,82 @@ assert.strictEqual(
   assert.deepStrictEqual(screening, { market: { fdv: 20_000, liquidity: 3_500 } });
   assert.strictEqual(marketCalls, 1);
 
+  const migration = {
+    mint: key('R'),
+    poolAddress: key('P'),
+    poolBaseVault: key('V'),
+    poolQuoteVault: key('W'),
+    migrationTime: now - 60_000,
+    migrationTimeSource: 'blockTime',
+    slot: 123456,
+    signature: 'liquidity-recheck-migration',
+    detectionPath: 'test',
+  };
+  const makeRecheckDiscovery = (markets) => {
+    const instance = Object.create(PumpGraduationDiscovery.prototype);
+    let marketIndex = 0;
+    instance.settings = {
+      minFdvUsd: 10_000,
+      maxFdvUsd: 500_000,
+      minLiquidityUsd: 3_000,
+      marketInitialDelayMs: 0,
+      liquidityRechecks: 1,
+      liquidityRecheckMs: 1,
+    };
+    instance.tokenRegistry = {
+      getToken: () => null,
+      addToken: async (_mint, options) => {
+        instance.addCalls++;
+        instance.addOptions = options;
+        return { mint: migration.mint, symbol: 'RECHECK' };
+      },
+    };
+    instance.addCalls = 0;
+    instance.marketCalls = 0;
+    instance.rejections = [];
+    instance._fetchScreeningData = async () => {
+      instance.marketCalls++;
+      const market = markets[Math.min(marketIndex, markets.length - 1)];
+      marketIndex++;
+      return { market };
+    };
+    instance.fetchAsset = async () => ({ symbol: 'RECHECK' });
+    instance.onBeforeAdd = null;
+    instance.onTokenAdded = null;
+    instance.emit = (name, value) => {
+      if (name === 'rejected') instance.rejections.push(value);
+    };
+    return instance;
+  };
+
+  const recoveredDiscovery = makeRecheckDiscovery([
+    { fdv: 20_000, liquidity: 2_693 },
+    { fdv: 20_000, liquidity: 3_100 },
+  ]);
+  await recoveredDiscovery._screenAndAdd(migration);
+  assert.strictEqual(recoveredDiscovery.marketCalls, 2, 'low LP must be checked once more');
+  assert.strictEqual(recoveredDiscovery.addCalls, 1, 'recovered LP must add the mint');
+  assert.strictEqual(recoveredDiscovery.rejections.length, 0, 'first low LP is not final rejection');
+
+  const stillLowDiscovery = makeRecheckDiscovery([
+    { fdv: 20_000, liquidity: 1_128 },
+    { fdv: 20_000, liquidity: 1_500 },
+  ]);
+  await stillLowDiscovery._screenAndAdd(migration);
+  assert.strictEqual(stillLowDiscovery.marketCalls, 2);
+  assert.strictEqual(stillLowDiscovery.addCalls, 0);
+  assert.strictEqual(stillLowDiscovery.rejections.length, 1);
+  assert.strictEqual(stillLowDiscovery.rejections[0].rejection.code, 'liquidity_low');
+
+  const lowFdvDiscovery = makeRecheckDiscovery([
+    { fdv: 9_000, liquidity: 5_000 },
+    { fdv: 20_000, liquidity: 5_000 },
+  ]);
+  await lowFdvDiscovery._screenAndAdd(migration);
+  assert.strictEqual(lowFdvDiscovery.marketCalls, 1, 'FDV rejection must not be retried');
+  assert.strictEqual(lowFdvDiscovery.addCalls, 0);
+  assert.strictEqual(lowFdvDiscovery.rejections[0].rejection.code, 'fdv_low');
+
   let addOptions = null;
   discovery.tokenRegistry = {
     getToken: () => null,
