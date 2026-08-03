@@ -205,6 +205,7 @@ const config = {
     sellMaxSlippageBps: Math.min(5000, Math.max(0, parseInt(process.env.SELL_MAX_SLIPPAGE_BPS || '5000', 10))),
     sellMaxPoolStateAgeMs: parseInt(process.env.SELL_MAX_POOL_STATE_AGE_MS || '0', 10),
     sell6004RetryDelayMs: parseInt(process.env.SELL_6004_RETRY_DELAY_MS || '100', 10),
+    // Legacy env name retained for compatibility; covers BUY slippage 6004 and 6040.
     buy6004RequoteRetries: Math.min(1, Math.max(0, parseInt(process.env.BUY_6004_REQUOTE_RETRIES || '1', 10))),
 
     // 风控（v3.17 默认 maxConcurrent 5）

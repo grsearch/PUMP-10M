@@ -2,6 +2,8 @@
 
 const assert = require('assert');
 const {
+  calculateBuyFailurePnlPct,
+  isBuySlippageError,
   isExceededSlippageError,
   resolveSellSlippageBps,
 } = require('../src/utils/executionSlippagePolicy');
@@ -27,7 +29,16 @@ async function run() {
   }), 5000);
   assert.ok(isExceededSlippageError('ExceededSlippage (0x1774)'));
   assert.ok(isExceededSlippageError('{"InstructionError":[3,{"Custom":6004}]}'));
+  assert.strictEqual(isExceededSlippageError('{"InstructionError":[9,{"Custom":6040}]}'), false);
   assert.strictEqual(isExceededSlippageError('{"Custom":6003}'), false);
+  assert.ok(isBuySlippageError('BuySlippageBelowMinBaseAmountOut (0x1798)'));
+  assert.ok(isBuySlippageError('Buy Slippage Below Min Base Amount Out (0x1798)'));
+  assert.ok(isBuySlippageError('{"InstructionError":[9,{"Custom":6040}]}'));
+  assert.ok(isBuySlippageError('{"InstructionError":[9,{"Custom":6004}]}'));
+  assert.strictEqual(isBuySlippageError('{"Custom":6039}'), false);
+  assert.strictEqual(calculateBuyFailurePnlPct(0.000505, 0.2), -0.2525);
+  assert.strictEqual(calculateBuyFailurePnlPct(0, 0.2), 0);
+  assert.strictEqual(calculateBuyFailurePnlPct(0.000505, 0), 0);
 
   // Executor must force a pool refresh and pass the requested 50% tolerance
   // to PumpAmmSdk; the diagnostics must preserve the state source and age.
@@ -78,8 +89,8 @@ async function run() {
   assert.strictEqual(sell.sellDiagnostics.cacheAgeBeforeMs, 750);
   assert.strictEqual(sell.sellDiagnostics.effectiveSlippagePct, 50);
 
-  // A confirmed BUY 6004 gets one fresh re-quote. Executor still owns the
-  // +15% price guard, so this path cannot raise the permitted purchase price.
+  // A confirmed BUY slippage error gets one fresh re-quote. Executor still owns
+  // the no-chase signal-price guard, so this path cannot raise the permitted price.
   const manager = Object.create(PositionManager.prototype);
   manager.tokenRegistry = {
     getToken: () => ({ pool_address: 'pool', decimals: 6 }),
@@ -122,19 +133,57 @@ async function run() {
     buyDiagnostics: { signalPrice: 0.1, spendableQuoteSol: 0.2 },
     buy6004RetryCount: 0,
   };
-  const retried = await manager._retryBuyAfter6004(
+  const retried = await manager._retryBuyAfterSlippage(
     pos,
     'position',
     'mint',
     'failed-signature',
-    '{"Custom":6004}',
+    '{"Custom":6040}',
   );
   assert.strictEqual(retried, true);
   assert.ok(markedFailed);
-  assert.strictEqual(retryTrade.reason, 'BUY_6004_REQUOTE_1');
+  assert.strictEqual(retryTrade.reason, 'BUY_SLIPPAGE_REQUOTE_1');
   assert.strictEqual(updatedPosition.buySignature, 'retry-signature');
   assert.strictEqual(pos.failedBuyFeeLamports, 505_000);
   assert.strictEqual(reconciledSignature, 'retry-signature');
+
+  // If the fresh quote is already above the signal cap, the retry remains a
+  // local rejection: no second signature is submitted and no second chain fee exists.
+  let locallyRejectedTrade = null;
+  manager.executor.buy = async () => ({
+    success: false,
+    error: 'buy_price_guard: expected price above signal cap',
+    priceGuardRejected: true,
+    buyDiagnostics: {
+      signalPrice: 0.1,
+      expectedPrice: 0.101,
+      maxPrice: 0.1,
+    },
+  });
+  manager.tradeLogger.logTrade = (trade) => { locallyRejectedTrade = trade; };
+  const rejectPos = {
+    positionId: 'rejected-position',
+    mint: 'mint',
+    symbol: 'REJECT',
+    entrySol: 0.2,
+    entryPrice: 0.1,
+    tokenAmount: 2,
+    buyFeeLamports: 500_000,
+    buyDiagnostics: { signalPrice: 0.1, spendableQuoteSol: 0.2 },
+    buy6004RetryCount: 0,
+  };
+  const rejected = await manager._retryBuyAfterSlippage(
+    rejectPos,
+    'rejected-position',
+    'mint',
+    'failed-signature-2',
+    '{"Custom":6040}',
+  );
+  assert.strictEqual(rejected, false);
+  assert.strictEqual(locallyRejectedTrade.signature, undefined);
+  assert.strictEqual(locallyRejectedTrade.success, false);
+  assert.match(locallyRejectedTrade.error, /expected price above signal cap/);
+  assert.strictEqual(rejectPos.failedBuyFeeLamports, 505_000);
 
   console.log('execution slippage policy tests passed');
 }
