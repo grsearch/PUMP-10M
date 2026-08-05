@@ -296,7 +296,7 @@ class FeatureRecorder {
   }
 
   recordLatency(event) {
-    if (!this.enabled || !event) return;
+    if (!event) return;
     const normalized = {
       ts: event.ts || Date.now(),
       mint: event.mint || null,
@@ -307,9 +307,32 @@ class FeatureRecorder {
       latencyDecisionMs: finite(event.latencyDecisionMs, null),
       latencySendMs: finite(event.latencySendMs, null),
       latencyConfirmMs: finite(event.latencyConfirmMs, null),
+      candidateTs: finite(event.candidateTs, null),
+      candidateSlot: finite(event.candidateSlot, null),
+      candidateLowTs: finite(event.candidateLowTs, null),
+      candidateLowSlot: finite(event.candidateLowSlot, null),
+      reboundTs: finite(event.reboundTs, null),
+      reboundSlot: finite(event.reboundSlot, null),
+      signalReceivedAt: finite(event.signalReceivedAt, null),
+      submitStartedAt: finite(event.submitStartedAt, null),
+      submitAcceptedAt: finite(event.submitAcceptedAt, null),
+      submittedSlot: finite(event.submittedSlot, null),
+      submissionChannel: event.submissionChannel || null,
+      computeUnitLimit: finite(event.computeUnitLimit, null),
+      priorityFeeLamports: finite(event.priorityFeeLamports, null),
+      jitoTipLamports: finite(event.jitoTipLamports, null),
+      stateSource: event.stateSource || null,
+      cacheAgeBeforeMs: finite(event.cacheAgeBeforeMs, null),
+      cacheAgeAtBuildMs: finite(event.cacheAgeAtBuildMs, null),
+      latencyCandidateToReboundMs: finite(event.latencyCandidateToReboundMs, null),
+      latencyReboundToSubmitMs: finite(event.latencyReboundToSubmitMs, null),
+      latencySubmitAcceptedMs: finite(event.latencySubmitAcceptedMs, null),
       details: event.details || null,
     };
     try { this.tradeLogger.logBotLatencyEvent(normalized); } catch (_) {}
+    // Execution telemetry is operational evidence, not an optional research
+    // feature. Persist it even when StrategyLab snapshots are disabled.
+    if (!this.enabled) return;
     if (normalized.mint) {
       const state = this._stateOf(normalized.mint);
       state.lastLatency = normalized;

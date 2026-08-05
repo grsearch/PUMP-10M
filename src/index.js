@@ -45,7 +45,8 @@ async function main() {
   console.log(
     `BUY execution: PumpSwap SDK 1.19.0 / buy_exact_quote_in / ` +
       `virtual reserves / fixed ${config.strategy.positionSizeSol} SOL / ` +
-      `signal cap +${config.strategy.buyMaxPriceDeviationPct}% / forced fresh RPC`,
+      `signal cap +${config.strategy.buyMaxPriceDeviationPct}% / ` +
+      `reuse cache<=${config.strategy.buyFastPoolStateMaxAgeMs}ms else refresh once`,
   );
   if (process.env.BUY_MIN_EFFECTIVE_SLIPPAGE_PCT != null) {
     console.warn(
@@ -89,7 +90,7 @@ async function main() {
   console.log(
     `Buy guard: chain ceiling=${(config.strategy.buySlippageBps / 100).toFixed(1)}%, ` +
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
-      `pool age<=${config.strategy.buyMaxPoolStateAgeMs}ms, ` +
+      `fast pool cache<=${config.strategy.buyFastPoolStateMaxAgeMs}ms, ` +
       `slippage requote=${config.strategy.buy6004RequoteRetries}x`,
   );
   console.log(
@@ -236,6 +237,7 @@ async function main() {
       `${activityFlowTracker.dropWindowMs}ms ` +
       `rebound=${activityFlowTracker.reboundMinPct}-${activityFlowTracker.reboundMaxPct}% ` +
       `within=${activityFlowTracker.reboundTimeoutMs}ms ` +
+      `entryAge<=${activityFlowTracker.entryMaxTokenAgeMs}ms ` +
       `replaceDump=${activityFlowTracker.replaceDumpSignal}`,
   );
   console.log(
@@ -790,20 +792,10 @@ async function main() {
     // Record the current chain slot on BUY for execution metadata.
     executor.setLatestSlot(tickStream.latestSlot || 0);
 
-    // v3.17.27: 同步刷新 pool state → 确保 executor.buy cache hit
-    //   如果 cache miss，executor.buy 会走同步 RPC(80-180ms)。
-    //   在这里同步 refreshOne(30-80ms) 把 state 填入 cache，
-    //   buy 时直接 cache hit → state=0ms → 总延迟从 ~150ms 降到 ~60ms。
-    const preBuyPoolAddr = tokenInfo?.pool_address;
-    if (preBuyPoolAddr && executor.poolStateCache) {
-      const cachedState = executor.poolStateCache.get(preBuyPoolAddr);
-      if (!cachedState) {
-        const tPre = Date.now();
-        try { await executor.poolStateCache.refreshOne(preBuyPoolAddr); } catch (_) { /* 静默 */ }
-        monitor.set('main.preBuyRefreshMs', Date.now() - tPre, 'main');
-      }
-    }
-
+    // Pool freshness has a single owner: Executor. It reuses an ultra-fresh
+    // cache entry (<=100ms) or performs exactly one synchronous refresh.
+    // Keeping a second pre-buy refresh here caused two sequential RPC reads on
+    // cache misses without making the final quote any fresher.
     const _t2 = Date.now();
     const buyResult = await executor.buy({
       mint: order.mint,
@@ -836,23 +828,56 @@ async function main() {
 
     // 记录 BUY trade（用同一 positionId）
     if (order._signalReceivedAt && buyResult) {
-      const signalToBuyMs = Date.now() - order._signalReceivedAt;
-      const fromDumpTsMs = order.ts ? Date.now() - order.ts : null;
+      const flowEntry = order._flow?.entryDropRebound1s || {};
+      const signalToBuyMs = buyResult.submitStartedAt
+        ? buyResult.submitStartedAt - order._signalReceivedAt
+        : Date.now() - order._signalReceivedAt;
+      const detectionMs = order.ts ? order._signalReceivedAt - order.ts : null;
+      const candidateTs = flowEntry.candidateStartedAt ?? flowEntry.lowTs ?? null;
+      const reboundTs = flowEntry.reboundTs ?? order.ts ?? null;
       try {
         featureRecorder.recordLatency({
-          ts: Date.now(),
+          ts: buyResult.submitAcceptedAt || Date.now(),
           mint: order.mint,
           symbol: order.symbol,
           signature: buyResult.signature || order.signature,
           phase: 'buy',
-          latencyDetectMs: fromDumpTsMs,
+          latencyDetectMs: detectionMs,
           latencyDecisionMs: signalToBuyMs,
           latencySendMs: buyResult.sendLatencyMs,
-          latencyConfirmMs: buyResult.latencyMs,
+          latencyConfirmMs: null,
+          candidateTs,
+          candidateSlot: flowEntry.candidateStartedSlot || 0,
+          candidateLowTs: flowEntry.lowTs || null,
+          candidateLowSlot: flowEntry.lowSlot || 0,
+          reboundTs,
+          reboundSlot: flowEntry.reboundSlot || order.slot || 0,
+          signalReceivedAt: order._signalReceivedAt,
+          submitStartedAt: buyResult.submitStartedAt || null,
+          submitAcceptedAt: buyResult.submitAcceptedAt || null,
+          submittedSlot: buyResult.buySlot || 0,
+          submissionChannel: buyResult.submissionChannel || null,
+          computeUnitLimit: buyResult.computeUnitLimit || null,
+          priorityFeeLamports: buyResult.priorityFeeLamports || 0,
+          jitoTipLamports: buyResult.jitoTipLamports || 0,
+          stateSource: buyResult.buyDiagnostics?.stateSource || null,
+          cacheAgeBeforeMs: buyResult.buyDiagnostics?.cacheAgeBeforeMs ?? null,
+          cacheAgeAtBuildMs: buyResult.buyDiagnostics?.cacheAgeAtBuildMs ?? null,
+          latencyCandidateToReboundMs:
+            candidateTs != null && reboundTs != null ? reboundTs - candidateTs : null,
+          latencyReboundToSubmitMs:
+            reboundTs != null && buyResult.submitAcceptedAt
+              ? buyResult.submitAcceptedAt - reboundTs
+              : null,
+          latencySubmitAcceptedMs:
+            buyResult.submitStartedAt && buyResult.submitAcceptedAt
+              ? buyResult.submitAcceptedAt - buyResult.submitStartedAt
+              : buyResult.sendLatencyMs,
           details: {
             success: !!buyResult.success,
             reason: order.reason,
             stateLatencyMs: buyResult.stateLatencyMs,
+            buildLatencyMs: buyResult.buildLatencyMs,
             error: buyResult.error || null,
             buyDiagnostics: buyResult.buyDiagnostics || null,
           },

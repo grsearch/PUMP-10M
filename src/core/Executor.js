@@ -42,6 +42,7 @@ const {
 const { config } = require('../config');
 const { getMonitor } = require('../monitor/HealthMonitor');
 const { MIN_COMPUTE_UNIT_LIMIT, resolveComputeUnitLimit } = require('../utils/computeUnitLimit');
+const { recommendComputeUnitLimit } = require('../utils/computeUnitAdvisor');
 const { estimateBuySlippagePct } = require('./ExecutionMath');
 const {
   calculateBuyPriceGuard,
@@ -159,7 +160,7 @@ class Executor {
         this.cacheSdk = new OnlinePumpAmmSdk(this.rpc);
         console.log(
           `[Executor] Pump AMM SDK ${sdkVersion} loaded ` +
-            '(virtual_quote_reserves + buy_exact_quote_in; fixed quote input; fresh RPC before BUY)',
+            '(virtual_quote_reserves + buy_exact_quote_in; fixed quote input; <=100ms cache or one refresh)',
         );
       } catch (err) {
         console.error(`[Executor] failed to load @pump-fun/pump-swap-sdk: ${err.message}`);
@@ -182,9 +183,28 @@ class Executor {
     //   代价:CU 250K 后 μL/CU 排名会下降 → 需要拉高 priority fee 补偿
     //         配合 BUY_MIN_PRIORITY_FEE 0.04 → 0.067 SOL,μL/CU 仍为 267M
     //   ROI 算法:每笔多花 0.027 SOL priority fee 比每笔白花 0.04 fee 又没买到划算太多
-    //   未来优化:不同代币不同 CU(根据历史消耗自动调) — 复杂度高,暂不做
+    //   当前版本会在收集至少 20 笔成功 BUY 后，以最近样本 P99+10% 自动收敛。
     const configuredComputeUnitLimit = Number.parseInt(process.env.COMPUTE_UNIT_LIMIT || '', 10);
     this.computeUnitLimit = resolveComputeUnitLimit(process.env.COMPUTE_UNIT_LIMIT);
+    this.computeUnitAdvisorEnabled = (process.env.COMPUTE_UNIT_ADVISOR_ENABLED ?? 'true').toLowerCase() === 'true';
+    this.computeUnitAdvisorMinSamples = Math.max(
+      1,
+      Number.parseInt(process.env.COMPUTE_UNIT_ADVISOR_MIN_SAMPLES || '20', 10) || 20,
+    );
+    this.computeUnitAdvisorWindow = Math.max(
+      this.computeUnitAdvisorMinSamples,
+      Number.parseInt(process.env.COMPUTE_UNIT_ADVISOR_WINDOW || '200', 10) || 200,
+    );
+    this.computeUnitAdvisorSafetyMultiplier = Math.max(
+      1,
+      Number.parseFloat(process.env.COMPUTE_UNIT_ADVISOR_SAFETY_MULTIPLIER || '1.10') || 1.10,
+    );
+    this.computeUnitMaxLimit = Math.max(
+      MIN_COMPUTE_UNIT_LIMIT,
+      Number.parseInt(process.env.COMPUTE_UNIT_MAX_LIMIT || '400000', 10) || 400_000,
+    );
+    this._buyComputeUnitSamples = [];
+    this._recordedBuyCuSignatures = new Set();
     if (
       Number.isFinite(configuredComputeUnitLimit) &&
       configuredComputeUnitLimit > 0 &&
@@ -209,7 +229,16 @@ class Executor {
     //     - 配低 → 双通道(staked + Jito),0.003 SOL = 微小成本但保留可能性
     //   不再加大 tip:因为 leader 排序看 μL/CU,加大 tip 不提升 slot 内排名
     //   8 个 Jito tip 账户,每笔 BUY 随机选一个(避免账户写锁竞争)
-    this.jitoTipLamports = parseInt(process.env.JITO_TIP_LAMPORTS || '1000000', 10);  // v3.17.20: 0.003 → 0.001 SOL
+    const configuredJitoTipLamports = parseInt(process.env.JITO_TIP_LAMPORTS || '1000000', 10);
+    this.jitoTipLamports = configuredJitoTipLamports > 0
+      ? Math.max(1_000_000, configuredJitoTipLamports)
+      : 0;
+    if (configuredJitoTipLamports > 0 && configuredJitoTipLamports < this.jitoTipLamports) {
+      console.warn(
+        `[Executor] JITO_TIP_LAMPORTS=${configuredJitoTipLamports} raised to ` +
+          `${this.jitoTipLamports} for competitive BUY routing`,
+      );
+    }
     // v3.16: Helius Sender 官方 tip 账户列表（10 个）
     // ⚠️ 之前用的 Jito 官方 8 个账户是错的 — Helius Sender 拒绝它们
     // 来源: https://www.helius.dev/docs/sending-transactions/sender (2026)
@@ -536,6 +565,68 @@ class Executor {
 
   setTradeLogger(tradeLogger) {
     this.tradeLogger = tradeLogger;
+    if (!this.computeUnitAdvisorEnabled || !tradeLogger?.getRecentBuyComputeUnitSamples) return;
+    try {
+      this._buyComputeUnitSamples = tradeLogger.getRecentBuyComputeUnitSamples(
+        this.computeUnitAdvisorWindow,
+      );
+      this._refreshComputeUnitBudget('history');
+    } catch (err) {
+      console.warn(`[Executor] compute-unit history unavailable: ${err.message}`);
+    }
+  }
+
+  recordBuyComputeUnits(computeUnitsConsumed, signature = null) {
+    const consumed = Number.parseInt(String(computeUnitsConsumed || ''), 10);
+    if (!this.computeUnitAdvisorEnabled || !Number.isFinite(consumed) || consumed <= 0) return;
+    if (signature && this._recordedBuyCuSignatures.has(signature)) return;
+    if (signature) {
+      this._recordedBuyCuSignatures.add(signature);
+      if (this._recordedBuyCuSignatures.size > this.computeUnitAdvisorWindow * 2) {
+        const oldest = this._recordedBuyCuSignatures.values().next().value;
+        this._recordedBuyCuSignatures.delete(oldest);
+      }
+    }
+    this._buyComputeUnitSamples.push(consumed);
+    if (this._buyComputeUnitSamples.length > this.computeUnitAdvisorWindow) {
+      this._buyComputeUnitSamples.splice(
+        0,
+        this._buyComputeUnitSamples.length - this.computeUnitAdvisorWindow,
+      );
+    }
+    this._refreshComputeUnitBudget('live');
+  }
+
+  _refreshComputeUnitBudget(source) {
+    const advice = recommendComputeUnitLimit(this._buyComputeUnitSamples, {
+      minSamples: this.computeUnitAdvisorMinSamples,
+      safetyMultiplier: this.computeUnitAdvisorSafetyMultiplier,
+      minLimit: MIN_COMPUTE_UNIT_LIMIT,
+      maxLimit: this.computeUnitMaxLimit,
+    });
+    monitor.set('Executor.buyCuSampleCount', advice.sampleCount, 'Executor');
+    if (!advice.ready) {
+      if (source === 'history') {
+        console.log(
+          `[Executor] CU advisor collecting samples: ${advice.sampleCount}/` +
+            `${advice.minSamples}; keeping ${this.computeUnitLimit}`,
+        );
+      }
+      return;
+    }
+
+    monitor.set('Executor.buyCuP99', advice.percentileValue, 'Executor');
+    monitor.set('Executor.buyCuRecommendedLimit', advice.recommendedLimit, 'Executor');
+    if (advice.recommendedLimit === this.computeUnitLimit) return;
+
+    const previous = this.computeUnitLimit;
+    this.computeUnitLimit = advice.recommendedLimit;
+    this.feeOracle?.setCuLimit?.(this.computeUnitLimit);
+    console.log(
+      `[Executor] CU advisor ${source}: ${previous}→${this.computeUnitLimit} ` +
+        `(n=${advice.sampleCount}, p99=${advice.percentileValue}, ` +
+        `safety=${advice.safetyMultiplier}x${advice.clamped ? ', clamped' : ''})`,
+    );
   }
 
   /** v3.17.11: 外部（main）在 BUY 前更新 latestSlot，
@@ -641,7 +732,11 @@ class Executor {
             if (result.sig) {
               resolved = true;
               monitor.inc(`Executor.raceWon_${result.channel}`, 1, 'Executor');
-              resolve(result.sig);
+              resolve({
+                signature: result.sig,
+                channel: result.channel,
+                acceptedAt: Date.now(),
+              });
             } else {
               failed++;
               if (failed === racers.length) {
@@ -656,10 +751,11 @@ class Executor {
     }
 
     // SELL — 直接走 staked RPC
-    return await this.stakedRpc.sendRawTransaction(serialized, {
+    const signature = await this.stakedRpc.sendRawTransaction(serialized, {
       skipPreflight: true,
       maxRetries: 0,
     });
+    return { signature, channel: 'Staked', acceptedAt: Date.now() };
   }
 
   /**
@@ -758,6 +854,8 @@ class Executor {
       return { confirmed: true, slot: null }; // DRY_RUN 自动算成功
     }
     const t0 = Date.now();
+    let firstLandedObservedAt = null;
+    let firstLandedSlot = null;
     while (Date.now() - t0 < timeoutMs) {
       try {
         const { value } = await this.rpc.getSignatureStatuses([signature], {
@@ -765,18 +863,39 @@ class Executor {
         });
         const status = value?.[0];
         if (status) {
+          if (!firstLandedObservedAt) {
+            firstLandedObservedAt = Date.now();
+            firstLandedSlot = status.slot || null;
+            this.tradeLogger?.updateBotLatencyLanding?.({
+              signature,
+              landedObservedAt: firstLandedObservedAt,
+              landedSlot: firstLandedSlot,
+              chainSuccess: status.err ? false : null,
+            });
+          }
           if (status.err) {
             return {
               confirmed: false,
               error: typeof status.err === 'string' ? status.err : JSON.stringify(status.err),
               slot: status.slot,
+              landedObservedAt: firstLandedObservedAt,
             };
           }
           // confirmationStatus: 'processed' | 'confirmed' | 'finalized'
           if (status.confirmationStatus === 'confirmed' ||
               status.confirmationStatus === 'finalized' ||
               status.confirmations !== null) {
-            return { confirmed: true, slot: status.slot };
+            this.tradeLogger?.updateBotLatencyLanding?.({
+              signature,
+              landedObservedAt: firstLandedObservedAt,
+              landedSlot: status.slot || firstLandedSlot,
+              chainSuccess: true,
+            });
+            return {
+              confirmed: true,
+              slot: status.slot,
+              landedObservedAt: firstLandedObservedAt,
+            };
           }
           // status='processed' 还需要再等等
         }
@@ -785,7 +904,12 @@ class Executor {
       }
       await new Promise((r) => setTimeout(r, pollIntervalMs));
     }
-    return { confirmed: false, error: 'not_landed' };
+    return {
+      confirmed: false,
+      error: 'not_landed',
+      landedObservedAt: firstLandedObservedAt,
+      slot: firstLandedSlot,
+    };
   }
 
   /**
@@ -861,6 +985,8 @@ class Executor {
         realTokenDelta,
         fee: tx.meta.fee || 0,
         computeUnitsConsumed: tx.meta.computeUnitsConsumed || 0,
+        slot: tx.slot || null,
+        blockTimeMs: Number.isFinite(tx.blockTime) ? tx.blockTime * 1000 : null,
         success: !tx.meta.err,
       };
       this.tradeLogger?.saveTxQuoteReconciliation?.({
@@ -873,6 +999,18 @@ class Executor {
         feeLamports: result.fee,
         success: result.success,
       });
+      this.tradeLogger?.updateBotLatencyLanding?.({
+        signature,
+        landedObservedAt: Date.now(),
+        landedBlockTimeMs: result.blockTimeMs,
+        landedSlot: result.slot,
+        computeUnitsConsumed: result.computeUnitsConsumed,
+        computeUnitLimit: this.computeUnitLimit,
+        chainSuccess: result.success,
+      });
+      if (result.success && result.realTokenDelta > 0 && result.computeUnitsConsumed > 0) {
+        this.recordBuyComputeUnits(result.computeUnitsConsumed, signature);
+      }
       return result;
     } catch (err) {
       monitor.recordError('Executor', err, { phase: 'fetchTxSwapResult', signature });
@@ -1091,10 +1229,13 @@ class Executor {
 
       const freshPool = await loadFreshBuyPoolState({
         poolAddress: order.poolAddress,
-        maxAgeMs: config.strategy.buyMaxPoolStateAgeMs,
+        maxAgeMs: Math.min(
+          config.strategy.buyMaxPoolStateAgeMs,
+          config.strategy.buyFastPoolStateMaxAgeMs,
+        ),
         poolStateCache: this.poolStateCache,
         loadFromRpc: () => this.onlineSdk.swapSolanaState(poolKey, this.keypair.publicKey),
-        forceRefresh: true,
+        forceRefresh: false,
       });
       const swapState = freshPool.state;
       const stateSource = freshPool.stateSource;
@@ -1290,7 +1431,8 @@ class Executor {
       const realSig = bs58.encode(serialized.slice(1, 65));
 
       const tSend0 = Date.now();
-      await this._submitTx(serialized, 'BUY');
+      const submission = await this._submitTx(serialized, 'BUY');
+      const submitAcceptedAt = submission?.acceptedAt || Date.now();
       const sendLatencyMs = Date.now() - tSend0;
       monitor.inc('Executor.buySuccess', 1, 'Executor');
 
@@ -1299,7 +1441,8 @@ class Executor {
         `[Executor:LIVE] BUY submitted: ${(sig || '').slice(0, 8)}.. ` +
           `(state=${stateLatencyMs}ms[${stateSource}] build=${buildLatencyMs}ms send=${sendLatencyMs}ms total=${
             Date.now() - t0
-          }ms, fee=${feeInfo.totalLamports}L ${feeInfo.source})`,
+          }ms, channel=${submission?.channel || 'unknown'}, ` +
+          `fee=${feeInfo.totalLamports}L ${feeInfo.source})`,
       );
 
       return finishBuy({
@@ -1314,6 +1457,11 @@ class Executor {
         buildLatencyMs,
         priorityFeeLamports: feeInfo.totalLamports,
         priorityFeeSource: feeInfo.source,
+        jitoTipLamports: this.jitoTipLamports,
+        computeUnitLimit: this.computeUnitLimit,
+        submissionChannel: submission?.channel || 'unknown',
+        submitStartedAt: tSend0,
+        submitAcceptedAt,
         sendLatencyMs,
         buySlot: this._latestBuySlot || null,  // 提交时的链上 slot
       });

@@ -27,7 +27,10 @@ monitor.registerModule('PriorityFeeOracle', { staleMs: 60_000, label: 'Priority 
 const PUMP_AMM_PROGRAM_ID = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 // v3.17: refresh 默认从 1500ms 拉到 500ms — 砸盘瞬间整网 fee 飙升，1.5s 跟不上
 // 后台一直轮询 + estimate 同步返回，所以缩短刷新间隔不影响 BUY 路径延迟（仅多消耗 credit）
-const REFRESH_MS = parseInt(process.env.PRIORITY_FEE_REFRESH_MS || '5000', 10);
+const REFRESH_MS = Math.max(
+  500,
+  parseInt(process.env.PRIORITY_FEE_REFRESH_MS || '500', 10) || 500,
+);
 
 class PriorityFeeOracle {
   constructor({ cuLimit } = {}) {
@@ -58,6 +61,10 @@ class PriorityFeeOracle {
       clearInterval(this._timer);
       this._timer = null;
     }
+  }
+
+  setCuLimit(cuLimit) {
+    this.cuLimit = resolveComputeUnitLimit(cuLimit);
   }
 
   async _fetchLevels() {

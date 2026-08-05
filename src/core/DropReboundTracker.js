@@ -21,9 +21,10 @@ function round(value, digits = 4) {
 /**
  * Live entry tracker for newly migrated Pump tokens.
  *
- * A candidate starts when the trusted price crosses into a 10%-20% drawdown
+ * A candidate starts when the trusted price crosses into an 18%-22% drawdown
  * from the rolling one-second high. The first rebound from the running low
- * must reach 2%-5% before the one-second candidate deadline.
+ * must reach 2%-5% before the one-second candidate deadline. New entries are
+ * limited to the first three minutes after migration.
  */
 class DropReboundTracker extends EventEmitter {
   constructor(opts = {}) {
@@ -35,8 +36,8 @@ class DropReboundTracker extends EventEmitter {
     this.replaceDumpSignal = opts.replaceDumpSignal ?? settings.replaceDumpSignal ?? true;
     this.entryMode = 'DROP_REBOUND_1S';
     this.dropWindowMs = opts.dropWindowMs ?? settings.dropWindowMs ?? 1_000;
-    this.dropMinPct = opts.dropMinPct ?? settings.dropMinPct ?? 10;
-    this.dropMaxPct = opts.dropMaxPct ?? settings.dropMaxPct ?? 20;
+    this.dropMinPct = opts.dropMinPct ?? settings.dropMinPct ?? 18;
+    this.dropMaxPct = opts.dropMaxPct ?? settings.dropMaxPct ?? 22;
     this.reboundMinPct = opts.reboundMinPct ?? settings.reboundMinPct ?? 2;
     this.reboundMaxPct = opts.reboundMaxPct ?? settings.reboundMaxPct ?? 5;
     this.reboundTimeoutMs = opts.reboundTimeoutMs ?? settings.reboundTimeoutMs ?? 1_000;
@@ -46,6 +47,7 @@ class DropReboundTracker extends EventEmitter {
     this.maxFdvUsd = opts.maxFdvUsd ?? config.strategy.maxFdVUsd;
     this.minLiquidityUsd = opts.minLiquidityUsd ?? config.strategy.minLiquidityUsd;
     this.maxTokenAgeMs = opts.maxTokenAgeMs ?? config.strategy.maxTokenAgeMs;
+    this.entryMaxTokenAgeMs = opts.entryMaxTokenAgeMs ?? settings.entryMaxTokenAgeMs ?? 180_000;
     this.states = new Map();
   }
 
@@ -66,7 +68,7 @@ class DropReboundTracker extends EventEmitter {
         dropReady: true,
         candidate: null,
         stage: 'monitoring',
-        waitReason: 'waiting for a 10%-20% drop inside one second',
+        waitReason: `waiting for an ${this.dropMinPct}%-${this.dropMaxPct}% drop inside one second`,
         lastSignalTs: null,
         lastSignal: null,
         inflight: false,
@@ -116,8 +118,8 @@ class DropReboundTracker extends EventEmitter {
     const migrationTime = normalizeUnixMs(token.migration_time);
     if (!migrationTime) return 'migration AGE unavailable';
     const ageMs = Math.max(0, signalTs - migrationTime);
-    if (this.maxTokenAgeMs > 0 && ageMs >= this.maxTokenAgeMs) {
-      return `AGE ${(ageMs / 60_000).toFixed(2)}m>=${this.maxTokenAgeMs / 60_000}m`;
+    if (this.entryMaxTokenAgeMs > 0 && ageMs > this.entryMaxTokenAgeMs) {
+      return `entry AGE ${(ageMs / 1_000).toFixed(1)}s>${this.entryMaxTokenAgeMs / 1_000}s`;
     }
     return null;
   }
@@ -171,12 +173,19 @@ class DropReboundTracker extends EventEmitter {
       reboundTimeoutMs: this.reboundTimeoutMs,
       peakPrice: candidate.peakPrice,
       peakTs: candidate.peakTs,
+      peakSlot: candidate.peakSlot || 0,
       lowPrice: candidate.lowPrice,
       lowTs: candidate.lowTs,
+      lowSlot: candidate.lowSlot || 0,
+      candidateStartedAt: candidate.startedAt,
+      candidateStartedSlot: candidate.startedSlot || 0,
       dropPct: round(dropPct),
       reboundPct: round(reboundPct),
       reboundElapsedMs: ev.ts - candidate.startedAt,
       reboundFromLowMs: ev.ts - candidate.lowTs,
+      reboundTs: ev.ts,
+      reboundSlot: ev.slot || 0,
+      reboundSignature: ev.signature || null,
       executionPrice: ev.price,
     };
     const signal = {
@@ -274,10 +283,12 @@ class DropReboundTracker extends EventEmitter {
 
     let rollingPeak = price;
     let rollingPeakTs = ts;
+    let rollingPeakSlot = ev.slot || 0;
     for (const row of state.prices) {
       if (row.price > rollingPeak) {
         rollingPeak = row.price;
         rollingPeakTs = row.ts;
+        rollingPeakSlot = row.slot || 0;
       }
     }
     const rollingDropPct = (price / rollingPeak - 1) * 100;
@@ -295,6 +306,7 @@ class DropReboundTracker extends EventEmitter {
         if (price < candidate.lowPrice) {
           candidate.lowPrice = price;
           candidate.lowTs = ts;
+          candidate.lowSlot = ev.slot || 0;
         }
         const dropPct = (candidate.lowPrice / candidate.peakPrice - 1) * 100;
         if (dropPct < -this.dropMaxPct) {
@@ -330,9 +342,12 @@ class DropReboundTracker extends EventEmitter {
       state.candidate = {
         peakPrice: rollingPeak,
         peakTs: rollingPeakTs,
+        peakSlot: rollingPeakSlot,
         lowPrice: price,
         lowTs: ts,
+        lowSlot: ev.slot || 0,
         startedAt: ts,
+        startedSlot: ev.slot || 0,
         expiresAt: ts + this.reboundTimeoutMs,
       };
       state.dropReady = false;
@@ -439,6 +454,7 @@ class DropReboundTracker extends EventEmitter {
         minFdvUsd: this.minFdvUsd,
         maxFdvUsd: this.maxFdvUsd,
         minLiquidityUsd: this.minLiquidityUsd,
+        entryMaxTokenAgeMs: this.entryMaxTokenAgeMs,
         maxTokenAgeMs: this.maxTokenAgeMs,
         trailingActivatePct: config.strategy.trailingActivatePct,
         trailingDrawdownPct: config.strategy.trailingDrawdownPct,

@@ -946,18 +946,25 @@ class PositionManager extends EventEmitter {
    * BUY 提交后异步等链上确认，用真实 SOL 出账 / 真实 token 入账修正 position。
    */
   async _reconcileBuyAsync(positionId, mint, signature) {
-    // v3.7: 等 1 秒让 tx 落链（BUY 通常 400-800ms 落链，1s 是合理初始延迟）
-    await new Promise((r) => setTimeout(r, 1000));
-
+    // 提交后立即观察首次链上可见时间。旧逻辑固定等待 1 秒，导致
+    // 300-800ms 的真实落链延迟全部被记成约 1 秒。
     // 短超时确认（confirmTx 内部 poll，最多 15 秒）
     // v3.17.14: 从 8s 提到 15s，三路 race 后 tx 可能走慢通道需要更长时间落链
     let result = await this.executor.confirmTx(signature, {
       timeoutMs: 15_000,
-      pollIntervalMs: 500,
+      pollIntervalMs: 100,
     });
 
     const pos = this.positions.get(positionId);
     if (!pos) return; // position 已被外部清理
+
+    // Capture the real landed slot, block time and CU consumption for both
+    // successful and failed on-chain BUYs. Previously failed 6040 transactions
+    // never reached fetchTxSwapResult, leaving the execution timeline blank.
+    let swap = null;
+    if (result.slot) {
+      swap = await this.executor.fetchTxSwapResult(signature, mint);
+    }
 
     // v3.17.14: confirmTx 超时返回 not_landed 时，先查钱包余额做二次验证
     // 实战发现：三路 race 后 tx 可能走慢通道，>15s 才确认但实际已上链
@@ -1066,7 +1073,7 @@ class PositionManager extends EventEmitter {
     // ============ 分支 B: BUY 链上成功，但解析失败 ============
     // v3.17.14: 三路 race 时 Slipstream 返回的 sig 可能不是链上 sig
     // 如果 fetchTxSwapResult 失败，先用钱包余额判断是否真的买到了
-    const swap = await this.executor.fetchTxSwapResult(signature, mint);
+    swap = swap || await this.executor.fetchTxSwapResult(signature, mint);
     if (!swap || !swap.success) {
       // 二次验证：钱包里有 token 就说明买入成功，只是 sig 不对
       const walletBalance = await this.executor.getWalletTokenBalance(mint);
@@ -1258,7 +1265,7 @@ class PositionManager extends EventEmitter {
         monitor.inc('PositionManager.cuNearLimit', 1, 'PositionManager');
         console.warn(
           `[PositionManager] ⚠️ ${pos.symbol || mint.slice(0, 6)} CU 消耗 ${cuConsumed} / ${cuLimit} ` +
-            `(${cuUtilPct.toFixed(0)}%) — 接近上限，建议调高 COMPUTE_UNIT_LIMIT 或观察是否有 BUY_CHAIN_FAILED`,
+            `(${cuUtilPct.toFixed(0)}%) — 接近上限；CU advisor 将按成功样本 P99+10% 自动调整`,
         );
       }
     }

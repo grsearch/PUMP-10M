@@ -65,7 +65,7 @@ class AlertChecker {
       this.monitor.fireAlert(
         'executor.cu_near_limit',
         'warn',
-        `${cuNearLimit} 笔 BUY CU 利用率 ≥90%,下一笔可能 BUY_CHAIN_FAILED。立刻调大 COMPUTE_UNIT_LIMIT (推荐 +30K)`,
+        `${cuNearLimit} 笔 BUY CU 利用率 ≥90%。CU advisor 会按成功样本的 P99+10% 调整；请核对实际 compute_units_consumed`,
         { cuNearLimit },
       );
     } else {
@@ -77,7 +77,7 @@ class AlertChecker {
       this.monitor.fireAlert(
         'executor.buy_chain_failed',
         'error',
-        `${buyChainFail} 笔 BUY ProgramFailedToComplete,fee 已烧但 token 没买到。立刻调大 COMPUTE_UNIT_LIMIT`,
+        `${buyChainFail} 笔 BUY 已落链但失败，fee 已烧且未买到 token。请按链上错误分类；Pump 6040 是 minBase/slippage，不是 CU 耗尽`,
         { buyChainFail },
       );
     } else {

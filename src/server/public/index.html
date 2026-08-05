@@ -490,8 +490,8 @@ async function refreshStatus() {
   $('modeBadge').className = 'badge ' + (r.dryRun ? 'dry' : 'live');
   $('stat-watched').textContent = r.watchedTokens;
   $('stat-open').textContent = r.openPositions;
-  $('stat-volume1m').textContent = 'FDV $10k-$500k / LP≥$3k';
-  $('stat-trades1m').textContent = `1s 跌 ${r.config.dropMinPct}-${r.config.dropMaxPct}% / 反弹 ${r.config.reboundMinPct}-${r.config.reboundMaxPct}%`;
+  $('stat-volume1m').textContent = 'FDV $10k-$500k / LP过滤关闭 / 监控AGE<5m';
+  $('stat-trades1m').textContent = `1s 跌 ${r.config.dropMinPct}-${r.config.dropMaxPct}% / 反弹 ${r.config.reboundMinPct}-${r.config.reboundMaxPct}% / 开仓AGE≤${Math.round((r.config.entryMaxTokenAgeMs ?? 180000) / 1000)}s`;
   $('stat-size').textContent = r.config.positionSizeSol + ' SOL';
   $('stat-trailing').textContent = `+${r.config.trailingActivatePct}% / ${r.config.trailingDrawdownPct}%`;
   $('stat-forced').textContent = `5s快盈 / 6s亏损检查 / 最长${Math.round((r.config.maxHoldMs ?? 15000) / 1000)}s`;
@@ -756,11 +756,12 @@ async function refreshSignals() {
     ? `LP ≥ $${Math.round(thresholds.minLiquidityUsd / 1000)}k`
     : 'LP 过滤关闭';
   meta.innerHTML = [
-    `<span>买入 <b>${thresholds.dropWindowMs ?? 1000}ms 内跌 ${thresholds.dropMinPct ?? 10}%～${thresholds.dropMaxPct ?? 20}%</b></span>`,
+    `<span>开仓 AGE <b>≤ ${Math.round((thresholds.entryMaxTokenAgeMs ?? 180000) / 1000)}s</b></span>`,
+    `<span>买入 <b>${thresholds.dropWindowMs ?? 1000}ms 内跌 ${thresholds.dropMinPct ?? 18}%～${thresholds.dropMaxPct ?? 22}%</b></span>`,
     `<span>反弹确认 <b>低点反弹 ${thresholds.reboundMinPct ?? 2}%～${thresholds.reboundMaxPct ?? 5}%，须在 ${thresholds.reboundTimeoutMs ?? 1000}ms 内完成</b></span>`,
     `<span>监控 <b>FDV $${Math.round((thresholds.minFdvUsd ?? 10000) / 1000)}k～$${Math.round((thresholds.maxFdvUsd ?? 500000) / 1000)}k / ${liquidityFilter} / AGE &lt; ${Math.round((thresholds.maxTokenAgeMs ?? 300000) / 60000)}m</b></span>`,
     `<span>移动止盈 <b>+${trailingActivate}% 激活 / 回撤 ${trailingDrawdown}% 卖出</b></span>`,
-    `<span>快速止盈 <b>买入后 ${Math.round((thresholds.fastTakeProfitWindowMs ?? 5000) / 1000)}s 内达到 +${thresholds.fastTakeProfitPct ?? 8}% 立即卖出</b></span>`,
+    `<span>快速止盈 <b>买入后 ${Math.round((thresholds.fastTakeProfitWindowMs ?? 5000) / 1000)}s 内达到 +${thresholds.fastTakeProfitPct ?? 18}% 立即卖出</b></span>`,
     `<span>盈亏检查 <b>第 ${Math.round((thresholds.lossCheckAtMs ?? 6000) / 1000)}s 低于买入价立即止损；不低于则继续持有</b></span>`,
     `<span>最长持仓 <b>${Math.round((thresholds.maxHoldMs ?? 15000) / 1000)}s</b></span>`,
     `<span>旧策略 <b>RSI、EMA、成交量、固定止损及其他策略退出均关闭</b></span>`,

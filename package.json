@@ -30,6 +30,7 @@
     "test:buy-exact-quote": "node scripts/test-pump-exact-quote-buy.js",
     "test:execution-slippage": "node scripts/test-execution-slippage-policy.js",
     "test:compute-unit-limit": "node scripts/test-compute-unit-limit.js",
+    "test:buy-telemetry": "node scripts/test-buy-execution-telemetry.js",
     "test:pricing": "node scripts/test-pump-swap-pricing.js",
     "test:pool-cache": "node scripts/test-pool-state-cache-foundation.js",
     "test:strategy-lab-schema": "node scripts/test-strategy-lab-schema.js",

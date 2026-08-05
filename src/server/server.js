@@ -383,6 +383,7 @@ class Server {
           reboundMinPct: config.activityFlow.reboundMinPct,
           reboundMaxPct: config.activityFlow.reboundMaxPct,
           reboundTimeoutMs: config.activityFlow.reboundTimeoutMs,
+          entryMaxTokenAgeMs: config.activityFlow.entryMaxTokenAgeMs,
           minFdvUsd: config.strategy.minFdVUsd,
           maxFdvUsd: config.strategy.maxFdVUsd,
           minLiquidityUsd: config.strategy.minLiquidityUsd,
