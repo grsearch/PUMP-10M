@@ -72,7 +72,7 @@ async function run() {
     1.03,
   );
 
-  // The high-confidence entry band is narrower than the absolute +3% chain
+  // The entry quote band is narrower than the absolute +3% chain
   // landing cap and rejects locally before a transaction is submitted.
   const confidenceTooLow = calculateBuyPriceGuard({
     signalPrice: 1,
@@ -80,7 +80,7 @@ async function run() {
     configuredSlippagePct: 50,
     maxPriceDeviationPct: 3,
     minExpectedPriceDeviationPct: -1,
-    maxExpectedPriceDeviationPct: 0.5,
+    maxExpectedPriceDeviationPct: 1.5,
     inputSol: 0.3,
   });
   assert.strictEqual(confidenceTooLow.allowed, false);
@@ -92,11 +92,11 @@ async function run() {
 
   const confidenceTooHigh = calculateBuyPriceGuard({
     signalPrice: 1,
-    expectedPrice: 1.006,
+    expectedPrice: 1.016,
     configuredSlippagePct: 50,
     maxPriceDeviationPct: 3,
     minExpectedPriceDeviationPct: -1,
-    maxExpectedPriceDeviationPct: 0.5,
+    maxExpectedPriceDeviationPct: 1.5,
     inputSol: 0.3,
   });
   assert.strictEqual(confidenceTooHigh.allowed, false);
@@ -106,14 +106,14 @@ async function run() {
     'buy_confidence_guard: expected price deviation above entry ceiling',
   );
 
-  for (const expectedPrice of [0.99, 1.005]) {
+  for (const expectedPrice of [0.99, 1.015]) {
     const boundary = calculateBuyPriceGuard({
       signalPrice: 1,
       expectedPrice,
       configuredSlippagePct: 50,
       maxPriceDeviationPct: 3,
       minExpectedPriceDeviationPct: -1,
-      maxExpectedPriceDeviationPct: 0.5,
+      maxExpectedPriceDeviationPct: 1.5,
       inputSol: 0.3,
     });
     assert.strictEqual(boundary.allowed, true, `entry boundary ${expectedPrice} must pass`);

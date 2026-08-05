@@ -279,20 +279,20 @@ const config = {
     // are intentionally ignored so stale deployments cannot reactivate removed rules.
     entryMode: 'DROP_REBOUND_1S',
     dropWindowMs: 1_000,
-    dropMinPct: 18,
-    dropMaxPct: 18.5,
+    dropMinPct: 15,
+    dropMaxPct: 25,
     reboundMinPct: 2,
     reboundMaxPct: 5,
     reboundTimeoutMs: 1_000,
-    // High-confidence live entry subset. Discovery/watchdog monitoring keeps
+    // Live entry subset. Discovery/watchdog monitoring keeps
     // the broader $10k-$500k FDV range; only order submission is narrowed.
     entryMinFdvUsd: 10_000,
-    entryMaxFdvUsd: 30_000,
+    entryMaxFdvUsd: 60_000,
     // Compare the fresh RPC exact-quote price with the rebound signal price.
     // This is an entry-quality filter, separate from the +3% absolute chain
     // landing cap used to calculate min_base_amount_out.
     entryQuoteMinDeviationPct: -1,
-    entryQuoteMaxDeviationPct: 0.5,
+    entryQuoteMaxDeviationPct: 1.5,
     // Backtest-validated entry window. Monitoring remains active for five
     // minutes so the watchdog can still close positions before removal, but
     // no new position may be opened after the first three minutes.
@@ -591,6 +591,10 @@ const config = {
     marketInitialDelayMs: parseInt(process.env.PUMP_DISCOVERY_MARKET_INITIAL_DELAY_MS || '2000', 10),
     marketRetries: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRIES || '8', 10),
     marketRetryMs: parseInt(process.env.PUMP_DISCOVERY_MARKET_RETRY_MS || '3000', 10),
+    // If all normal market-data attempts fail, wait three seconds and perform
+    // one final isolated lookup before permanently dropping the candidate.
+    marketUnavailableRechecks: 1,
+    marketUnavailableRecheckMs: 3_000,
     liquidityRechecks: Math.max(
       0,
       parseInt(process.env.PUMP_DISCOVERY_LIQUIDITY_RECHECKS || '1', 10),
@@ -783,6 +787,18 @@ function validateConfig() {
     config.activityFlow.entryMaxTokenAgeMs > config.strategy.maxTokenAgeMs
   ) {
     errors.push('entryMaxTokenAgeMs must be > 0 and <= maxTokenAgeMs');
+  }
+  if (
+    !Number.isFinite(config.pumpDiscovery.marketUnavailableRechecks) ||
+    config.pumpDiscovery.marketUnavailableRechecks < 0
+  ) {
+    errors.push('marketUnavailableRechecks must be >= 0');
+  }
+  if (
+    !Number.isFinite(config.pumpDiscovery.marketUnavailableRecheckMs) ||
+    config.pumpDiscovery.marketUnavailableRecheckMs < 250
+  ) {
+    errors.push('marketUnavailableRecheckMs must be >= 250');
   }
   return errors;
 }
