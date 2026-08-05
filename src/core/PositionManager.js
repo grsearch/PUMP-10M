@@ -821,7 +821,7 @@ class PositionManager extends EventEmitter {
           // v3.17.21: BUY reconcile 超时 → 从 hotMints 移除
           if (this.executor?.poolStateCache) this.executor.poolStateCache.removeHot(mint);
           if (this.signalEngine?.setBuyFailureCooldown) {
-            const cooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
+            const cooldownMs = config.strategy.buyFailureCooldownMs;
             this.signalEngine.setBuyFailureCooldown(mint, cooldownMs, 'BUY_RECONCILE_TIMEOUT');
           }
           monitor.set('PositionManager.openCount', this.positions.size, 'PositionManager');
@@ -1004,10 +1004,10 @@ class PositionManager extends EventEmitter {
       // Arm protection before any DB/event work so a logging failure cannot
       // reopen the fee-burning retry window.
       if (this.signalEngine?.setBuyFailureCooldown) {
-        const buyFailedCooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
+        const buyFailedCooldownMs = config.strategy.buyFailureCooldownMs;
         this.signalEngine.setBuyFailureCooldown(mint, buyFailedCooldownMs, 'BUY_CHAIN_FAILED');
         console.log(
-          `[PositionManager] 🔒 BUY_CHAIN_FAILED cooldown ${pos.symbol || mint.slice(0, 6)} for ${Math.round(buyFailedCooldownMs / 3600000)}h (no rebuy)`,
+          `[PositionManager] 🔒 BUY_CHAIN_FAILED cooldown ${pos.symbol || mint.slice(0, 6)} for ${Math.round(buyFailedCooldownMs / 1000)}s (no rebuy)`,
         );
       }
 
@@ -1107,7 +1107,7 @@ class PositionManager extends EventEmitter {
       ) / 1e9;
       const feePnlPct = calculateBuyFailurePnlPct(feeSol, pos.entrySol);
       if (this.signalEngine?.setBuyFailureCooldown) {
-        const cooldownMs = parseInt(process.env.BUY_FAILED_REBUY_COOLDOWN_MS || '86400000', 10);
+        const cooldownMs = config.strategy.buyFailureCooldownMs;
         this.signalEngine.setBuyFailureCooldown(mint, cooldownMs, 'BUY_PARSE_FAILED');
       }
       if (this.tradeLogger?.markBuyChainFailed) {

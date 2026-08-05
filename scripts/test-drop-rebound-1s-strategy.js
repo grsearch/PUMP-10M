@@ -9,6 +9,7 @@ Module._load = function loadWithDotenvStub(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 const DropReboundTracker = require('../src/core/DropReboundTracker');
+const SignalEngine = require('../src/core/SignalEngine');
 const { config, validateConfig } = require('../src/config');
 Module._load = originalLoad;
 
@@ -16,7 +17,7 @@ function registryFor(base, overrides = {}) {
   const token = {
     is_active: 1,
     symbol: 'TEST',
-    fdv: 50_000,
+    fdv: 20_000,
     liquidity: 5_000,
     migration_time: base - 60_000,
     ...overrides,
@@ -45,20 +46,57 @@ function tracker(base, tokenOverrides = {}) {
 }
 
 function run() {
-  assert.deepStrictEqual(validateConfig().filter((message) => message.includes('drop') || message.includes('rebound')), []);
+  assert.deepStrictEqual(
+    validateConfig().filter((message) =>
+      message.includes('drop') ||
+      message.includes('rebound') ||
+      message.includes('entry FDV') ||
+      message.includes('entry quote') ||
+      message.includes('positionSizeSol')),
+    [],
+  );
   assert.strictEqual(config.activityFlow.entryMode, 'DROP_REBOUND_1S');
   assert.strictEqual(config.activityFlow.dropWindowMs, 1_000);
   assert.strictEqual(config.activityFlow.dropMinPct, 18);
-  assert.strictEqual(config.activityFlow.dropMaxPct, 22);
+  assert.strictEqual(config.activityFlow.dropMaxPct, 18.5);
   assert.strictEqual(config.activityFlow.reboundMinPct, 2);
   assert.strictEqual(config.activityFlow.reboundMaxPct, 5);
   assert.strictEqual(config.activityFlow.reboundTimeoutMs, 1_000);
   assert.strictEqual(config.activityFlow.entryMaxTokenAgeMs, 180_000);
+  assert.strictEqual(config.activityFlow.entryMinFdvUsd, 10_000);
+  assert.strictEqual(config.activityFlow.entryMaxFdvUsd, 30_000);
+  assert.strictEqual(config.activityFlow.entryQuoteMinDeviationPct, -1);
+  assert.strictEqual(config.activityFlow.entryQuoteMaxDeviationPct, 0.5);
+  assert.strictEqual(config.strategy.positionSizeSol, 0.3);
   assert.strictEqual(config.strategy.maxTokenAgeMs, 5 * 60_000);
   assert.strictEqual(config.strategy.minFdVUsd, 10_000);
   assert.strictEqual(config.strategy.maxFdVUsd, 500_000);
   assert.strictEqual(config.strategy.minLiquidityUsd, 0);
+  assert.strictEqual(config.strategy.buyFailureCooldownMs, 10_000);
   assert.strictEqual(config.pumpDiscovery.enabled, true);
+
+  const failureGuard = Object.create(SignalEngine.prototype);
+  failureGuard._buyFailureCooldowns = new Map();
+  const protection = failureGuard.setBuyFailureCooldown(
+    'CooldownMint111111111111111111111111111111',
+    config.strategy.buyFailureCooldownMs,
+    'BUY_CHAIN_FAILED',
+  );
+  assert.strictEqual(protection.reason, 'BUY_CHAIN_FAILED');
+  assert.strictEqual(
+    failureGuard.getActiveBuyFailureCooldown(
+      'CooldownMint111111111111111111111111111111',
+      protection.expireAt - 1,
+    ),
+    protection,
+  );
+  assert.strictEqual(
+    failureGuard.getActiveBuyFailureCooldown(
+      'CooldownMint111111111111111111111111111111',
+      protection.expireAt,
+    ),
+    null,
+  );
 
   const base = Date.now() - 2_000;
   const mint = 'DropReboundMint111111111111111111111111111';
@@ -68,9 +106,9 @@ function run() {
     const signals = [];
     t.on('flowReversalSignal', (signal) => signals.push(signal));
     t.handleSwap(swap(mint, 1, base, 'ok-peak'));
-    t.handleSwap(swap(mint, 0.81, base + 400, 'ok-drop'));
+    t.handleSwap(swap(mint, 0.818, base + 400, 'ok-drop'));
     assert.strictEqual(t.states.get(mint).stage, 'waiting');
-    t.handleSwap(swap(mint, 0.8272, base + 900, 'ok-rebound'));
+    t.handleSwap(swap(mint, 0.835, base + 900, 'ok-rebound'));
     assert.strictEqual(signals.length, 1);
     assert(signals[0]._flow.entryDropRebound1s);
     const entry = signals[0]._flow.entryDropRebound1s;
@@ -89,8 +127,8 @@ function run() {
     let signals = 0;
     t.on('flowReversalSignal', () => signals++);
     t.handleSwap(swap(mint, 1, base, 'age-boundary-peak'));
-    t.handleSwap(swap(mint, 0.81, base + 100, 'age-boundary-drop'));
-    t.handleSwap(swap(mint, 0.83, signalTs, 'age-boundary-rebound'));
+    t.handleSwap(swap(mint, 0.818, base + 100, 'age-boundary-drop'));
+    t.handleSwap(swap(mint, 0.835, signalTs, 'age-boundary-rebound'));
     assert.strictEqual(signals, 1, 'an entry signal at exactly 180 seconds must be accepted');
   }
 
@@ -99,8 +137,8 @@ function run() {
     let signals = 0;
     t.on('flowReversalSignal', () => signals++);
     t.handleSwap(swap(mint, 1, base, 'timeout-peak'));
-    t.handleSwap(swap(mint, 0.81, base + 100, 'timeout-drop'));
-    t.handleSwap(swap(mint, 0.83, base + 1_101, 'timeout-rebound'));
+    t.handleSwap(swap(mint, 0.818, base + 100, 'timeout-drop'));
+    t.handleSwap(swap(mint, 0.835, base + 1_101, 'timeout-rebound'));
     assert.strictEqual(signals, 0, 'a rebound after 1000ms must be rejected');
     assert.strictEqual(t.states.get(mint).candidate, null);
   }
@@ -110,7 +148,7 @@ function run() {
     let signals = 0;
     t.on('flowReversalSignal', () => signals++);
     t.handleSwap(swap(mint, 1, base, 'jump-peak'));
-    t.handleSwap(swap(mint, 0.81, base + 100, 'jump-drop'));
+    t.handleSwap(swap(mint, 0.818, base + 100, 'jump-drop'));
     t.handleSwap(swap(mint, 0.86, base + 300, 'jump-rebound'));
     assert.strictEqual(signals, 0, 'the first rebound above 5% must be rejected');
   }
@@ -123,20 +161,20 @@ function run() {
     t.handleSwap(swap(mint, 0.77, base + 100, 'deep-drop'));
     t.handleSwap(swap(mint, 0.79, base + 300, 'deep-rebound-into-band'));
     assert.strictEqual(signals, 0);
-    assert.strictEqual(t.states.get(mint).candidate, null, 'a >22% drop must not re-arm inside the same episode');
+    assert.strictEqual(t.states.get(mint).candidate, null, 'a >18.5% drop must not re-arm inside the same episode');
   }
 
   for (const [name, overrides] of [
     ['low fdv', { fdv: 9_999 }],
-    ['high fdv', { fdv: 500_001 }],
+    ['high entry fdv', { fdv: 30_001 }],
     ['entry age over three minutes', { migration_time: base - 181_000 }],
   ]) {
     const t = tracker(base, overrides);
     let signals = 0;
     t.on('flowReversalSignal', () => signals++);
     t.handleSwap(swap(mint, 1, base, `${name}-peak`));
-    t.handleSwap(swap(mint, 0.81, base + 100, `${name}-drop`));
-    t.handleSwap(swap(mint, 0.83, base + 300, `${name}-rebound`));
+    t.handleSwap(swap(mint, 0.818, base + 100, `${name}-drop`));
+    t.handleSwap(swap(mint, 0.835, base + 300, `${name}-rebound`));
     assert.strictEqual(signals, 0, `${name} must fail the monitoring filter`);
     assert.strictEqual(t.states.get(mint).stage, 'ineligible');
   }
@@ -146,8 +184,8 @@ function run() {
     let signals = 0;
     t.on('flowReversalSignal', () => signals++);
     t.handleSwap(swap(mint, 1, base, 'no-lp-peak'));
-    t.handleSwap(swap(mint, 0.81, base + 100, 'no-lp-drop'));
-    t.handleSwap(swap(mint, 0.83, base + 300, 'no-lp-rebound'));
+    t.handleSwap(swap(mint, 0.818, base + 100, 'no-lp-drop'));
+    t.handleSwap(swap(mint, 0.835, base + 300, 'no-lp-rebound'));
     assert.strictEqual(signals, 1, 'missing LP telemetry must not block an entry signal');
   }
 
@@ -158,6 +196,11 @@ function run() {
     assert.strictEqual(panel.mode, 'DROP_REBOUND_1S');
     assert.strictEqual(panel.thresholds.reboundTimeoutMs, 1_000);
     assert.strictEqual(panel.thresholds.entryMaxTokenAgeMs, 180_000);
+    assert.strictEqual(panel.thresholds.entryMinFdvUsd, 10_000);
+    assert.strictEqual(panel.thresholds.entryMaxFdvUsd, 30_000);
+    assert.strictEqual(panel.thresholds.entryQuoteMinDeviationPct, -1);
+    assert.strictEqual(panel.thresholds.entryQuoteMaxDeviationPct, 0.5);
+    assert.strictEqual(panel.thresholds.buyMaxPriceDeviationPct, 3);
     assert.strictEqual(panel.thresholds.maxTokenAgeMs, 300_000);
     assert.strictEqual(panel.thresholds.minLiquidityUsd, 0);
     assert.strictEqual(panel.thresholds.trailingActivatePct, 8);

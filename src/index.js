@@ -72,10 +72,12 @@ async function main() {
     `Entry: rolling ${config.activityFlow.dropWindowMs}ms drop ` +
       `${config.activityFlow.dropMinPct}-${config.activityFlow.dropMaxPct}%, ` +
       `then +${config.activityFlow.reboundMinPct}-${config.activityFlow.reboundMaxPct}% rebound ` +
-      `within ${config.activityFlow.reboundTimeoutMs}ms`,
+      `within ${config.activityFlow.reboundTimeoutMs}ms; ` +
+      `entry FDV $${config.activityFlow.entryMinFdvUsd}-$${config.activityFlow.entryMaxFdvUsd}`,
   );
   console.log(`Legacy dumpSignal: ${config.activityFlow.replaceDumpSignal ? 'suppressed' : 'allowed fallback'}`);
   console.log(`Rebuy cooldown: ${config.strategy.rebuyCooldownMs > 0 ? config.strategy.rebuyCooldownMs / 60_000 + 'min after close' : 'disabled'}`);
+  console.log(`BUY failure cooldown: ${config.strategy.buyFailureCooldownMs / 1000}s`);
   const watchdogLiquidityPolicy = config.strategy.minLiquidityUsd > 0
     ? `liquidity>=$${config.strategy.minLiquidityUsd}`
     : 'liquidity filter=disabled';
@@ -90,6 +92,8 @@ async function main() {
   console.log(
     `Buy guard: chain ceiling=${(config.strategy.buySlippageBps / 100).toFixed(1)}%, ` +
       `signal cap=+${config.strategy.buyMaxPriceDeviationPct}%, ` +
+      `entry quote=${config.activityFlow.entryQuoteMinDeviationPct}%..` +
+      `${config.activityFlow.entryQuoteMaxDeviationPct}%, ` +
       `fast pool cache<=${config.strategy.buyFastPoolStateMaxAgeMs}ms, ` +
       `slippage requote=${config.strategy.buy6004RequoteRetries}x`,
   );
@@ -107,7 +111,16 @@ async function main() {
   ) {
     console.warn(
       `BUY_MAX_PRICE_DEVIATION_PCT is ignored; the production BUY price cap ` +
-        `is fixed at signal +${config.strategy.buyMaxPriceDeviationPct}%.`,
+      `is fixed at signal +${config.strategy.buyMaxPriceDeviationPct}%.`,
+    );
+  }
+  if (
+    process.env.POSITION_SIZE_SOL != null &&
+    Number(process.env.POSITION_SIZE_SOL) !== config.strategy.positionSizeSol
+  ) {
+    console.warn(
+      `POSITION_SIZE_SOL is ignored; the production position size is fixed at ` +
+        `${config.strategy.positionSizeSol} SOL.`,
     );
   }
   console.log('Entry frequency: no overlapping position per mint; re-entry is allowed after close');

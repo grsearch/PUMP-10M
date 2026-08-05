@@ -16,6 +16,8 @@ function calculateBuyPriceGuard({
   expectedPrice,
   configuredSlippagePct,
   maxPriceDeviationPct,
+  minExpectedPriceDeviationPct,
+  maxExpectedPriceDeviationPct,
   inputSol,
 }) {
   const signal = finitePositive(signalPrice);
@@ -23,6 +25,12 @@ function calculateBuyPriceGuard({
   const input = finitePositive(inputSol);
   const configured = Number(configuredSlippagePct);
   const maxDeviation = Number(maxPriceDeviationPct);
+  const minEntryDeviation = minExpectedPriceDeviationPct == null
+    ? Number.NEGATIVE_INFINITY
+    : Number(minExpectedPriceDeviationPct);
+  const maxEntryDeviation = maxExpectedPriceDeviationPct == null
+    ? Number.POSITIVE_INFINITY
+    : Number(maxExpectedPriceDeviationPct);
 
   if (!signal) {
     return { allowed: false, error: 'buy_price_guard: invalid signal price' };
@@ -38,6 +46,13 @@ function calculateBuyPriceGuard({
   }
   if (!Number.isFinite(maxDeviation) || maxDeviation < 0) {
     return { allowed: false, error: 'buy_price_guard: invalid max price deviation' };
+  }
+  if (
+    Number.isNaN(minEntryDeviation) ||
+    Number.isNaN(maxEntryDeviation) ||
+    maxEntryDeviation < minEntryDeviation
+  ) {
+    return { allowed: false, error: 'buy_confidence_guard: invalid expected price deviation range' };
   }
 
   const maxPrice = signal * (1 + maxDeviation / 100);
@@ -58,6 +73,40 @@ function calculateBuyPriceGuard({
     };
   }
 
+  const deviationTolerance = 1e-9;
+  if (priceDeviationPct < minEntryDeviation - deviationTolerance) {
+    return {
+      allowed: false,
+      error: 'buy_confidence_guard: expected price deviation below entry floor',
+      confidenceGuardRejected: true,
+      signalPrice: signal,
+      expectedPrice: expected,
+      maxPrice,
+      priceDeviationPct,
+      minExpectedPriceDeviationPct: minEntryDeviation,
+      maxExpectedPriceDeviationPct: maxEntryDeviation,
+      remainingPct: 0,
+      effectiveSlippagePct: 0,
+      maxQuoteSol: input,
+    };
+  }
+  if (priceDeviationPct > maxEntryDeviation + deviationTolerance) {
+    return {
+      allowed: false,
+      error: 'buy_confidence_guard: expected price deviation above entry ceiling',
+      confidenceGuardRejected: true,
+      signalPrice: signal,
+      expectedPrice: expected,
+      maxPrice,
+      priceDeviationPct,
+      minExpectedPriceDeviationPct: minEntryDeviation,
+      maxExpectedPriceDeviationPct: maxEntryDeviation,
+      remainingPct: 0,
+      effectiveSlippagePct: 0,
+      maxQuoteSol: input,
+    };
+  }
+
   const remainingPct = Math.max(0, (maxPrice / expected - 1) * 100);
   const effectiveSlippagePct = Math.min(
     ABSOLUTE_MAX_BUY_SLIPPAGE_PCT,
@@ -72,6 +121,8 @@ function calculateBuyPriceGuard({
     expectedPrice: expected,
     maxPrice,
     priceDeviationPct,
+    minExpectedPriceDeviationPct: Number.isFinite(minEntryDeviation) ? minEntryDeviation : null,
+    maxExpectedPriceDeviationPct: Number.isFinite(maxEntryDeviation) ? maxEntryDeviation : null,
     remainingPct,
     effectiveSlippagePct,
     // buy_exact_quote_in fixes quote input; tolerance is enforced through the

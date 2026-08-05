@@ -1112,6 +1112,9 @@ class Executor {
       quoteMode: 'buy_exact_quote_in',
       signalPrice: Number.isFinite(rawSignalPrice) && rawSignalPrice > 0 ? rawSignalPrice : null,
       expectedPrice: null,
+      priceDeviationPct: null,
+      entryQuoteMinDeviationPct: config.activityFlow.entryQuoteMinDeviationPct,
+      entryQuoteMaxDeviationPct: config.activityFlow.entryQuoteMaxDeviationPct,
       maxPrice: null,
       maxQuoteSol: null,
       spendableQuoteSol: sizeSol,
@@ -1138,14 +1141,38 @@ class Executor {
           latencyMs: Date.now() - t0,
         });
       }
-      const tokenAmount = sizeSol / fillPrice;
-      buyDiagnostics.expectedPrice = fillPrice;
-      buyDiagnostics.maxPrice = buyDiagnostics.signalPrice
-        ? buyDiagnostics.signalPrice * (1 + config.strategy.buyMaxPriceDeviationPct / 100)
-        : null;
-      buyDiagnostics.effectiveSlippagePct = 0.5;
-      buyDiagnostics.maxQuoteSol = sizeSol * 1.005;
+      const priceGuard = calculateBuyPriceGuard({
+        signalPrice: buyDiagnostics.signalPrice,
+        expectedPrice: fillPrice,
+        configuredSlippagePct,
+        maxPriceDeviationPct: config.strategy.buyMaxPriceDeviationPct,
+        minExpectedPriceDeviationPct: config.activityFlow.entryQuoteMinDeviationPct,
+        maxExpectedPriceDeviationPct: config.activityFlow.entryQuoteMaxDeviationPct,
+        inputSol: sizeSol,
+      });
+      buyDiagnostics.expectedPrice = priceGuard.expectedPrice ?? fillPrice;
+      buyDiagnostics.priceDeviationPct = priceGuard.priceDeviationPct ?? null;
+      buyDiagnostics.maxPrice = priceGuard.maxPrice ?? null;
+      buyDiagnostics.effectiveSlippagePct = priceGuard.effectiveSlippagePct ?? null;
+      buyDiagnostics.maxQuoteSol = priceGuard.maxQuoteSol ?? sizeSol;
       buyDiagnostics.stateSource = 'dry_run';
+      if (!priceGuard.allowed) {
+        monitor.inc(
+          priceGuard.confidenceGuardRejected
+            ? 'Executor.buyConfidenceGuardRejected'
+            : 'Executor.buyPriceGuardRejected',
+          1,
+          'Executor',
+        );
+        return finishBuy({
+          success: false,
+          error: priceGuard.error,
+          priceGuardRejected: true,
+          confidenceGuardRejected: !!priceGuard.confidenceGuardRejected,
+          latencyMs: Date.now() - t0,
+        });
+      }
+      const tokenAmount = sizeSol / fillPrice;
       console.log(
         `[Executor:DRY_RUN] BUY ${order.symbol || order.mint.slice(0, 6)}: ` +
           `${sizeSol} SOL → ${tokenAmount.toFixed(2)} tokens @ ${fillPrice.toExponential(4)}`,
@@ -1356,24 +1383,36 @@ class Executor {
         expectedPrice: realPrice,
         configuredSlippagePct,
         maxPriceDeviationPct: config.strategy.buyMaxPriceDeviationPct,
+        minExpectedPriceDeviationPct: config.activityFlow.entryQuoteMinDeviationPct,
+        maxExpectedPriceDeviationPct: config.activityFlow.entryQuoteMaxDeviationPct,
         inputSol: sizeSol,
       });
       buyDiagnostics.expectedPrice = priceGuard.expectedPrice ?? (realPrice || null);
+      buyDiagnostics.priceDeviationPct = priceGuard.priceDeviationPct ?? null;
       buyDiagnostics.maxPrice = priceGuard.maxPrice ?? null;
       buyDiagnostics.effectiveSlippagePct = priceGuard.effectiveSlippagePct ?? null;
       buyDiagnostics.maxQuoteSol = priceGuard.maxQuoteSol ?? null;
 
       if (!priceGuard.allowed) {
-        monitor.inc('Executor.buyPriceGuardRejected', 1, 'Executor');
+        monitor.inc(
+          priceGuard.confidenceGuardRejected
+            ? 'Executor.buyConfidenceGuardRejected'
+            : 'Executor.buyPriceGuardRejected',
+          1,
+          'Executor',
+        );
         console.warn(
           `[Executor:LIVE] BUY ABORTED ${order.symbol || order.mint.slice(0, 6)}: ` +
             `${priceGuard.error} signal=${buyDiagnostics.signalPrice ?? 'n/a'} ` +
-            `expected=${realPrice || 'n/a'} max=${priceGuard.maxPrice ?? 'n/a'}`,
+            `expected=${realPrice || 'n/a'} deviation=${priceGuard.priceDeviationPct?.toFixed(3) ?? 'n/a'}% ` +
+            `entryBand=${config.activityFlow.entryQuoteMinDeviationPct}%..` +
+            `${config.activityFlow.entryQuoteMaxDeviationPct}% max=${priceGuard.maxPrice ?? 'n/a'}`,
         );
         return finishBuy({
           success: false,
           error: priceGuard.error,
           priceGuardRejected: true,
+          confidenceGuardRejected: !!priceGuard.confidenceGuardRejected,
           latencyMs: Date.now() - t0,
         });
       }
@@ -1412,6 +1451,8 @@ class Executor {
         `[Executor:LIVE] BUY quote: signal=${fmtPrice(buyDiagnostics.signalPrice)} ` +
           `expected=${fmtPrice(buyDiagnostics.expectedPrice)} ` +
           `deviation=${priceGuard.priceDeviationPct.toFixed(2)}% ` +
+          `entryBand=${config.activityFlow.entryQuoteMinDeviationPct}%..` +
+          `${config.activityFlow.entryQuoteMaxDeviationPct}% ` +
           `slippage=${configuredSlippagePct.toFixed(2)}%->${effectiveSlippagePct.toFixed(2)}% ` +
           `exactQuote=${buyDiagnostics.spendableQuoteSol.toFixed(9)}SOL ` +
           `minBase=${buyDiagnostics.minBaseAmountOutRaw} ` +

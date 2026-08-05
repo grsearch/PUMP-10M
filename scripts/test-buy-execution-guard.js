@@ -72,6 +72,53 @@ async function run() {
     1.03,
   );
 
+  // The high-confidence entry band is narrower than the absolute +3% chain
+  // landing cap and rejects locally before a transaction is submitted.
+  const confidenceTooLow = calculateBuyPriceGuard({
+    signalPrice: 1,
+    expectedPrice: 0.989,
+    configuredSlippagePct: 50,
+    maxPriceDeviationPct: 3,
+    minExpectedPriceDeviationPct: -1,
+    maxExpectedPriceDeviationPct: 0.5,
+    inputSol: 0.3,
+  });
+  assert.strictEqual(confidenceTooLow.allowed, false);
+  assert.strictEqual(confidenceTooLow.confidenceGuardRejected, true);
+  assert.strictEqual(
+    confidenceTooLow.error,
+    'buy_confidence_guard: expected price deviation below entry floor',
+  );
+
+  const confidenceTooHigh = calculateBuyPriceGuard({
+    signalPrice: 1,
+    expectedPrice: 1.006,
+    configuredSlippagePct: 50,
+    maxPriceDeviationPct: 3,
+    minExpectedPriceDeviationPct: -1,
+    maxExpectedPriceDeviationPct: 0.5,
+    inputSol: 0.3,
+  });
+  assert.strictEqual(confidenceTooHigh.allowed, false);
+  assert.strictEqual(confidenceTooHigh.confidenceGuardRejected, true);
+  assert.strictEqual(
+    confidenceTooHigh.error,
+    'buy_confidence_guard: expected price deviation above entry ceiling',
+  );
+
+  for (const expectedPrice of [0.99, 1.005]) {
+    const boundary = calculateBuyPriceGuard({
+      signalPrice: 1,
+      expectedPrice,
+      configuredSlippagePct: 50,
+      maxPriceDeviationPct: 3,
+      minExpectedPriceDeviationPct: -1,
+      maxExpectedPriceDeviationPct: 0.5,
+      inputSol: 0.3,
+    });
+    assert.strictEqual(boundary.allowed, true, `entry boundary ${expectedPrice} must pass`);
+  }
+
   // TCAT regression: a 1.883% price move fits inside the production +3% cap.
   const tcat = calculateBuyPriceGuard({
     signalPrice: 1,

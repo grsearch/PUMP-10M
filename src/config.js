@@ -52,7 +52,9 @@ const config = {
     minPoolQuoteSol: parseFloat(process.env.MIN_POOL_QUOTE_SOL || '30.0'),
 
     // 仓位
-    positionSizeSol: parseFloat(process.env.POSITION_SIZE_SOL || '0.2'),
+    // Production position size is fixed so a stale deployment environment
+    // cannot silently restore the previous 0.2 SOL order size.
+    positionSizeSol: 0.3,
 
     // Production exits: fast +8% TP in the first five seconds, a one-shot
     // loss check at six seconds, trailing, and the fifteen-second timeout.
@@ -214,6 +216,9 @@ const config = {
     sell6004RetryDelayMs: parseInt(process.env.SELL_6004_RETRY_DELAY_MS || '100', 10),
     // Legacy env name retained for compatibility; covers BUY slippage 6004 and 6040.
     buy6004RequoteRetries: Math.min(1, Math.max(0, parseInt(process.env.BUY_6004_REQUOTE_RETRIES || '1', 10))),
+    // Retry transient BUY chain/parse/reconcile failures after ten seconds.
+    // This is fixed so a stale 24-hour server environment value cannot win.
+    buyFailureCooldownMs: 10_000,
 
     // 风控（v3.17 默认 maxConcurrent 5）
     cooldownMsPerToken: parseInt(process.env.COOLDOWN_MS_PER_TOKEN || '0', 10),
@@ -275,10 +280,19 @@ const config = {
     entryMode: 'DROP_REBOUND_1S',
     dropWindowMs: 1_000,
     dropMinPct: 18,
-    dropMaxPct: 22,
+    dropMaxPct: 18.5,
     reboundMinPct: 2,
     reboundMaxPct: 5,
     reboundTimeoutMs: 1_000,
+    // High-confidence live entry subset. Discovery/watchdog monitoring keeps
+    // the broader $10k-$500k FDV range; only order submission is narrowed.
+    entryMinFdvUsd: 10_000,
+    entryMaxFdvUsd: 30_000,
+    // Compare the fresh RPC exact-quote price with the rebound signal price.
+    // This is an entry-quality filter, separate from the +3% absolute chain
+    // landing cap used to calculate min_base_amount_out.
+    entryQuoteMinDeviationPct: -1,
+    entryQuoteMaxDeviationPct: 0.5,
     // Backtest-validated entry window. Monitoring remains active for five
     // minutes so the watchdog can still close positions before removal, but
     // no new position may be opened after the first three minutes.
@@ -648,6 +662,9 @@ const config = {
 
 function validateConfig() {
   const errors = [];
+  if (!Number.isFinite(config.strategy.positionSizeSol) || config.strategy.positionSizeSol <= 0) {
+    errors.push('positionSizeSol must be > 0');
+  }
   if (!Number.isFinite(config.strategy.buySlippageBps) || config.strategy.buySlippageBps < 0) {
     errors.push('BUY_SLIPPAGE_BPS must be >= 0');
   }
@@ -741,6 +758,24 @@ function validateConfig() {
     config.activityFlow.reboundTimeoutMs <= 0
   ) {
     errors.push('reboundTimeoutMs must be > 0');
+  }
+  if (
+    !Number.isFinite(config.activityFlow.entryMinFdvUsd) ||
+    !Number.isFinite(config.activityFlow.entryMaxFdvUsd) ||
+    config.activityFlow.entryMinFdvUsd <= 0 ||
+    config.activityFlow.entryMaxFdvUsd < config.activityFlow.entryMinFdvUsd ||
+    config.activityFlow.entryMinFdvUsd < config.strategy.minFdVUsd ||
+    (config.strategy.maxFdVUsd > 0 && config.activityFlow.entryMaxFdvUsd > config.strategy.maxFdVUsd)
+  ) {
+    errors.push('entry FDV range must be valid and inside the monitoring FDV range');
+  }
+  if (
+    !Number.isFinite(config.activityFlow.entryQuoteMinDeviationPct) ||
+    !Number.isFinite(config.activityFlow.entryQuoteMaxDeviationPct) ||
+    config.activityFlow.entryQuoteMaxDeviationPct < config.activityFlow.entryQuoteMinDeviationPct ||
+    config.activityFlow.entryQuoteMaxDeviationPct > config.strategy.buyMaxPriceDeviationPct
+  ) {
+    errors.push('entry quote deviation range must be valid and remain inside the BUY signal cap');
   }
   if (
     !Number.isFinite(config.activityFlow.entryMaxTokenAgeMs) ||

@@ -21,10 +21,11 @@ function round(value, digits = 4) {
 /**
  * Live entry tracker for newly migrated Pump tokens.
  *
- * A candidate starts when the trusted price crosses into an 18%-22% drawdown
+ * A candidate starts when the trusted price crosses into an 18%-18.5% drawdown
  * from the rolling one-second high. The first rebound from the running low
  * must reach 2%-5% before the one-second candidate deadline. New entries are
- * limited to the first three minutes after migration.
+ * limited to the first three minutes after migration and the $10k-$30k FDV
+ * entry subset. The broader discovery/watchdog range remains unchanged.
  */
 class DropReboundTracker extends EventEmitter {
   constructor(opts = {}) {
@@ -37,14 +38,16 @@ class DropReboundTracker extends EventEmitter {
     this.entryMode = 'DROP_REBOUND_1S';
     this.dropWindowMs = opts.dropWindowMs ?? settings.dropWindowMs ?? 1_000;
     this.dropMinPct = opts.dropMinPct ?? settings.dropMinPct ?? 18;
-    this.dropMaxPct = opts.dropMaxPct ?? settings.dropMaxPct ?? 22;
+    this.dropMaxPct = opts.dropMaxPct ?? settings.dropMaxPct ?? 18.5;
     this.reboundMinPct = opts.reboundMinPct ?? settings.reboundMinPct ?? 2;
     this.reboundMaxPct = opts.reboundMaxPct ?? settings.reboundMaxPct ?? 5;
     this.reboundTimeoutMs = opts.reboundTimeoutMs ?? settings.reboundTimeoutMs ?? 1_000;
     this.maxSignalAgeMs = opts.maxSignalAgeMs ?? settings.maxSignalAgeMs ?? 5_000;
     this.inflightTimeoutMs = Math.max(5_000, Number(opts.inflightTimeoutMs ?? 30_000) || 30_000);
-    this.minFdvUsd = opts.minFdvUsd ?? config.strategy.minFdVUsd;
-    this.maxFdvUsd = opts.maxFdvUsd ?? config.strategy.maxFdVUsd;
+    this.entryMinFdvUsd = opts.entryMinFdvUsd ?? opts.minFdvUsd ??
+      settings.entryMinFdvUsd ?? config.strategy.minFdVUsd;
+    this.entryMaxFdvUsd = opts.entryMaxFdvUsd ?? opts.maxFdvUsd ??
+      settings.entryMaxFdvUsd ?? config.strategy.maxFdVUsd;
     this.minLiquidityUsd = opts.minLiquidityUsd ?? config.strategy.minLiquidityUsd;
     this.maxTokenAgeMs = opts.maxTokenAgeMs ?? config.strategy.maxTokenAgeMs;
     this.entryMaxTokenAgeMs = opts.entryMaxTokenAgeMs ?? settings.entryMaxTokenAgeMs ?? 180_000;
@@ -102,9 +105,11 @@ class DropReboundTracker extends EventEmitter {
 
     const fdv = finite(token.fdv);
     if (fdv == null) return 'FDV unavailable';
-    if (fdv < this.minFdvUsd) return `FDV $${Math.round(fdv)}<$${this.minFdvUsd}`;
-    if (this.maxFdvUsd > 0 && fdv > this.maxFdvUsd) {
-      return `FDV $${Math.round(fdv)}>$${this.maxFdvUsd}`;
+    if (fdv < this.entryMinFdvUsd) {
+      return `entry FDV $${Math.round(fdv)}<$${this.entryMinFdvUsd}`;
+    }
+    if (this.entryMaxFdvUsd > 0 && fdv > this.entryMaxFdvUsd) {
+      return `entry FDV $${Math.round(fdv)}>$${this.entryMaxFdvUsd}`;
     }
 
     if (this.minLiquidityUsd > 0) {
@@ -451,10 +456,15 @@ class DropReboundTracker extends EventEmitter {
         reboundMinPct: this.reboundMinPct,
         reboundMaxPct: this.reboundMaxPct,
         reboundTimeoutMs: this.reboundTimeoutMs,
-        minFdvUsd: this.minFdvUsd,
-        maxFdvUsd: this.maxFdvUsd,
+        entryMinFdvUsd: this.entryMinFdvUsd,
+        entryMaxFdvUsd: this.entryMaxFdvUsd,
+        minFdvUsd: config.strategy.minFdVUsd,
+        maxFdvUsd: config.strategy.maxFdVUsd,
         minLiquidityUsd: this.minLiquidityUsd,
         entryMaxTokenAgeMs: this.entryMaxTokenAgeMs,
+        entryQuoteMinDeviationPct: config.activityFlow.entryQuoteMinDeviationPct,
+        entryQuoteMaxDeviationPct: config.activityFlow.entryQuoteMaxDeviationPct,
+        buyMaxPriceDeviationPct: config.strategy.buyMaxPriceDeviationPct,
         maxTokenAgeMs: this.maxTokenAgeMs,
         trailingActivatePct: config.strategy.trailingActivatePct,
         trailingDrawdownPct: config.strategy.trailingDrawdownPct,
