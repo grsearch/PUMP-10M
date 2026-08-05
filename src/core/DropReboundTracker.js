@@ -21,10 +21,10 @@ function round(value, digits = 4) {
 /**
  * Live entry tracker for newly migrated Pump tokens.
  *
- * A candidate starts when the trusted price crosses into an 18%-18.5% drawdown
+ * A candidate starts when the trusted price crosses into a 15%-25% drawdown
  * from the rolling one-second high. The first rebound from the running low
  * must reach 2%-5% before the one-second candidate deadline. New entries are
- * limited to the first three minutes after migration and the $10k-$30k FDV
+ * limited to the first three minutes after migration and the $10k-$60k FDV
  * entry subset. The broader discovery/watchdog range remains unchanged.
  */
 class DropReboundTracker extends EventEmitter {
@@ -37,8 +37,8 @@ class DropReboundTracker extends EventEmitter {
     this.replaceDumpSignal = opts.replaceDumpSignal ?? settings.replaceDumpSignal ?? true;
     this.entryMode = 'DROP_REBOUND_1S';
     this.dropWindowMs = opts.dropWindowMs ?? settings.dropWindowMs ?? 1_000;
-    this.dropMinPct = opts.dropMinPct ?? settings.dropMinPct ?? 18;
-    this.dropMaxPct = opts.dropMaxPct ?? settings.dropMaxPct ?? 18.5;
+    this.dropMinPct = opts.dropMinPct ?? settings.dropMinPct ?? 15;
+    this.dropMaxPct = opts.dropMaxPct ?? settings.dropMaxPct ?? 25;
     this.reboundMinPct = opts.reboundMinPct ?? settings.reboundMinPct ?? 2;
     this.reboundMaxPct = opts.reboundMaxPct ?? settings.reboundMaxPct ?? 5;
     this.reboundTimeoutMs = opts.reboundTimeoutMs ?? settings.reboundTimeoutMs ?? 1_000;

@@ -99,7 +99,8 @@ class PumpGraduationDiscovery extends EventEmitter {
       : 'liquidity filter disabled';
     console.log(
       `[PumpDiscovery] enabled: FDV $${this.settings.minFdvUsd}-${this.settings.maxFdvUsd}, ` +
-        liquidityPolicy,
+        `${liquidityPolicy}, market-unavailable final recheck=` +
+        `${this.settings.marketUnavailableRechecks}x/${this.settings.marketUnavailableRecheckMs}ms`,
     );
 
     this._connectWebSocket();
@@ -338,7 +339,41 @@ class PumpGraduationDiscovery extends EventEmitter {
     }
 
     if (this.settings.marketInitialDelayMs > 0) await sleep(this.settings.marketInitialDelayMs);
-    let screening = await this._fetchScreeningData(migration.mint);
+    let screening = null;
+    let screeningError = null;
+    try {
+      screening = await this._fetchScreeningData(migration.mint);
+    } catch (err) {
+      screeningError = err;
+    }
+
+    const unavailableRechecks = Math.max(
+      0,
+      Number(this.settings.marketUnavailableRechecks) || 0,
+    );
+    const unavailableRecheckMs = Math.max(
+      250,
+      Number(this.settings.marketUnavailableRecheckMs) || 3_000,
+    );
+    for (let attempt = 1; !screening && attempt <= unavailableRechecks; attempt++) {
+      monitor.inc(`${MODULE}.marketUnavailableRecheckScheduled`, 1, MODULE);
+      console.warn(
+        `[PumpDiscovery] screening unavailable ${migration.mint.slice(0, 8)}..; ` +
+          `final recheck ${attempt}/${unavailableRechecks} in ${unavailableRecheckMs}ms`,
+      );
+      await sleep(unavailableRecheckMs);
+      try {
+        // The normal lookup already exhausted its configured retry budget.
+        // This delayed recovery lookup is deliberately one RPC attempt only.
+        screening = await this._fetchScreeningData(migration.mint, 1);
+        screeningError = null;
+        monitor.inc(`${MODULE}.marketUnavailableRecheckRecovered`, 1, MODULE);
+      } catch (err) {
+        screeningError = err;
+        monitor.inc(`${MODULE}.marketUnavailableRecheckFailed`, 1, MODULE);
+      }
+    }
+    if (!screening) throw screeningError || new Error(`screening data unavailable for ${migration.mint}`);
     let rejection = this._getRejection(screening);
 
     // A just-created PumpSwap pool can be visible to Birdeye before its USD
@@ -433,9 +468,9 @@ class PumpGraduationDiscovery extends EventEmitter {
     this.emit('tokenAdded', event);
   }
 
-  async _fetchScreeningData(mint) {
+  async _fetchScreeningData(mint, attemptLimit = this.settings.marketRetries) {
     let lastMarketError = null;
-    const attempts = Math.max(1, this.settings.marketRetries);
+    const attempts = Math.max(1, Number(attemptLimit) || 1);
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
       let market = null;

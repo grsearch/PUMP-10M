@@ -57,16 +57,16 @@ function run() {
   );
   assert.strictEqual(config.activityFlow.entryMode, 'DROP_REBOUND_1S');
   assert.strictEqual(config.activityFlow.dropWindowMs, 1_000);
-  assert.strictEqual(config.activityFlow.dropMinPct, 18);
-  assert.strictEqual(config.activityFlow.dropMaxPct, 18.5);
+  assert.strictEqual(config.activityFlow.dropMinPct, 15);
+  assert.strictEqual(config.activityFlow.dropMaxPct, 25);
   assert.strictEqual(config.activityFlow.reboundMinPct, 2);
   assert.strictEqual(config.activityFlow.reboundMaxPct, 5);
   assert.strictEqual(config.activityFlow.reboundTimeoutMs, 1_000);
   assert.strictEqual(config.activityFlow.entryMaxTokenAgeMs, 180_000);
   assert.strictEqual(config.activityFlow.entryMinFdvUsd, 10_000);
-  assert.strictEqual(config.activityFlow.entryMaxFdvUsd, 30_000);
+  assert.strictEqual(config.activityFlow.entryMaxFdvUsd, 60_000);
   assert.strictEqual(config.activityFlow.entryQuoteMinDeviationPct, -1);
-  assert.strictEqual(config.activityFlow.entryQuoteMaxDeviationPct, 0.5);
+  assert.strictEqual(config.activityFlow.entryQuoteMaxDeviationPct, 1.5);
   assert.strictEqual(config.strategy.positionSizeSol, 0.3);
   assert.strictEqual(config.strategy.maxTokenAgeMs, 5 * 60_000);
   assert.strictEqual(config.strategy.minFdVUsd, 10_000);
@@ -121,6 +121,19 @@ function run() {
     assert(entry.reboundPct >= 2);
   }
 
+  for (const [label, dropPrice, reboundPrice] of [
+    ['minimum-drop-boundary', 0.85, 0.868],
+    ['maximum-drop-boundary', 0.75, 0.766],
+  ]) {
+    const t = tracker(base);
+    let signals = 0;
+    t.on('flowReversalSignal', () => signals++);
+    t.handleSwap(swap(mint, 1, base, `${label}-peak`));
+    t.handleSwap(swap(mint, dropPrice, base + 100, `${label}-drop`));
+    t.handleSwap(swap(mint, reboundPrice, base + 300, `${label}-rebound`));
+    assert.strictEqual(signals, 1, `${label} must be accepted`);
+  }
+
   {
     const signalTs = base + 300;
     const t = tracker(base, { migration_time: signalTs - 180_000 });
@@ -158,15 +171,15 @@ function run() {
     let signals = 0;
     t.on('flowReversalSignal', () => signals++);
     t.handleSwap(swap(mint, 1, base, 'deep-peak'));
-    t.handleSwap(swap(mint, 0.77, base + 100, 'deep-drop'));
-    t.handleSwap(swap(mint, 0.79, base + 300, 'deep-rebound-into-band'));
+    t.handleSwap(swap(mint, 0.74, base + 100, 'deep-drop'));
+    t.handleSwap(swap(mint, 0.76, base + 300, 'deep-rebound-into-band'));
     assert.strictEqual(signals, 0);
-    assert.strictEqual(t.states.get(mint).candidate, null, 'a >18.5% drop must not re-arm inside the same episode');
+    assert.strictEqual(t.states.get(mint).candidate, null, 'a >25% drop must not re-arm inside the same episode');
   }
 
   for (const [name, overrides] of [
     ['low fdv', { fdv: 9_999 }],
-    ['high entry fdv', { fdv: 30_001 }],
+    ['high entry fdv', { fdv: 60_001 }],
     ['entry age over three minutes', { migration_time: base - 181_000 }],
   ]) {
     const t = tracker(base, overrides);
@@ -197,9 +210,9 @@ function run() {
     assert.strictEqual(panel.thresholds.reboundTimeoutMs, 1_000);
     assert.strictEqual(panel.thresholds.entryMaxTokenAgeMs, 180_000);
     assert.strictEqual(panel.thresholds.entryMinFdvUsd, 10_000);
-    assert.strictEqual(panel.thresholds.entryMaxFdvUsd, 30_000);
+    assert.strictEqual(panel.thresholds.entryMaxFdvUsd, 60_000);
     assert.strictEqual(panel.thresholds.entryQuoteMinDeviationPct, -1);
-    assert.strictEqual(panel.thresholds.entryQuoteMaxDeviationPct, 0.5);
+    assert.strictEqual(panel.thresholds.entryQuoteMaxDeviationPct, 1.5);
     assert.strictEqual(panel.thresholds.buyMaxPriceDeviationPct, 3);
     assert.strictEqual(panel.thresholds.maxTokenAgeMs, 300_000);
     assert.strictEqual(panel.thresholds.minLiquidityUsd, 0);
