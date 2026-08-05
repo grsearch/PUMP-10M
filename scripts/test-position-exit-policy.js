@@ -69,7 +69,7 @@ function run() {
 
   assert.strictEqual(config.strategy.trailingActivatePct, 8);
   assert.strictEqual(config.strategy.trailingDrawdownPct, 3);
-  assert.strictEqual(config.strategy.fastTakeProfitPct, 8);
+  assert.strictEqual(config.strategy.fastTakeProfitPct, 18);
   assert.strictEqual(config.strategy.fastTakeProfitWindowMs, 5_000);
   assert.strictEqual(config.strategy.lossCheckAtMs, 6_000);
   assert.strictEqual(config.strategy.trailingMinHwmAgeMs, 0);
@@ -100,7 +100,7 @@ function run() {
   {
     const leg = position('p1', mint, { openedAt: Date.now() - 4_000 });
     const manager = managerWith(token, leg);
-    manager._checkExit('p1', 1.08, { source: 'fast_profit' });
+    manager._checkExit('p1', 1.181, { source: 'fast_profit' });
     assert.strictEqual(manager._exitCalls.length, 1);
     assert.strictEqual(manager._exitCalls[0].reason, 'FAST_TP_5S');
     assert.strictEqual(leg.trailingArmed, false, 'fast TP must sell instead of arming trailing');

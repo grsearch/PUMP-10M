@@ -67,7 +67,7 @@ const config = {
     //   设 trailingActivatePct=0 或 trailingDrawdownPct=0 可禁用移动止盈
     trailingActivatePct: 8,
     trailingDrawdownPct: 3,
-    fastTakeProfitPct: 8,
+    fastTakeProfitPct: 18,
     fastTakeProfitWindowMs: 5_000,
     lossCheckAtMs: 6_000,
     // Exact production rule: once armed, a 3% drawdown exits immediately.
@@ -196,6 +196,13 @@ const config = {
     // +15% chase allowance. Keep this hard-coded against stale server envs.
     buyMaxPriceDeviationPct: 3,
     buyMaxPoolStateAgeMs: parseInt(process.env.BUY_MAX_POOL_STATE_AGE_MS || '500', 10),
+    // The triggering swap or the hot-pool refresher may already have produced
+    // an ultra-fresh state. Reuse it for up to 100ms; anything older is
+    // synchronously refreshed once inside Executor.
+    buyFastPoolStateMaxAgeMs: Math.min(
+      100,
+      Math.max(0, parseInt(process.env.BUY_FAST_POOL_STATE_MAX_AGE_MS || '100', 10)),
+    ),
     buyMaxEstimatedSlippagePct: parseFloat(process.env.BUY_MAX_ESTIMATED_SLIPPAGE_PCT || '5'),
     // SELL has no signal-price ceiling like BUY. Profit exits start at 30%;
     // urgent loss/time exits and retries after Pump 6004 may use up to 50%.
@@ -267,11 +274,15 @@ const config = {
     // are intentionally ignored so stale deployments cannot reactivate removed rules.
     entryMode: 'DROP_REBOUND_1S',
     dropWindowMs: 1_000,
-    dropMinPct: 10,
-    dropMaxPct: 20,
+    dropMinPct: 18,
+    dropMaxPct: 22,
     reboundMinPct: 2,
     reboundMaxPct: 5,
     reboundTimeoutMs: 1_000,
+    // Backtest-validated entry window. Monitoring remains active for five
+    // minutes so the watchdog can still close positions before removal, but
+    // no new position may be opened after the first three minutes.
+    entryMaxTokenAgeMs: 180_000,
     rsi1sPeriod: 7,
     rsi1sEntryThreshold: 30,
     rsi1sLiveMax: 50,
@@ -593,12 +604,17 @@ const config = {
   priorityFee: {
     // 静态模式（dynamic=false 时使用）
     // v3.17.20: 用户调整 BUY/SELL fee 范围 (BUY 0.001-0.009, SELL 0.0001-0.0003)
-    buyMaxLamports: parseInt(process.env.BUY_MAX_PRIORITY_FEE_LAMPORTS || '500000', 10),  // 0.0005 SOL
+    buyMaxLamports: Math.max(
+      3_000_000,
+      parseInt(process.env.BUY_MAX_PRIORITY_FEE_LAMPORTS || '3000000', 10),
+    ),
     sellMaxLamports: parseInt(process.env.SELL_MAX_PRIORITY_FEE_LAMPORTS || '300000', 10),  // 0.0003 SOL
 
     // 动态模式：用 Helius getPriorityFeeEstimate 查 mempool 实时拥堵
     // 砸盘事件中整网 fee 飙升，动态调整能跟上竞争者节奏
-    dynamic: (process.env.PRIORITY_FEE_DYNAMIC ?? 'true').toLowerCase() === 'true',
+    // BUY landing priority is always dynamic. Old deployments commonly carry
+    // PRIORITY_FEE_DYNAMIC=false, which silently pinned BUYs to 0.0005 SOL.
+    dynamic: true,
 
     // 动态模式参数
     // BUY 用 high (75th) 或 veryHigh (95th)，SELL 用 medium (50th)
@@ -608,17 +624,23 @@ const config = {
     // 动态模式下限
     // v3.17.20: 用户压低成本设置 — 注意 BUY μL/CU 会从 267M 降到 36M (CU 250K, fee 0.009 上限)
     //   如果出现 BUY_CHAIN_FAILED 增多,先把 BUY_CAP 调到 0.02 SOL 看是否恢复
-    buyMinLamports: parseInt(process.env.BUY_MIN_PRIORITY_FEE_LAMPORTS || '500000', 10),  // 0.0005 SOL
+    buyMinLamports: Math.max(
+      3_000_000,
+      parseInt(process.env.BUY_MIN_PRIORITY_FEE_LAMPORTS || '3000000', 10),
+    ),
     sellMinLamports: parseInt(process.env.SELL_MIN_PRIORITY_FEE_LAMPORTS || '100000', 10),  // 0.0001 SOL
 
     // 动态查询的上限 (即使 mempool 极拥堵也不超过)
     // v3.17.20: 用户调整,激进压成本
-    buyCapLamports: parseInt(process.env.BUY_CAP_PRIORITY_FEE_LAMPORTS || '500000', 10),   // 0.0005 SOL
+    buyCapLamports: Math.max(
+      5_000_000,
+      parseInt(process.env.BUY_CAP_PRIORITY_FEE_LAMPORTS || '5000000', 10),
+    ),
     sellCapLamports: parseInt(process.env.SELL_CAP_PRIORITY_FEE_LAMPORTS || '300000', 10),  // 0.0003 SOL
   },
 
   // 旧字段保留，向后兼容（仅用于 fallback）
-  maxPriorityFeeLamports: parseInt(process.env.MAX_PRIORITY_FEE_LAMPORTS || '500000', 10), // 0.0005 SOL
+  maxPriorityFeeLamports: parseInt(process.env.MAX_PRIORITY_FEE_LAMPORTS || '5000000', 10),
 
   // 启动时是否自动尝试补充缺失的 pool 信息（PoolFinder）
   autoFillPoolsOnStart: (process.env.AUTO_FILL_POOLS_ON_START ?? 'true').toLowerCase() === 'true',
@@ -640,6 +662,20 @@ function validateConfig() {
     config.strategy.buyMaxPoolStateAgeMs < 0
   ) {
     errors.push('BUY_MAX_POOL_STATE_AGE_MS must be >= 0');
+  }
+  if (
+    !Number.isFinite(config.strategy.buyFastPoolStateMaxAgeMs) ||
+    config.strategy.buyFastPoolStateMaxAgeMs < 0 ||
+    config.strategy.buyFastPoolStateMaxAgeMs > 100
+  ) {
+    errors.push('BUY_FAST_POOL_STATE_MAX_AGE_MS must be between 0 and 100');
+  }
+  if (
+    !Number.isFinite(config.priorityFee.buyMinLamports) ||
+    !Number.isFinite(config.priorityFee.buyCapLamports) ||
+    config.priorityFee.buyCapLamports < config.priorityFee.buyMinLamports
+  ) {
+    errors.push('BUY_CAP_PRIORITY_FEE_LAMPORTS must be >= BUY_MIN_PRIORITY_FEE_LAMPORTS');
   }
   for (const [name, value] of [
     ['SELL_SLIPPAGE_BPS', config.strategy.sellSlippageBps],
@@ -705,6 +741,13 @@ function validateConfig() {
     config.activityFlow.reboundTimeoutMs <= 0
   ) {
     errors.push('reboundTimeoutMs must be > 0');
+  }
+  if (
+    !Number.isFinite(config.activityFlow.entryMaxTokenAgeMs) ||
+    config.activityFlow.entryMaxTokenAgeMs <= 0 ||
+    config.activityFlow.entryMaxTokenAgeMs > config.strategy.maxTokenAgeMs
+  ) {
+    errors.push('entryMaxTokenAgeMs must be > 0 and <= maxTokenAgeMs');
   }
   return errors;
 }

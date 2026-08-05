@@ -472,10 +472,37 @@ ${snapshotColumnsSql},
         latency_decision_ms INTEGER,
         latency_send_ms INTEGER,
         latency_confirm_ms INTEGER,
+        candidate_ts INTEGER,
+        candidate_slot INTEGER,
+        candidate_low_ts INTEGER,
+        candidate_low_slot INTEGER,
+        rebound_ts INTEGER,
+        rebound_slot INTEGER,
+        signal_received_at INTEGER,
+        submit_started_at INTEGER,
+        submit_accepted_at INTEGER,
+        landed_observed_at INTEGER,
+        landed_block_time_ms INTEGER,
+        submitted_slot INTEGER,
+        landed_slot INTEGER,
+        submission_channel TEXT,
+        compute_unit_limit INTEGER,
+        compute_units_consumed INTEGER,
+        chain_success INTEGER,
+        priority_fee_lamports INTEGER,
+        jito_tip_lamports INTEGER,
+        state_source TEXT,
+        cache_age_before_ms INTEGER,
+        cache_age_at_build_ms INTEGER,
+        latency_candidate_to_rebound_ms INTEGER,
+        latency_rebound_to_submit_ms INTEGER,
+        latency_submit_accepted_ms INTEGER,
+        latency_landed_ms INTEGER,
         details_json TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_bot_latency_events_ts ON bot_latency_events(ts);
       CREATE INDEX IF NOT EXISTS idx_bot_latency_events_mint_ts ON bot_latency_events(mint, ts);
+      CREATE INDEX IF NOT EXISTS idx_bot_latency_events_signature ON bot_latency_events(signature);
     `);
 
     this._ensureColumns('token_snapshots', this._snapshotFeatureColumns());
@@ -528,6 +555,32 @@ ${snapshotColumnsSql},
       ['latency_decision_ms', 'INTEGER'],
       ['latency_send_ms', 'INTEGER'],
       ['latency_confirm_ms', 'INTEGER'],
+      ['candidate_ts', 'INTEGER'],
+      ['candidate_slot', 'INTEGER'],
+      ['candidate_low_ts', 'INTEGER'],
+      ['candidate_low_slot', 'INTEGER'],
+      ['rebound_ts', 'INTEGER'],
+      ['rebound_slot', 'INTEGER'],
+      ['signal_received_at', 'INTEGER'],
+      ['submit_started_at', 'INTEGER'],
+      ['submit_accepted_at', 'INTEGER'],
+      ['landed_observed_at', 'INTEGER'],
+      ['landed_block_time_ms', 'INTEGER'],
+      ['submitted_slot', 'INTEGER'],
+      ['landed_slot', 'INTEGER'],
+      ['submission_channel', 'TEXT'],
+      ['compute_unit_limit', 'INTEGER'],
+      ['compute_units_consumed', 'INTEGER'],
+      ['chain_success', 'INTEGER'],
+      ['priority_fee_lamports', 'INTEGER'],
+      ['jito_tip_lamports', 'INTEGER'],
+      ['state_source', 'TEXT'],
+      ['cache_age_before_ms', 'INTEGER'],
+      ['cache_age_at_build_ms', 'INTEGER'],
+      ['latency_candidate_to_rebound_ms', 'INTEGER'],
+      ['latency_rebound_to_submit_ms', 'INTEGER'],
+      ['latency_submit_accepted_ms', 'INTEGER'],
+      ['latency_landed_ms', 'INTEGER'],
       ['details_json', 'TEXT'],
     ]);
   }
@@ -903,10 +956,63 @@ ${snapshotColumnsSql},
     this.stmts.insertBotLatencyEvent = this.db.prepare(`
       INSERT INTO bot_latency_events
         (ts, mint, symbol, signature, phase,
-         latency_detect_ms, latency_decision_ms, latency_send_ms, latency_confirm_ms, details_json)
+         latency_detect_ms, latency_decision_ms, latency_send_ms, latency_confirm_ms,
+         candidate_ts, candidate_slot, candidate_low_ts, candidate_low_slot,
+         rebound_ts, rebound_slot, signal_received_at, submit_started_at, submit_accepted_at,
+         landed_observed_at, landed_block_time_ms, submitted_slot, landed_slot,
+         submission_channel, compute_unit_limit, compute_units_consumed, chain_success,
+         priority_fee_lamports, jito_tip_lamports, state_source,
+         cache_age_before_ms, cache_age_at_build_ms,
+         latency_candidate_to_rebound_ms, latency_rebound_to_submit_ms,
+         latency_submit_accepted_ms, latency_landed_ms, details_json)
       VALUES
         (@ts, @mint, @symbol, @signature, @phase,
-         @latency_detect_ms, @latency_decision_ms, @latency_send_ms, @latency_confirm_ms, @details_json)
+         @latency_detect_ms, @latency_decision_ms, @latency_send_ms, @latency_confirm_ms,
+         @candidate_ts, @candidate_slot, @candidate_low_ts, @candidate_low_slot,
+         @rebound_ts, @rebound_slot, @signal_received_at, @submit_started_at, @submit_accepted_at,
+         @landed_observed_at, @landed_block_time_ms, @submitted_slot, @landed_slot,
+         @submission_channel, @compute_unit_limit, @compute_units_consumed, @chain_success,
+         @priority_fee_lamports, @jito_tip_lamports, @state_source,
+         @cache_age_before_ms, @cache_age_at_build_ms,
+         @latency_candidate_to_rebound_ms, @latency_rebound_to_submit_ms,
+         @latency_submit_accepted_ms, @latency_landed_ms, @details_json)
+    `);
+
+    this.stmts.updateBotLatencyLanding = this.db.prepare(`
+      UPDATE bot_latency_events SET
+        landed_observed_at = CASE
+          WHEN @landed_observed_at IS NULL THEN landed_observed_at
+          WHEN landed_observed_at IS NULL THEN @landed_observed_at
+          ELSE MIN(landed_observed_at, @landed_observed_at)
+        END,
+        landed_block_time_ms = COALESCE(@landed_block_time_ms, landed_block_time_ms),
+        landed_slot = COALESCE(landed_slot, @landed_slot),
+        compute_unit_limit = COALESCE(compute_unit_limit, @compute_unit_limit),
+        compute_units_consumed = COALESCE(@compute_units_consumed, compute_units_consumed),
+        chain_success = COALESCE(@chain_success, chain_success),
+        latency_landed_ms = CASE
+          WHEN submit_accepted_at IS NOT NULL AND @landed_observed_at IS NOT NULL
+            THEN MAX(0, MIN(COALESCE(landed_observed_at, @landed_observed_at), @landed_observed_at) - submit_accepted_at)
+          ELSE latency_landed_ms
+        END,
+        latency_confirm_ms = CASE
+          WHEN signal_received_at IS NOT NULL AND @landed_observed_at IS NOT NULL
+            THEN MAX(0, MIN(COALESCE(landed_observed_at, @landed_observed_at), @landed_observed_at) - signal_received_at)
+          ELSE latency_confirm_ms
+        END
+      WHERE id = (
+        SELECT id FROM bot_latency_events
+        WHERE signature = @signature AND phase = 'buy'
+        ORDER BY id DESC LIMIT 1
+      )
+    `);
+
+    this.stmts.recentBuyComputeUnitSamples = this.db.prepare(`
+      SELECT compute_units_consumed
+      FROM bot_latency_events
+      WHERE phase = 'buy' AND chain_success = 1 AND compute_units_consumed > 0
+      ORDER BY id DESC
+      LIMIT ?
     `);
 
     this.stmts.pendingSnapshotLabels = this.db.prepare(`
@@ -1216,9 +1322,71 @@ ${snapshotColumnsSql},
         latency_decision_ms: this._cleanDbValue(event.latencyDecisionMs),
         latency_send_ms: this._cleanDbValue(event.latencySendMs),
         latency_confirm_ms: this._cleanDbValue(event.latencyConfirmMs),
+        candidate_ts: this._cleanDbValue(event.candidateTs),
+        candidate_slot: this._cleanDbValue(event.candidateSlot),
+        candidate_low_ts: this._cleanDbValue(event.candidateLowTs),
+        candidate_low_slot: this._cleanDbValue(event.candidateLowSlot),
+        rebound_ts: this._cleanDbValue(event.reboundTs),
+        rebound_slot: this._cleanDbValue(event.reboundSlot),
+        signal_received_at: this._cleanDbValue(event.signalReceivedAt),
+        submit_started_at: this._cleanDbValue(event.submitStartedAt),
+        submit_accepted_at: this._cleanDbValue(event.submitAcceptedAt),
+        landed_observed_at: this._cleanDbValue(event.landedObservedAt),
+        landed_block_time_ms: this._cleanDbValue(event.landedBlockTimeMs),
+        submitted_slot: this._cleanDbValue(event.submittedSlot),
+        landed_slot: this._cleanDbValue(event.landedSlot),
+        submission_channel: event.submissionChannel || null,
+        compute_unit_limit: this._cleanDbValue(event.computeUnitLimit),
+        compute_units_consumed: this._cleanDbValue(event.computeUnitsConsumed),
+        chain_success: event.chainSuccess == null ? null : (event.chainSuccess ? 1 : 0),
+        priority_fee_lamports: this._cleanDbValue(event.priorityFeeLamports),
+        jito_tip_lamports: this._cleanDbValue(event.jitoTipLamports),
+        state_source: event.stateSource || null,
+        cache_age_before_ms: this._cleanDbValue(event.cacheAgeBeforeMs),
+        cache_age_at_build_ms: this._cleanDbValue(event.cacheAgeAtBuildMs),
+        latency_candidate_to_rebound_ms: this._cleanDbValue(event.latencyCandidateToReboundMs),
+        latency_rebound_to_submit_ms: this._cleanDbValue(event.latencyReboundToSubmitMs),
+        latency_submit_accepted_ms: this._cleanDbValue(event.latencySubmitAcceptedMs),
+        latency_landed_ms: this._cleanDbValue(event.latencyLandedMs),
         details_json: details,
       });
     } catch (_) { /* analytics only */ }
+  }
+
+  updateBotLatencyLanding({
+    signature,
+    landedObservedAt,
+    landedBlockTimeMs,
+    landedSlot,
+    computeUnitsConsumed,
+    computeUnitLimit,
+    chainSuccess,
+  } = {}) {
+    if (!signature || !this.stmts.updateBotLatencyLanding) return false;
+    try {
+      const result = this.stmts.updateBotLatencyLanding.run({
+        signature,
+        landed_observed_at: this._cleanDbValue(landedObservedAt),
+        landed_block_time_ms: this._cleanDbValue(landedBlockTimeMs),
+        landed_slot: this._cleanDbValue(landedSlot),
+        compute_units_consumed: this._cleanDbValue(computeUnitsConsumed),
+        compute_unit_limit: this._cleanDbValue(computeUnitLimit),
+        chain_success: chainSuccess == null ? null : (chainSuccess ? 1 : 0),
+      });
+      return result.changes > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  getRecentBuyComputeUnitSamples(limit = 200) {
+    if (!this.stmts.recentBuyComputeUnitSamples) return [];
+    const safeLimit = Math.max(1, Math.min(2_000, Number.parseInt(String(limit), 10) || 200));
+    return this.stmts.recentBuyComputeUnitSamples
+      .all(safeLimit)
+      .map((row) => Number(row.compute_units_consumed))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .reverse();
   }
 
   getSnapshotLabelBacklog({ now = Date.now(), minQualityVersion = STRATEGY_LAB_QUALITY_VERSION } = {}) {

@@ -146,7 +146,22 @@ async function run() {
   assert.strictEqual(fresh.stateSource, 'rpc');
   assert.strictEqual(fresh.cacheAgeBeforeMs, 1_200);
 
-  // 6. Production BUY mode forces an RPC refresh even when the cache is well
+  // 6. An ultra-fresh cache state is reused without an RPC refresh.
+  ageMs = 75;
+  state = { id: 'ultra-fresh' };
+  refreshCalls = 0;
+  const cached = await loadFreshBuyPoolState({
+    poolAddress: 'pool',
+    maxAgeMs: 100,
+    poolStateCache,
+    loadFromRpc: async () => assert.fail('ultra-fresh cache must avoid RPC'),
+  });
+  assert.strictEqual(refreshCalls, 0);
+  assert.strictEqual(cached.state.id, 'ultra-fresh');
+  assert.strictEqual(cached.stateSource, 'cache');
+
+  // 7. The helper still supports an explicit forced refresh for emergency and
+  // sell paths even when the cache is well
   // inside the configured age window.
   ageMs = 10;
   state = { id: 'cached-but-not-used' };
